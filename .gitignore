@@ -25,5 +25,6 @@ orbit_wars_rl/_native/*.lib
 *.obj
 *.exe
 *.pdb
+.env
 
 # keep REFERENCE_* (authoritative game spec copies) tracked on purpose
