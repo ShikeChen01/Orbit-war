@@ -1,0 +1,15 @@
+# Keep the Cloud Build / image context small.
+.git/
+.venv/
+runs/
+__pycache__/
+*.pyc
+.pytest_cache/
+REFERENCE_*
+_*.py
+*.log
+out.txt
+err.txt
+imperr*.txt
+smoke_err.txt
+docs/

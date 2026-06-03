@@ -1,0 +1,20 @@
+# Vertex AI CustomJob worker-pool spec (single GPU worker).
+# __IMAGE__ is substituted by submit_job.sh. Tune machineType / acceleratorType later.
+workerPoolSpecs:
+  - machineSpec:
+      machineType: n1-standard-8
+      acceleratorType: NVIDIA_TESLA_T4
+      acceleratorCount: 1
+    replicaCount: 1
+    containerSpec:
+      imageUri: __IMAGE__
+      args:
+        - "--total-steps"
+        - "5000000"
+        - "--device"
+        - "cuda"
+        - "--run-name"
+        - "vertex-ppo"
+        # Write checkpoints to a GCS bucket mounted at /gcs (set to your bucket):
+        - "--save-dir"
+        - "/gcs/CHANGE_ME_BUCKET/runs"

@@ -1,1 +1,29 @@
 .venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# training outputs
+runs/
+
+# local scratch / investigation dumps
+_*.py
+*.log
+out.txt
+err.txt
+imperr*.txt
+smoke_err.txt
+
+# native C++ build artifacts
+native/_bld/
+native/build/
+native/_probe/
+orbit_wars_rl/_native/*.pyd
+orbit_wars_rl/_native/*.exp
+orbit_wars_rl/_native/*.lib
+*.obj
+*.exe
+*.pdb
+
+# keep REFERENCE_* (authoritative game spec copies) tracked on purpose
