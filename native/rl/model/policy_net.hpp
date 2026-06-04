@@ -27,8 +27,11 @@ struct PolicyNetImpl : torch::nn::Module {
     ModelConfig cfg;
     int A;  // actions_per_entity, cached from cfg
 
-    torch::nn::Linear ent0{nullptr}, ent2{nullptr};   // entity encoder
-    torch::nn::Linear ctx0{nullptr}, ctx2{nullptr};   // context (pooled + globals) encoder
+    torch::nn::Linear ent0{nullptr}, ent2{nullptr};   // entity encoder (2-layer MLP)
+    torch::nn::Linear ctx0{nullptr}, ctx2{nullptr};   // context (pooled + globals) encoder (2-layer MLP)
+    // Residual GLU blocks (one per encoder): out = x + W_o( (W_v x) * sigmoid(W_g x) ).
+    torch::nn::Linear ent_glu_gate{nullptr}, ent_glu_val{nullptr}, ent_glu_out{nullptr};
+    torch::nn::Linear ctx_glu_gate{nullptr}, ctx_glu_val{nullptr}, ctx_glu_out{nullptr};
     torch::nn::Linear act0{nullptr}, act2{nullptr};   // angle-mode actor MLP
     torch::nn::Linear aq{nullptr}, ak{nullptr}, anoop{nullptr};  // target-mode pointer actor
 };

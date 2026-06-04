@@ -2,25 +2,30 @@
 \contentsline {paragraph}{Training scope of this document.}{2}{section*.2}%
 \contentsline {paragraph}{Factored action space.}{2}{section*.3}%
 \contentsline {section}{\numberline {2}Observation encoding}{2}{section.2}%
-\contentsline {section}{\numberline {3}Policy network $\pi _\theta $}{2}{section.3}%
-\contentsline {paragraph}{Entity encoder.}{2}{section*.4}%
-\contentsline {paragraph}{Context encoder.}{2}{section*.5}%
-\contentsline {paragraph}{Actor head.}{3}{section*.6}%
-\contentsline {paragraph}{Legality masking.}{3}{section*.7}%
-\contentsline {section}{\numberline {4}Action distribution}{3}{section.4}%
-\contentsline {section}{\numberline {5}Reward and return}{3}{section.5}%
-\contentsline {paragraph}{Shaped potential.}{3}{section*.8}%
-\contentsline {paragraph}{Per-step shaped reward.}{4}{section*.9}%
-\contentsline {paragraph}{Outcome.}{4}{section*.10}%
-\contentsline {paragraph}{GRPO return.}{4}{section*.11}%
-\contentsline {paragraph}{Note --- 2p vs.\ 4p objective.}{4}{section*.12}%
-\contentsline {section}{\numberline {6}GRPO update}{4}{section.6}%
-\contentsline {subsection}{\numberline {6.1}Grouped sampling}{4}{subsection.6.1}%
-\contentsline {subsection}{\numberline {6.2}Group-relative advantage (no critic)}{4}{subsection.6.2}%
-\contentsline {subsection}{\numberline {6.3}Clipped policy surrogate}{5}{subsection.6.3}%
-\contentsline {subsection}{\numberline {6.4}KL anchor to a reference policy}{5}{subsection.6.4}%
-\contentsline {subsection}{\numberline {6.5}Total objective}{5}{subsection.6.5}%
-\contentsline {subsection}{\numberline {6.6}Optimization}{5}{subsection.6.6}%
-\contentsline {section}{\numberline {7}Self-play league}{6}{section.7}%
-\contentsline {section}{\numberline {8}Symbols $\leftrightarrow $ \texttt {config.hpp}}{6}{section.8}%
-\contentsline {section}{\numberline {A}Appendix: the PPO/GAE method being replaced}{6}{appendix.A}%
+\contentsline {paragraph}{Incoming-fleet threat features (defensive lookahead).}{2}{section*.4}%
+\contentsline {section}{\numberline {3}Policy network $\pi _\theta $}{3}{section.3}%
+\contentsline {paragraph}{Residual GLU block.}{3}{section*.5}%
+\contentsline {paragraph}{Entity encoder (2-layer MLP $+$ GLU).}{3}{section*.6}%
+\contentsline {paragraph}{Context encoder (2-layer MLP $+$ GLU).}{3}{section*.7}%
+\contentsline {paragraph}{Actor head.}{4}{section*.8}%
+\contentsline {paragraph}{Legality masking.}{4}{section*.9}%
+\contentsline {paragraph}{Layer inventory (target mode, $d=128$).}{4}{section*.10}%
+\contentsline {section}{\numberline {4}Action distribution}{4}{section.4}%
+\contentsline {section}{\numberline {5}Reward and return}{5}{section.5}%
+\contentsline {paragraph}{Production-only dense reward.}{5}{section*.11}%
+\contentsline {paragraph}{Outcome and the loss forfeit.}{5}{section*.12}%
+\contentsline {paragraph}{Note --- 2p vs.\ 4p objective.}{5}{section*.13}%
+\contentsline {section}{\numberline {6}Curriculum}{5}{section.6}%
+\contentsline {paragraph}{Stage 1 --- solo expansion (passive opponent).}{6}{section*.14}%
+\contentsline {paragraph}{Stage 2 --- $1$v$1$ vs.\ starter.}{6}{section*.15}%
+\contentsline {paragraph}{Stage 3 --- mixed opponents.}{6}{section*.16}%
+\contentsline {section}{\numberline {7}GRPO update}{6}{section.7}%
+\contentsline {subsection}{\numberline {7.1}Grouped sampling}{6}{subsection.7.1}%
+\contentsline {subsection}{\numberline {7.2}Group-relative advantage (no critic)}{6}{subsection.7.2}%
+\contentsline {subsection}{\numberline {7.3}Clipped policy surrogate}{7}{subsection.7.3}%
+\contentsline {subsection}{\numberline {7.4}KL anchor to a reference policy}{7}{subsection.7.4}%
+\contentsline {subsection}{\numberline {7.5}Total objective}{7}{subsection.7.5}%
+\contentsline {subsection}{\numberline {7.6}Optimization}{7}{subsection.7.6}%
+\contentsline {section}{\numberline {8}Self-play league}{7}{section.8}%
+\contentsline {section}{\numberline {9}Symbols $\leftrightarrow $ \texttt {config.hpp}}{8}{section.9}%
+\contentsline {section}{\numberline {A}Appendix: the PPO/GAE method being replaced}{8}{appendix.A}%

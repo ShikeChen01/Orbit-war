@@ -15,6 +15,9 @@ struct EntityPolicyImpl : torch::nn::Module {
     bool target_mode;  // true: actor classes are (target_row, frac); false: (angle_bin, frac)
     torch::nn::Linear ent0{nullptr}, ent2{nullptr}, ctx0{nullptr}, ctx2{nullptr};
     torch::nn::Linear act0{nullptr}, act2{nullptr}, crit0{nullptr}, crit2{nullptr};
+    // Residual GLU blocks (one per encoder): out = x + W_o( (W_v x) * sigmoid(W_g x) ).
+    torch::nn::Linear ent_glu_gate{nullptr}, ent_glu_val{nullptr}, ent_glu_out{nullptr};
+    torch::nn::Linear ctx_glu_gate{nullptr}, ctx_glu_val{nullptr}, ctx_glu_out{nullptr};
     // Target-mode pointer actor: logit(r,t,f) = <q_f(tok_r,core), k(tok_t)> + noop head.
     torch::nn::Linear aq{nullptr}, ak{nullptr}, anoop{nullptr};
 
@@ -27,6 +30,12 @@ struct EntityPolicyImpl : torch::nn::Module {
         ctx2 = register_module("ctx2", torch::nn::Linear(hidden, hidden));
         crit0 = register_module("crit0", torch::nn::Linear(hidden, hidden));
         crit2 = register_module("crit2", torch::nn::Linear(hidden, 1));
+        ent_glu_gate = register_module("ent_glu_gate", torch::nn::Linear(hidden, hidden));
+        ent_glu_val = register_module("ent_glu_val", torch::nn::Linear(hidden, hidden));
+        ent_glu_out = register_module("ent_glu_out", torch::nn::Linear(hidden, hidden));
+        ctx_glu_gate = register_module("ctx_glu_gate", torch::nn::Linear(hidden, hidden));
+        ctx_glu_val = register_module("ctx_glu_val", torch::nn::Linear(hidden, hidden));
+        ctx_glu_out = register_module("ctx_glu_out", torch::nn::Linear(hidden, hidden));
         if (target_mode) {
             aq = register_module("aq", torch::nn::Linear(hidden + hidden, num_fracs * hidden));
             ak = register_module("ak", torch::nn::Linear(hidden, hidden));
@@ -44,10 +53,14 @@ struct EntityPolicyImpl : torch::nn::Module {
                                                     const torch::Tensor& globals) {
         auto tok = torch::relu(ent0->forward(entities));
         tok = ent2->forward(tok);  // (B,E,h)
+        tok = tok + ent_glu_out->forward(ent_glu_val->forward(tok) *
+                                         torch::sigmoid(ent_glu_gate->forward(tok)));  // residual GLU
         auto m = entity_mask.unsqueeze(-1);                      // (B,E,1)
         auto pooled = (tok * m).sum(1) / m.sum(1).clamp_min(1.0);  // (B,h)
         auto core = torch::relu(ctx0->forward(torch::cat({pooled, globals}, -1)));
         core = ctx2->forward(core);                              // (B,h)
+        core = core + ctx_glu_out->forward(ctx_glu_val->forward(core) *
+                                           torch::sigmoid(ctx_glu_gate->forward(core)));  // residual GLU
         auto core_b = core.unsqueeze(1).expand({-1, tok.size(1), -1});  // (B,E,h)
         torch::Tensor logits;
         if (target_mode) {
@@ -144,6 +157,10 @@ inline void load_python_state_dict(EntityPolicy& policy,
     };
     load("entity_encoder.0", policy->ent0); load("entity_encoder.2", policy->ent2);
     load("context_encoder.0", policy->ctx0); load("context_encoder.2", policy->ctx2);
+    load("ent_glu_gate", policy->ent_glu_gate); load("ent_glu_val", policy->ent_glu_val);
+    load("ent_glu_out", policy->ent_glu_out);
+    load("ctx_glu_gate", policy->ctx_glu_gate); load("ctx_glu_val", policy->ctx_glu_val);
+    load("ctx_glu_out", policy->ctx_glu_out);
     load_opt("critic.0", policy->crit0); load_opt("critic.2", policy->crit2);
     if (policy->target_mode) {
         load("actor_q", policy->aq); load("actor_k", policy->ak); load("actor_noop", policy->anoop);

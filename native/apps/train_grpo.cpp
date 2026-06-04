@@ -33,6 +33,11 @@ int main(int argc, char** argv) {
     cfg.model.fractions = meta.fractions;
     cfg.rollout.episode_steps = a.i("episode-steps", meta.episode_steps);
     cfg.rollout.prod_weight = a.f("prod-weight", 20.0);
+    cfg.rollout.stage = a.i("stage", 2);  // 1 solo expansion, 2 vs starter, 3 mixed
+    cfg.rollout.prod_reward_weight = a.f("prod-reward-weight", 10.0);
+    cfg.rollout.launch_hit_reward = a.f("launch-hit-reward", 0.5);
+    cfg.rollout.launch_miss_penalty = a.f("launch-miss-penalty", 1.0);
+    cfg.rollout.loss_forfeit = a.i("loss-forfeit", 1) != 0;
     cfg.total_steps = a.l("total-steps", 30'000'000);
     cfg.grpo.group_size = a.i("group-size", 8);
     cfg.grpo.num_groups = a.i("num-groups", 64);

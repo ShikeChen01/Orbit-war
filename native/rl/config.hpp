@@ -58,6 +58,19 @@ struct RolloutConfig {
     double reward_clip = 5.0;     // clamp on the per-step shaped reward
     double prod_weight = 20.0;    // production-margin weight in the potential
     double terminal_bonus = 1.0;  // magnitude of the +/- terminal win signal
+    // Curriculum stage: 1 = solo expansion (passive opponent), 2 = 1v1 vs starter,
+    // 3 = mixed/self-play opponents. Stage only sets the opponent; the reward below is shared.
+    int stage = 2;
+    // Reward = production-only dense + launch quality, with a loss forfeiting everything:
+    //   r_t = prod_reward_weight * d(own production)
+    //       + launch_hit_reward * #launches-reaching-a-planet  -  launch_miss_penalty * #wasted
+    //   R   = (win ? D : -D) + outcome_weight * o,   D = sum_t gamma^t r_t.
+    // Rationale: reward growing production efficiently, but losing negates the accumulated
+    // reward, so "maximize production yet lose" is strongly penalized (it must actually win).
+    double prod_reward_weight = 10.0;   // dense weight on the per-step gain in own production
+    double launch_hit_reward = 0.5;     // + for each launch that will reach a planet
+    double launch_miss_penalty = 1.0;   // - for each launch that lands nowhere (wasted fleet)
+    bool loss_forfeit = true;           // on a loss, negate the accumulated dense return (R = -D)
 };
 
 // --- self-play league ------------------------------------------------------

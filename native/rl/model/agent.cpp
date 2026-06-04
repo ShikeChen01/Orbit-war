@@ -56,6 +56,12 @@ void Agent::load_state_dict(const std::map<std::string, torch::Tensor>& sd) {
     load("entity_encoder.2", net->ent2);
     load("context_encoder.0", net->ctx0);
     load("context_encoder.2", net->ctx2);
+    load("ent_glu_gate", net->ent_glu_gate);
+    load("ent_glu_val", net->ent_glu_val);
+    load("ent_glu_out", net->ent_glu_out);
+    load("ctx_glu_gate", net->ctx_glu_gate);
+    load("ctx_glu_val", net->ctx_glu_val);
+    load("ctx_glu_out", net->ctx_glu_out);
     if (net->cfg.target_mode) {
         load("actor_q", net->aq);
         load("actor_k", net->ak);
@@ -76,6 +82,12 @@ std::map<std::string, torch::Tensor> Agent::state_dict() const {
     put("entity_encoder.2", net->ent2);
     put("context_encoder.0", net->ctx0);
     put("context_encoder.2", net->ctx2);
+    put("ent_glu_gate", net->ent_glu_gate);
+    put("ent_glu_val", net->ent_glu_val);
+    put("ent_glu_out", net->ent_glu_out);
+    put("ctx_glu_gate", net->ctx_glu_gate);
+    put("ctx_glu_val", net->ctx_glu_val);
+    put("ctx_glu_out", net->ctx_glu_out);
     if (net->cfg.target_mode) {
         put("actor_q", net->aq);
         put("actor_k", net->ak);

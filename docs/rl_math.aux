@@ -7,39 +7,48 @@
 \@writefile{toc}{\contentsline {paragraph}{Training scope of this document.}{2}{section*.2}\protected@file@percent }
 \@writefile{toc}{\contentsline {paragraph}{Factored action space.}{2}{section*.3}\protected@file@percent }
 \@writefile{toc}{\contentsline {section}{\numberline {2}Observation encoding}{2}{section.2}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {3}Policy network $\pi _\theta $}{2}{section.3}\protected@file@percent }
-\newlabel{sec:policy}{{3}{2}{Policy network $\pi _\theta $}{section.3}{}}
-\@writefile{toc}{\contentsline {paragraph}{Entity encoder.}{2}{section*.4}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Context encoder.}{2}{section*.5}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Actor head.}{3}{section*.6}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Legality masking.}{3}{section*.7}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {4}Action distribution}{3}{section.4}\protected@file@percent }
-\newlabel{sec:dist}{{4}{3}{Action distribution}{section.4}{}}
-\newlabel{eq:logp}{{9}{3}{Action distribution}{equation.9}{}}
-\newlabel{eq:ent}{{10}{3}{Action distribution}{equation.10}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {5}Reward and return}{3}{section.5}\protected@file@percent }
-\newlabel{sec:reward}{{5}{3}{Reward and return}{section.5}{}}
-\@writefile{toc}{\contentsline {paragraph}{Shaped potential.}{3}{section*.8}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Per-step shaped reward.}{4}{section*.9}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Outcome.}{4}{section*.10}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{GRPO return.}{4}{section*.11}\protected@file@percent }
-\newlabel{eq:return}{{13}{4}{GRPO return}{equation.13}{}}
-\@writefile{toc}{\contentsline {paragraph}{Note --- 2p vs.\ 4p objective.}{4}{section*.12}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {6}GRPO update}{4}{section.6}\protected@file@percent }
-\newlabel{sec:grpo}{{6}{4}{GRPO update}{section.6}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {6.1}Grouped sampling}{4}{subsection.6.1}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {6.2}Group-relative advantage (no critic)}{4}{subsection.6.2}\protected@file@percent }
-\newlabel{eq:adv}{{15}{5}{Group-relative advantage (no critic)}{equation.15}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {6.3}Clipped policy surrogate}{5}{subsection.6.3}\protected@file@percent }
-\newlabel{eq:clip}{{17}{5}{Clipped policy surrogate}{equation.17}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {6.4}KL anchor to a reference policy}{5}{subsection.6.4}\protected@file@percent }
-\newlabel{sec:kl}{{6.4}{5}{KL anchor to a reference policy}{subsection.6.4}{}}
-\newlabel{eq:kl}{{18}{5}{KL anchor to a reference policy}{equation.18}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {6.5}Total objective}{5}{subsection.6.5}\protected@file@percent }
-\newlabel{eq:loss}{{19}{5}{Total objective}{equation.19}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {6.6}Optimization}{5}{subsection.6.6}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {7}Self-play league}{6}{section.7}\protected@file@percent }
-\newlabel{sec:league}{{7}{6}{Self-play league}{section.7}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {8}Symbols $\leftrightarrow $ \texttt  {config.hpp}}{6}{section.8}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {A}Appendix: the PPO/GAE method being replaced}{6}{appendix.A}\protected@file@percent }
-\gdef \@abspage@last{6}
+\newlabel{sec:obs}{{2}{2}{Observation encoding}{section.2}{}}
+\newlabel{sec:threat}{{2}{2}{Incoming-fleet threat features (defensive lookahead)}{section*.4}{}}
+\@writefile{toc}{\contentsline {paragraph}{Incoming-fleet threat features (defensive lookahead).}{2}{section*.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {3}Policy network $\pi _\theta $}{3}{section.3}\protected@file@percent }
+\newlabel{sec:policy}{{3}{3}{Policy network $\pi _\theta $}{section.3}{}}
+\@writefile{toc}{\contentsline {paragraph}{Residual GLU block.}{3}{section*.5}\protected@file@percent }
+\newlabel{eq:glu}{{6}{3}{Residual GLU block}{equation.6}{}}
+\@writefile{toc}{\contentsline {paragraph}{Entity encoder (2-layer MLP $+$ GLU).}{3}{section*.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Context encoder (2-layer MLP $+$ GLU).}{3}{section*.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Actor head.}{4}{section*.8}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Legality masking.}{4}{section*.9}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Layer inventory (target mode, $d=128$).}{4}{section*.10}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {4}Action distribution}{4}{section.4}\protected@file@percent }
+\newlabel{sec:dist}{{4}{4}{Action distribution}{section.4}{}}
+\newlabel{eq:logp}{{13}{4}{Action distribution}{equation.13}{}}
+\newlabel{eq:ent}{{14}{4}{Action distribution}{equation.14}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {5}Reward and return}{5}{section.5}\protected@file@percent }
+\newlabel{sec:reward}{{5}{5}{Reward and return}{section.5}{}}
+\@writefile{toc}{\contentsline {paragraph}{Production-only dense reward.}{5}{section*.11}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Outcome and the loss forfeit.}{5}{section*.12}\protected@file@percent }
+\newlabel{eq:return}{{16}{5}{Outcome and the loss forfeit}{equation.16}{}}
+\@writefile{toc}{\contentsline {paragraph}{Note --- 2p vs.\ 4p objective.}{5}{section*.13}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {6}Curriculum}{5}{section.6}\protected@file@percent }
+\newlabel{sec:curriculum}{{6}{5}{Curriculum}{section.6}{}}
+\@writefile{toc}{\contentsline {paragraph}{Stage 1 --- solo expansion (passive opponent).}{6}{section*.14}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Stage 2 --- $1$v$1$ vs.\ starter.}{6}{section*.15}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Stage 3 --- mixed opponents.}{6}{section*.16}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {7}GRPO update}{6}{section.7}\protected@file@percent }
+\newlabel{sec:grpo}{{7}{6}{GRPO update}{section.7}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.1}Grouped sampling}{6}{subsection.7.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.2}Group-relative advantage (no critic)}{6}{subsection.7.2}\protected@file@percent }
+\newlabel{eq:adv}{{18}{6}{Group-relative advantage (no critic)}{equation.18}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.3}Clipped policy surrogate}{7}{subsection.7.3}\protected@file@percent }
+\newlabel{eq:clip}{{20}{7}{Clipped policy surrogate}{equation.20}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.4}KL anchor to a reference policy}{7}{subsection.7.4}\protected@file@percent }
+\newlabel{sec:kl}{{7.4}{7}{KL anchor to a reference policy}{subsection.7.4}{}}
+\newlabel{eq:kl}{{21}{7}{KL anchor to a reference policy}{equation.21}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.5}Total objective}{7}{subsection.7.5}\protected@file@percent }
+\newlabel{eq:loss}{{22}{7}{Total objective}{equation.22}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.6}Optimization}{7}{subsection.7.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {8}Self-play league}{7}{section.8}\protected@file@percent }
+\newlabel{sec:league}{{8}{7}{Self-play league}{section.8}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {9}Symbols $\leftrightarrow $ \texttt  {config.hpp}}{8}{section.9}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {A}Appendix: the PPO/GAE method being replaced}{8}{appendix.A}\protected@file@percent }
+\gdef \@abspage@last{8}

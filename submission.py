@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from orbit_wars_rl.agents.base import _as_dict  # noqa: E402
 from scripts.search_agent import SearchAgent  # noqa: E402
 
-_CKPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs", "native", "bc_start.pt")
+_CKPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs", "grpo", "win1", "best.pt")
 
 _AGENT = SearchAgent(
     _CKPT, device="cpu", K=8, H=8, value="heuristic", opponent_model="starter",

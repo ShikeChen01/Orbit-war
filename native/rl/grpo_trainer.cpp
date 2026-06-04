@@ -151,7 +151,13 @@ void GrpoTrainer::train() {
           << " ent_coef=" << cfg_.grpo.ent_coef << " gamma=" << cfg_.grpo.gamma
           << "\ndense_weight=" << cfg_.grpo.dense_weight
           << " outcome_weight=" << cfg_.grpo.outcome_weight << "\nlr=" << cfg_.optim.lr
-          << " target_mode=" << cfg_.model.target_mode << " hidden=" << cfg_.model.hidden << "\n";
+          << " target_mode=" << cfg_.model.target_mode << " hidden=" << cfg_.model.hidden
+          << "\nstage=" << cfg_.rollout.stage
+          << " prod_reward_weight=" << cfg_.rollout.prod_reward_weight
+          << " launch_hit_reward=" << cfg_.rollout.launch_hit_reward
+          << " launch_miss_penalty=" << cfg_.rollout.launch_miss_penalty
+          << " loss_forfeit=" << cfg_.rollout.loss_forfeit
+          << " n_entity_features=" << cfg_.model.n_entity_features << "\n";
     }
     printf("GRPO: %d envs (%dx%d) | kl_beta=%.3f | total_steps=%ld | run_dir=%s\n",
            cfg_.num_envs(), cfg_.grpo.num_groups, cfg_.grpo.group_size, cfg_.grpo.kl_beta,

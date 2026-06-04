@@ -7,6 +7,10 @@ __pycache__/
 # training outputs
 runs/
 
+# generated self-contained Kaggle submission (regenerate via scripts/package_submission.py;
+# embeds weights, ~1.6MB -- don't bloat git)
+submission_kaggle.py
+
 # local scratch / investigation dumps
 _*.py
 *.log

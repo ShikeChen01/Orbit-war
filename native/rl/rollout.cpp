@@ -22,16 +22,29 @@ TrajectoryBatch GroupedRollout::collect(Agent& policy, RolloutStats& stats) {
                  rclip = cfg_.rollout.reward_clip, gamma = cfg_.grpo.gamma;
     Config econf{cfg_.rollout.episode_steps, 6.0, 4.0};
 
+    // Reward = production-only dense + launch quality; a loss forfeits the accumulated reward.
+    //   per step  r = w_prod * d(own production) + hit_r * #launches-hit - miss_p * #launches-miss
+    //   return    R = (win ? D : -D) + w_o * o,  D = sum_t gamma^t r_t.
+    // The opponent is stage-driven (passive / starter / mix), but the reward is shared: grow
+    // production efficiently with non-wasted launches, and WIN -- losing negates everything.
+    const int stage = cfg_.rollout.stage;
+    const double w_prod = cfg_.rollout.prod_reward_weight, hit_r = cfg_.rollout.launch_hit_reward,
+                 miss_p = cfg_.rollout.launch_miss_penalty;
+    const bool forfeit = cfg_.rollout.loss_forfeit;
+    (void)pw;
+
     // --- assign one (world, opponent) per group; all G envs in a group share them ---
     std::vector<GameState> st(B);
-    std::vector<int> opp(B);  // 0 random, 1 starter
+    std::vector<int> opp(B);  // 0 random, 1 starter, 2 noop (passive)
     std::vector<std::mt19937_64> erng(B);
     {
         double wr = cfg_.selfplay.mix_random, ws = cfg_.selfplay.mix_starter;
         std::uniform_real_distribution<double> u(0.0, wr + ws);
         for (int j = 0; j < N; ++j) {
             const GameState& world = world_pool_[cursor_++ % world_pool_.size()];
-            int o = (u(rng_) < wr) ? 0 : 1;
+            // Stage 1: passive opponent (learn aiming + expansion unpunished). Stage 2: starter.
+            // Stage 3: random/starter mix (self-play pool is a follow-up).
+            int o = (stage == 1) ? 2 : (stage == 2) ? 1 : ((u(rng_) < wr) ? 0 : 1);
             for (int g = 0; g < G; ++g) {
                 int i = j * G + g;
                 st[i] = world;
@@ -42,9 +55,9 @@ TrajectoryBatch GroupedRollout::collect(Agent& policy, RolloutStats& stats) {
     }
 
     std::vector<char> active(B, 1);
-    std::vector<double> dense_ret(B, 0.0), gpow(B, 1.0), prev_pot(B), outcome(B, 0.0);
+    std::vector<double> dense_ret(B, 0.0), gpow(B, 1.0), prev_prod(B), outcome(B, 0.0);
     std::vector<int> ep_len(B, T);
-    for (int i = 0; i < B; ++i) prev_pot[i] = potential(st[i], pw);
+    for (int i = 0; i < B; ++i) prev_prod[i] = my_production(st[i], 0);
 
     auto fo = torch::TensorOptions().dtype(torch::kFloat32);
     auto lo = torch::TensorOptions().dtype(torch::kLong);
@@ -103,15 +116,32 @@ TrajectoryBatch GroupedRollout::collect(Agent& policy, RolloutStats& stats) {
                                            rsh[i].data(), E, nf, cfg_.model.fractions)
                     : decode_action(cls0.data(), am0.data(), rid[i].data(), rsh[i].data(), E,
                                     cfg_.model.angle_bins, cfg_.model.fractions);
-            Action move1 = (opp[i] == 0) ? random_agent(st[i], 1, erng[i]) : starter_agent(st[i], 1);
+            // Launch quality: project each of this turn's launches; reward those that will reach
+            // a planet, penalize those that land nowhere (wasted cruise ship). Measured on the
+            // pre-step board (where the launch is fired from), same projection as the obs.
+            int hits = 0, misses = 0;
+            for (const auto& mv : move0) {
+                const Planet* fp = nullptr;
+                for (const auto& p : st[i].planets)
+                    if (p.id == mv.from_id) { fp = &p; break; }
+                if (!fp) continue;
+                Fleet tf{0, 0, fp->x + std::cos(mv.angle) * (fp->radius + 0.1),
+                         fp->y + std::sin(mv.angle) * (fp->radius + 0.1), mv.angle, mv.from_id,
+                         mv.ships};
+                if (fleet_target(tf, st[i].planets).first < 0) ++misses; else ++hits;
+            }
+            Action move1;  // opp 2 (noop) leaves it empty -> the passive stage-1 opponent
+            if (opp[i] == 0) move1 = random_agent(st[i], 1, erng[i]);
+            else if (opp[i] == 1) move1 = starter_agent(st[i], 1);
             std::vector<Action> acts = {move0, move1};
             ow::step(st[i], acts, econf);
             st[i].step += 1;
-            double pot = potential(st[i], pw);
-            double dense = std::max(-rclip, std::min(rclip, (pot - prev_pot[i]) / rscale));
+            double prod = my_production(st[i], 0);
+            double r = w_prod * (prod - prev_prod[i]) + hit_r * hits - miss_p * misses;
+            double dense = std::max(-rclip, std::min(rclip, r / rscale));
             dense_ret[i] += gpow[i] * dense;
             gpow[i] *= gamma;
-            prev_pot[i] = pot;
+            prev_prod[i] = prod;
             if (is_terminal(st[i], cfg_.rollout.episode_steps)) {
                 active[i] = 0;
                 outcome[i] = outcome_sign(st[i]);
@@ -124,11 +154,14 @@ TrajectoryBatch GroupedRollout::collect(Agent& policy, RolloutStats& stats) {
     for (int i = 0; i < B; ++i)
         if (active[i]) outcome[i] = outcome_sign(st[i]);  // hit the step cap
 
-    // --- per-episode return + group-relative advantage ---
+    // --- per-episode return (loss forfeits the accumulated reward) + group-relative advantage ---
     std::vector<float> Rv(B);
-    for (int i = 0; i < B; ++i)
-        Rv[i] = (float)(cfg_.grpo.dense_weight * dense_ret[i] +
-                        cfg_.grpo.outcome_weight * outcome[i]);
+    for (int i = 0; i < B; ++i) {
+        double D = cfg_.grpo.dense_weight * dense_ret[i];
+        double o = outcome[i];
+        double R = ((forfeit && o < 0.0) ? -D : D) + cfg_.grpo.outcome_weight * o;
+        Rv[i] = (float)R;
+    }
     auto R = torch::from_blob(Rv.data(), {B}, fo).clone();
     std::vector<int64_t> gidv(B);
     for (int i = 0; i < B; ++i) gidv[i] = i / G;

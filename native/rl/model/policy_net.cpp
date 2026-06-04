@@ -16,6 +16,12 @@ PolicyNetImpl::PolicyNetImpl(const ModelConfig& c) : cfg(c), A(c.actions_per_ent
     ent2 = register_module("ent2", torch::nn::Linear(h, h));
     ctx0 = register_module("ctx0", torch::nn::Linear(h + G, h));
     ctx2 = register_module("ctx2", torch::nn::Linear(h, h));
+    ent_glu_gate = register_module("ent_glu_gate", torch::nn::Linear(h, h));
+    ent_glu_val = register_module("ent_glu_val", torch::nn::Linear(h, h));
+    ent_glu_out = register_module("ent_glu_out", torch::nn::Linear(h, h));
+    ctx_glu_gate = register_module("ctx_glu_gate", torch::nn::Linear(h, h));
+    ctx_glu_val = register_module("ctx_glu_val", torch::nn::Linear(h, h));
+    ctx_glu_out = register_module("ctx_glu_out", torch::nn::Linear(h, h));
     if (c.target_mode) {
         aq = register_module("aq", torch::nn::Linear(h + h, nf * h));
         ak = register_module("ak", torch::nn::Linear(h, h));
@@ -32,10 +38,14 @@ torch::Tensor PolicyNetImpl::forward(const torch::Tensor& entities,
                                      const torch::Tensor& globals) {
     auto tok = torch::relu(ent0->forward(entities));
     tok = ent2->forward(tok);                                  // (B,E,h)
+    tok = tok + ent_glu_out->forward(ent_glu_val->forward(tok) *
+                                     torch::sigmoid(ent_glu_gate->forward(tok)));  // residual GLU
     auto m = entity_mask.unsqueeze(-1);                        // (B,E,1)
     auto pooled = (tok * m).sum(1) / m.sum(1).clamp_min(1.0);  // (B,h)
     auto core = torch::relu(ctx0->forward(torch::cat({pooled, globals}, -1)));
     core = ctx2->forward(core);                                // (B,h)
+    core = core + ctx_glu_out->forward(ctx_glu_val->forward(core) *
+                                       torch::sigmoid(ctx_glu_gate->forward(core)));  // residual GLU
     auto core_b = core.unsqueeze(1).expand({-1, tok.size(1), -1});  // (B,E,h)
     int nf = (int)cfg.fractions.size();
 

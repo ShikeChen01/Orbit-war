@@ -12,15 +12,60 @@
 
 namespace ow {
 
-constexpr int N_ENTITY_FEATURES = 15;
+constexpr int N_ENTITY_FEATURES = 20;  // 15 base + 5 incoming-fleet threat features
 constexpr int N_GLOBAL_FEATURES = 10;
 inline const double SHIP_LOG_DENOM = std::log(1000.0);
 inline const double DIAG_HALF = std::sqrt(BOARD_SIZE * BOARD_SIZE + BOARD_SIZE * BOARD_SIZE) / 2.0;
 constexpr double PRESSURE_RADIUS = 25.0;
 constexpr double PI = 3.141592653589793;  // == Python math.pi
+constexpr double THREAT_MAX_SPEED = 6.0;  // == Config.shipSpeed; fleet speed cap for the ETA model
+constexpr double THREAT_ETA_TAU = 8.0;    // imminence = exp(-eta/tau); ~half-life of 5-6 ticks
+constexpr double THREAT_MARGIN_SCALE = 100.0;  // hold-margin -> tanh divisor
 
 inline double ship_log(double n) {
     return std::log1p(std::max(0.0, n)) / SHIP_LOG_DENOM;
+}
+
+// Fleet ship-speed (mirrors sim.hpp fleet movement): larger fleets move faster, capped.
+inline double fleet_speed(long ships) {
+    double n = (double)std::max<long>(1, ships);
+    double v = 1.0 + (THREAT_MAX_SPEED - 1.0) * std::pow(std::log(n) / std::log(1000.0), 1.5);
+    return std::min(v, THREAT_MAX_SPEED);
+}
+
+// Closed-form straight-line threat projection: the planet INDEX this fleet first reaches and
+// the ETA in ticks, or {-1, 0} if it crosses the sun or hits nothing ahead. This approximates
+// the swept collision (it ignores planet rotation and re-launch self-hits) but is computed
+// identically on the Python side, so the observation stays parity-exact. It is used ONLY for
+// the threat features -- never for game mechanics, which remain the exact ported sim.
+inline std::pair<int, double> fleet_target(const Fleet& f, const std::vector<Planet>& planets) {
+    double dx = std::cos(f.angle), dy = std::sin(f.angle);
+    int best = -1;
+    double best_t = 1e18;
+    for (size_t i = 0; i < planets.size(); ++i) {
+        const Planet& p = planets[i];
+        double ox = f.x - p.x, oy = f.y - p.y;
+        double tca = -(ox * dx + oy * dy);   // distance along ray to closest approach
+        if (tca < 0.0) continue;             // planet is behind the fleet
+        double perp2 = ox * ox + oy * oy - tca * tca;
+        double rr = p.radius * p.radius;
+        if (perp2 > rr) continue;            // ray misses the planet disk
+        double t = tca - std::sqrt(rr - perp2);  // distance to first intersection
+        if (t < 0.0) t = 0.0;
+        if (t < best_t) { best_t = t; best = (int)i; }
+    }
+    if (best < 0) return {-1, 0.0};
+    double sx = f.x - CENTER, sy = f.y - CENTER;  // sun occlusion: dies if it crosses the sun first
+    double tcs = -(sx * dx + sy * dy);
+    if (tcs >= 0.0) {
+        double perp2 = sx * sx + sy * sy - tcs * tcs;
+        double sr = SUN_RADIUS * SUN_RADIUS;
+        if (perp2 <= sr) {
+            double t_sun = tcs - std::sqrt(sr - perp2);
+            if (t_sun >= 0.0 && t_sun < best_t) return {-1, 0.0};
+        }
+    }
+    return {best, best_t / fleet_speed(f.ships)};
 }
 
 // Row ordering used by both encode and decode: own planets first, then by id.
@@ -54,14 +99,31 @@ inline void encode_obs(const GameState& s, int player, int max_entities,
         return std::find(comet_set.begin(), comet_set.end(), id) != comet_set.end();
     };
 
-    // Per-planet fleet pressure.
-    std::vector<double> enemy_press(s.planets.size(), 0.0), ally_press(s.planets.size(), 0.0);
+    // Per-planet fleet pressure (raw proximity sum) + projected incoming threat (who a fleet
+    // will actually reach, and when). Threat is the signal a reactive policy needs to defend:
+    // a fleet inside the pressure radius but aimed away is harmless; one aimed in from afar is
+    // the danger. fleet_target() filters out fleets that hit nothing.
+    size_t np = s.planets.size();
+    std::vector<double> enemy_press(np, 0.0), ally_press(np, 0.0);
+    std::vector<double> inc_enemy(np, 0.0), inc_ally(np, 0.0);
+    std::vector<double> eta_enemy(np, 1e18), eta_ally(np, 1e18);
     for (const auto& f : s.fleets) {
-        for (size_t i = 0; i < s.planets.size(); ++i) {
+        for (size_t i = 0; i < np; ++i) {
             if (distance2(f.x, f.y, s.planets[i].x, s.planets[i].y) <= PRESSURE_RADIUS) {
                 if (f.owner == player) ally_press[i] += f.ships;
                 else enemy_press[i] += f.ships;
             }
+        }
+        auto tgt = fleet_target(f, s.planets);
+        if (tgt.first < 0) continue;
+        int ti = tgt.first;
+        double eta = tgt.second;
+        if (f.owner == player) {
+            inc_ally[ti] += (double)f.ships;
+            if (eta < eta_ally[ti]) eta_ally[ti] = eta;
+        } else {
+            inc_enemy[ti] += (double)f.ships;
+            if (eta < eta_enemy[ti]) eta_enemy[ti] = eta;
         }
     }
 
@@ -88,6 +150,15 @@ inline void encode_obs(const GameState& s, int player, int max_entities,
         e[12] = ((dist_center + p.radius) < ROTATION_RADIUS_LIMIT) ? 1.f : 0.f;
         e[13] = (float)ship_log(enemy_press[i]);
         e[14] = (float)ship_log(ally_press[i]);
+        // Incoming-fleet threat (projected): how much / how soon, plus a net hold-margin.
+        double ie = inc_enemy[i], ia = inc_ally[i], ee = eta_enemy[i], ea = eta_ally[i];
+        e[15] = (float)ship_log(ie);                                       // enemy ships inbound
+        e[16] = ie > 0.0 ? (float)std::exp(-ee / THREAT_ETA_TAU) : 0.f;    // enemy imminence (->1 soon)
+        e[17] = (float)ship_log(ia);                                       // my reinforcements inbound
+        e[18] = ia > 0.0 ? (float)std::exp(-ea / THREAT_ETA_TAU) : 0.f;    // reinforcement imminence
+        // Hold-margin at impact: current ships + production banked until impact + help - attack.
+        double margin = ie > 0.0 ? ((double)p.ships + (double)p.production * ee + ia - ie) : 0.0;
+        e[19] = ie > 0.0 ? (float)std::tanh(margin / THREAT_MARGIN_SCALE) : 0.f;  // >0 hold, <0 fall
         entity_mask[row] = 1.f;
         row_planet_id[row] = p.id;
         row_planet_ships[row] = p.ships;

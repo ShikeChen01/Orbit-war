@@ -72,11 +72,12 @@ aim angle computed analytically to hit $t$), or $C=$ \texttt{angle\_bins} in
 \end{equation}
 
 %==============================================================
-\section{Observation encoding}
+\section{Observation encoding}\label{sec:obs}
 For ego player $p$ and state $s$, the encoder (\texttt{native/core/encode.hpp}) emits
 \begin{itemize}[nosep]
-  \item entity features $X\in\R^{E\times F}$ ($F=15$): per planet/fleet geometry, ownership
-        (ego/ally/enemy/neutral one-hots), ships, production, comet flags;
+  \item entity features $X\in\R^{E\times F}$ ($F=20$): per planet geometry, ownership
+        (ego/ally/enemy/neutral one-hots), ships, production, comet/orbit flags, proximity
+        fleet pressure, and \textbf{five incoming-fleet threat features} (below);
   \item entity mask $m\in\{0,1\}^{E}$: $m_e=1$ iff slot $e$ is a real entity;
   \item action mask $u\in\{0,1\}^{E}$: $u_e=1$ iff $e$ is an ego-owned planet with $>0$ ships
         (i.e.\ legally able to launch);
@@ -84,24 +85,86 @@ For ego player $p$ and state $s$, the encoder (\texttt{native/core/encode.hpp}) 
         counts, angular velocity, etc.
 \end{itemize}
 
+\paragraph{Incoming-fleet threat features (defensive lookahead).}\label{sec:threat}
+A purely \emph{reactive} policy cannot defend if it cannot see what is coming: the base
+encoder summarized fleets only as a radius-25 proximity sum, which is blind to a fleet's
+\emph{heading} (one aimed away is harmless; one aimed in from afar is the danger). We add a
+closed-form projection of each in-flight fleet onto the planets. A fleet at position $o$ with
+unit heading $\hat d=(\cos\alpha,\sin\alpha)$ and ship count $\nu$ moves at speed
+\begin{equation}
+v(\nu)=\min\!\Big(v_{\max},\; 1+(v_{\max}-1)\big(\tfrac{\ln \max(1,\nu)}{\ln 1000}\big)^{1.5}\Big),
+\qquad v_{\max}=6,
+\end{equation}
+matching the engine's fleet dynamics. For a planet at $c$ with radius $\varrho$, the ray
+$o+t\hat d$ enters the planet disk at
+\begin{equation}
+t_{\mathrm{ca}} = -\langle o-c,\hat d\rangle,\quad
+p^2 = \lVert o-c\rVert^2 - t_{\mathrm{ca}}^2,\quad
+t_{\mathrm{hit}} = t_{\mathrm{ca}} - \sqrt{\varrho^2-p^2}\ \ (\text{if } t_{\mathrm{ca}}\!\geq\!0,\ p^2\!\leq\!\varrho^2).
+\end{equation}
+The fleet is assigned to the planet with the smallest $t_{\mathrm{hit}}\!\geq\!0$, unless the
+ray first crosses the sun (same test against the central disk), in which case it is dropped ---
+the heuristic ``does this fleet hit anything?'' filter. Its ETA in ticks is
+$\tau = t_{\mathrm{hit}}/v(\nu)$. Aggregating per planet $e$ over enemy ($\mathcal E_e$) and
+ally ($\mathcal A_e$) inbound fleets, with $I^{\mathrm{en}}_e=\!\sum_{\mathcal E_e}\!\nu$,
+$I^{\mathrm{al}}_e=\!\sum_{\mathcal A_e}\!\nu$, and $\tau^{\mathrm{en}}_e,\tau^{\mathrm{al}}_e$
+the minimum ETAs, the five features are
+\begin{equation}
+\Big[\ \widetilde{I^{\mathrm{en}}_e},\ \
+e^{-\tau^{\mathrm{en}}_e/\theta},\ \
+\widetilde{I^{\mathrm{al}}_e},\ \
+e^{-\tau^{\mathrm{al}}_e/\theta},\ \
+\tanh\!\big(\Delta_e/\theta_m\big)\ \Big],
+\end{equation}
+where $\widetilde{x}=\ln(1+x)/\ln 1000$ is the ship-log compressor, $\theta=8$ sets the
+imminence half-life, and
+$\Delta_e=\mathrm{ships}_e+\mathrm{prod}_e\,\tau^{\mathrm{en}}_e+I^{\mathrm{al}}_e-I^{\mathrm{en}}_e$
+is the \emph{hold-margin}: ships on hand, plus production banked until impact, plus
+reinforcements, minus the attack ($>0$ holds, $<0$ falls). Imminence and margin are zeroed
+when there is no enemy threat. The projection is an approximation (it ignores planet rotation),
+but it is computed \emph{identically} in C++ and Python (parity-tested bit-for-bit), so the
+policy trained natively behaves identically when served from pure Python.
+
 %==============================================================
 \section{Policy network $\pi_\theta$}\label{sec:policy}
 The network (\texttt{native/rl/model/policy\_net.hpp}) maps $(X,m,u,g)$ to per-entity class
 logits $Z\in\R^{E\times A}$. It has \textbf{no value head}; GRPO needs no critic. Let
-$d=128$ (\texttt{hidden}).
+$d=128$ (\texttt{hidden}). The trunk is \emph{MLP $+$ residual GLU} (gated linear unit): each
+encoder is a two-layer ReLU MLP followed by one residual GLU block, which adds multiplicative
+gating and a skip connection on top of the MLP features.
 
-\paragraph{Entity encoder.} A shared two-layer MLP over each entity row:
+\paragraph{Residual GLU block.} For an input $z\in\R^{d}$, with three $d\times d$ weight
+matrices (gate $W_g$, value $W_v$, output $W_o$),
 \begin{equation}
-h_e = W_2\,\relu\!\big(W_1 x_e + b_1\big) + b_2 \in \R^{d},
+\mathrm{GLU}(z) = \big(W_v z + b_v\big)\odot \sigma\!\big(W_g z + b_g\big),
+\qquad
+\mathcal{B}(z) = z + W_o\,\mathrm{GLU}(z) + b_o \ \in\R^{d},
+\label{eq:glu}
+\end{equation}
+where $\sigma$ is the logistic sigmoid and $\odot$ is elementwise. The sigmoid gate lets the
+block pass, attenuate, or suppress each feature channel conditionally (e.g.\ amplify the
+incoming-threat channels of Section~\ref{sec:threat} when a planet is under attack); the
+residual keeps optimization easy. Applied per entity row (encoder 1) or to the pooled
+context vector (encoder 2), it shares weights across rows just like the MLP.
+
+\paragraph{Entity encoder (2-layer MLP $+$ GLU).} A shared two-layer MLP over each entity row,
+then a residual GLU block ($\mathcal{B}_{\mathrm{ent}}$, its own weights):
+\begin{equation}
+\tilde h_e = W_2\,\relu\!\big(W_1 x_e + b_1\big) + b_2,
+\qquad
+h_e = \mathcal{B}_{\mathrm{ent}}(\tilde h_e) \in \R^{d},
 \qquad e=1,\dots,E .
 \end{equation}
 
-\paragraph{Context encoder.} A mask-aware mean pool followed by a two-layer MLP on the pooled
-tokens concatenated with the globals:
+\paragraph{Context encoder (2-layer MLP $+$ GLU).} A mask-aware mean pool, a two-layer MLP on
+the pooled tokens concatenated with the globals, then its own residual GLU block
+$\mathcal{B}_{\mathrm{ctx}}$:
 \begin{equation}
 \bar h = \frac{\sum_{e} m_e\, h_e}{\max\!\big(\sum_e m_e,\,1\big)},
 \qquad
-c = W_4\,\relu\!\big(W_3\,[\,\bar h\,;\,g\,] + b_3\big) + b_4 \in\R^{d}.
+\tilde c = W_4\,\relu\!\big(W_3\,[\,\bar h\,;\,g\,] + b_3\big) + b_4,
+\qquad
+c = \mathcal{B}_{\mathrm{ctx}}(\tilde c) \in\R^{d}.
 \end{equation}
 
 \paragraph{Actor head.} Two interchangeable heads produce the raw logits $\tilde Z$:
@@ -133,6 +196,26 @@ Z_{e,\,\text{class}(t,f)} =
 \end{cases}
 \end{equation}
 
+\paragraph{Layer inventory (target mode, $d=128$).} All layers are \texttt{nn.Linear}; the
+trunk is the two MLPs each followed by one residual GLU block, then the pointer actor.
+\begin{center}\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Module & Layers (name: shape) & Count \\
+\midrule
+Entity encoder & \texttt{ent0}:$F{\to}d$, \texttt{ent2}:$d{\to}d$;\ GLU \texttt{ent\_glu\_\{gate,val,out\}}:$d{\to}d$ & 5 \\
+Context encoder & \texttt{ctx0}:$d{+}G{\to}d$, \texttt{ctx2}:$d{\to}d$;\ GLU \texttt{ctx\_glu\_\{gate,val,out\}}:$d{\to}d$ & 5 \\
+Pointer actor & \texttt{aq}:$2d{\to}|\mathcal F|d$,\ \texttt{ak}:$d{\to}d$,\ \texttt{anoop}:$2d{\to}1$ & 3 \\
+\midrule
+\multicolumn{2}{@{}l}{\emph{Trainable total (no critic --- GRPO)}} & \textbf{13} \\
+\bottomrule
+\end{tabular}
+\end{center}
+\noindent (The Python serving net additionally carries a 2-layer critic
+\texttt{critic.0/.2} for legacy PPO tooling; the native GRPO trainer and arena never
+instantiate or load it.) With $F{=}20$, $G{=}10$, $d{=}128$, $|\mathcal F|{=}4$ this is
+$\approx 0.18$M parameters.
+
 %==============================================================
 \section{Action distribution}\label{sec:dist}
 Each entity is an independent masked categorical; a turn's joint action is their product over
@@ -154,37 +237,43 @@ $\arg\max_a Z_{e,a}$ at evaluation).
 
 %==============================================================
 \section{Reward and return}\label{sec:reward}
-\paragraph{Shaped potential.} Let $\mathrm{ships}_p(s)$ and $\mathrm{prod}_p(s)$ be player
-$p$'s total ships (planets $+$ fleets) and total planetary production in $s$. Define the
-production-aware potential (\texttt{native/rl/reward}; \texttt{prod\_weight}$=w_{\Phi}$)
+\paragraph{Production-only dense reward.} The shaped reward rewards \emph{growing one's own
+production efficiently}, and nothing else --- not raw planet count, not ship count (both of
+which an agent can maximize while still losing the game). Let
+$\Pi_0(s)=\sum_{p:\,\mathrm{owner}(p)=0}\mathrm{prod}(p)$ be ego's total planetary production,
+read directly from the state. For the ego launches $\mathcal L_t$ issued at step $t$, classify
+each by the closed-form projection of Section~\ref{sec:threat}: it \emph{hits} if its fleet
+reaches some planet, else it is \emph{wasted}. With $h_t,m_t$ the hit/wasted counts, weights
+$w_{\Pi}$ (\texttt{prod\_reward\_weight}), $\rho^{+}$ (\texttt{launch\_hit\_reward}),
+$\rho^{-}$ (\texttt{launch\_miss\_penalty}), and scale/clip $\sigma,\kappa$,
 \begin{equation}
-\Phi(s) = \big(\mathrm{ships}_0(s)-\mathrm{ships}_1(s)\big)
-        + w_{\Phi}\big(\mathrm{prod}_0(s)-\mathrm{prod}_1(s)\big).
+r_t = \clip\!\left(\frac{\,w_{\Pi}\big(\Pi_0(s_{t+1})-\Pi_0(s_t)\big)
+   + \rho^{+} h_t - \rho^{-} m_t\,}{\sigma},\,-\kappa,\,\kappa\right).
 \end{equation}
-Including production makes \emph{capturing a planet} immediately rewarding, counteracting the
-short-term ship cost of expansion that made a ship-only reward collapse to passivity.
+Capturing a high-production planet is rewarded \emph{exactly} through $\Delta\Pi_0$; a fleet
+launched to land nowhere is penalized the instant it is fired; a productive launch earns a
+small bonus (which also pulls the policy off the passive ``never launch'' optimum).
 
-\paragraph{Per-step shaped reward.} With scale $\sigma$ (\texttt{reward\_scale}) and clip
-$\kappa$ (\texttt{reward\_clip}),
-\begin{equation}
-r^{\mathrm{sh}}_t = \clip\!\left(\frac{\Phi(s_{t+1})-\Phi(s_t)}{\sigma},\,-\kappa,\,\kappa\right).
-\end{equation}
-
-\paragraph{Outcome.} At the terminal step $T_i$ of trajectory $i$, the game is scored by total
-ships; let $o_i=+1$ if ego wins, $-1$ if it loses, $0$ on a draw.
-
-\paragraph{GRPO return.} GRPO scores a \emph{whole trajectory} by a scalar return blending the
-discounted shaped reward and the outcome (\texttt{gamma}~$\gamma$, weights
-$w_{\mathrm{d}}=$\texttt{dense\_weight}, $w_{\mathrm{o}}=$\texttt{outcome\_weight}):
+\paragraph{Outcome and the loss forfeit.} At termination the game is scored by total ships;
+$o_i=+1$ win, $-1$ loss, $0$ draw. Let $D_i=\sum_t\gamma^t r_{i,t}$ be the accumulated discounted
+dense reward. It is kept on a win but \textbf{forfeited on a loss} --- the return negates it, so
+a trajectory that hoarded production yet still lost scores a large \emph{negative}
+($\texttt{loss\_forfeit}$; $w_{\mathrm d}=$\texttt{dense\_weight}, $w_{\mathrm o}=$\texttt{outcome\_weight}):
 \begin{equation}
 \boxed{\;
-R_i \;=\; w_{\mathrm{d}}\sum_{t=0}^{T_i-1}\gamma^{t}\,r^{\mathrm{sh}}_{i,t}
-       \;+\; w_{\mathrm{o}}\,o_i
+R_i = \begin{cases}
+\ \ w_{\mathrm d} D_i + w_{\mathrm o}, & o_i>0\ \text{(win)},\\[2pt]
+\ \ w_{\mathrm d} D_i, & o_i=0\ \text{(draw)},\\[2pt]
+-\,w_{\mathrm d} D_i - w_{\mathrm o}, & o_i<0\ \text{(loss)}.
+\end{cases}
 \;}
 \label{eq:return}
 \end{equation}
-Setting $w_{\mathrm{d}}=0$ recovers \emph{pure-outcome} GRPO; $\gamma=1$ is the
-undiscounted Monte-Carlo return (the default).
+Winning thus dominates by at least $2w_{\mathrm o}$, and among losses the \emph{more} a
+trajectory accumulated without converting it to a win, the worse it scores --- directly
+penalizing ``maximize my own production/ships but lose the game,'' which earlier shaped rewards
+failed to discourage. Setting \texttt{loss\_forfeit}=false recovers the plain
+$R_i=w_{\mathrm d}D_i+w_{\mathrm o}o_i$.
 
 \paragraph{Note --- 2p vs.\ 4p objective.} The margin potential $\Phi$ and the outcome $o_i$ are
 the two-player ($N=2$) zero-sum forms. In $N=4$ free-for-all the objective is \emph{ordinal} ---
@@ -192,6 +281,39 @@ be the maximum of four --- which is not zero-sum: e.g.\ $\Phi$ would become
 $\mathrm{ships}_0 - \max_{k\neq 0}\mathrm{ships}_k$ (margin over the \emph{strongest} rival, or a
 soft-max thereof) and $o_i$ the FFA win/lose of Section~\ref{sec:problem}. The GRPO machinery
 (advantage, surrogate, KL) is unchanged --- only $R_i$ in Eq.~\eqref{eq:return} is redefined.
+
+%==============================================================
+\section{Curriculum}\label{sec:curriculum}
+From-scratch and BC-finetuned RL repeatedly plateaued at $\sim$random level \emph{versus}
+the scripted \texttt{starter} ($\le 2\%$ win), because two skills are entangled in the full
+adversarial task: (i) \emph{aim + expand} --- launch ships that actually capture planets ---
+and (ii) \emph{defend} --- hold planets against incoming fleets. We decouple them with a
+three-stage curriculum (\texttt{RolloutConfig::stage}); each stage warm-starts from the
+previous stage's policy, which also becomes the new KL reference $\polref$ of
+Section~\ref{sec:kl} (anchor-and-advance, rather than anchoring forever to the passive BC).
+\emph{All stages share the one reward of Section~\ref{sec:reward}} (production-only dense $+$
+launch quality, loss-forfeit return); only the \textbf{opponent} and the discount $\gamma$
+change across stages.
+
+\paragraph{Stage 1 --- solo expansion (passive opponent).} The opponent issues no launches, so
+the policy can freely learn to aim and to take the whole map without adversarial punishment.
+Because the passive opponent hoards production on its home planet, the ego must actually
+\emph{conquer} it (not merely grab neutrals) to win the terminal ship score --- failing that,
+the loss forfeit (Eq.~\eqref{eq:return}) turns the episode negative. Running with $\gamma<1$
+($\gamma=0.99$) makes \emph{earlier} production gains worth more, i.e.\ a discounted
+``planet-takeover-time'' incentive for fastest full-map conquest; the episode ends early once
+the ego owns everything.
+
+\paragraph{Stage 2 --- $1$v$1$ vs.\ starter.} The opponent is always \texttt{starter} and
+$\gamma=1$ (timing is now dictated by the opponent, not a solo clock). The same reward applies,
+so the loss forfeit is fully in force: the agent must convert its production into an actual win
+and must \emph{defend} (using the threat features of Section~\ref{sec:threat}) or forfeit
+everything it built. The Stage-1 policy supplies both the initialization and $\polref$, so it
+keeps its aiming/expansion skill while learning to win.
+
+\paragraph{Stage 3 --- mixed opponents.} The opponent per group is sampled from
+\{\texttt{random}, \texttt{starter}, (league snapshots)\} as in Section~\ref{sec:league},
+generalizing beyond a single fixed adversary toward the multi-opponent FFA setting.
 
 %==============================================================
 \section{GRPO update}\label{sec:grpo}
@@ -305,8 +427,13 @@ $c_{\mathcal H}$ & \texttt{GrpoConfig::ent\_coef} & $0.01$ \\
 $\varepsilon$ & \texttt{GrpoConfig::adv\_eps} & $10^{-4}$ \\
 $w_{\mathrm d},\,w_{\mathrm o}$ & \texttt{GrpoConfig::dense\_weight}, \texttt{outcome\_weight} & $1,\ 1$ \\
 $\gamma$ & \texttt{GrpoConfig::gamma} & $1.0$ \\
-$w_{\Phi}$ & \texttt{RolloutConfig::prod\_weight} & $20$ \\
+$w_{\Pi}$ & \texttt{RolloutConfig::prod\_reward\_weight} & $10$ \\
+$\rho^{+}$ & \texttt{RolloutConfig::launch\_hit\_reward} & $0.5$ \\
+$\rho^{-}$ & \texttt{RolloutConfig::launch\_miss\_penalty} & $1.0$ \\
+\texttt{loss\_forfeit} & \texttt{RolloutConfig::loss\_forfeit} & true \\
 $\sigma,\,\kappa$ & \texttt{RolloutConfig::reward\_scale}, \texttt{reward\_clip} & $50,\ 5$ \\
+stage & \texttt{RolloutConfig::stage} & $2$ \\
+$\theta,\,\theta_m$ & threat $\tau$-scale, margin-scale (\texttt{encode.hpp}) & $8,\ 100$ \\
 $\eta$ & \texttt{OptimConfig::lr} & $3\!\times\!10^{-4}$ \\
 \bottomrule
 \end{tabular}

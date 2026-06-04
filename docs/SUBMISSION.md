@@ -8,15 +8,23 @@ and `kaggle_environments` itself).
 
 ## What to submit
 
+> **Architecture note (2026-06-04).** The serving net is now the **threat-aware (F=20) +
+> GLU/ResNet** `EntityPolicy`. The bundled `orbit_wars_rl/processors/observation.py` (5 incoming-
+> fleet threat features) and `agents/ppo_policy.py` (residual GLU blocks) already match the trained
+> checkpoints, and the threat features are computed from the same `py_engine` fleet state on the
+> eval box (no `.pyd`). Any submission must ship these two files unchanged alongside the checkpoint.
+
 Two options, in increasing strength:
 
-### A. Raw policy (simplest)
+### A. Raw policy (now strong: **55% vs starter**, 99.5% vs random)
 Wrap a trained checkpoint with `PolicyAgent` and emit `to_kaggle_agent()`. The pointer-actor
-`EntityPolicy` forward is small and runs in well under the budget on CPU. The strongest raw
-policy here is `runs/native/bc_start.pt` (BC clone of starter: ~96% vs random). Note raw
-policies plateau ~0–2% vs starter (over-extension) — option B is the real edge.
+`EntityPolicy` forward is small and runs in well under the budget on CPU. The strongest raw policy
+is **`runs/grpo/win1/best.pt`** (GRPO + new reward; 55% vs starter, 99.5% vs random); the strong BC
+`runs/native/bc_glu.pt` is 52%/99.5%. The old "raw plateaus ~0–2% vs starter" no longer holds — it
+was a weak-BC + threat-blind artifact (see `EXPERIMENTS.md`). Raw is the simplest, timeout-free
+submission and already beats starter.
 
-### B. Inference search (the edge: 0% → **70%** vs starter)
+### B. Inference search (further booster on top of the raw policy)
 Lookahead on a bit-exact forward model, opponent modeled as `starter`. The strongest config is
 **`mode="per_planet"`** (decide each planet's hold-vs-attack by 1-ply lookahead, H=8) — 70% vs
 starter from a 0%-greedy policy. (Joint mode with an all-noop candidate gives 42%.) Ready to

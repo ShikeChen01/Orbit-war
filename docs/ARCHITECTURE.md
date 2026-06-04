@@ -13,20 +13,25 @@ The original pure-Python gym-env + PPO training loop has been **archived**
 faster, bit-exact env). What remains in Python is the engine wrapper, the abstractions,
 and the serving/eval path.
 
-> **RL math:** the full policy architecture, reward shaping, and the training update are
-> derived in [`rl_math.pdf`](rl_math.pdf) (LaTeX source [`rl_math.tex`](rl_math.tex)).
+> **RL math:** the full policy architecture, observation, reward shaping, curriculum, and the
+> training update are derived in [`rl_math.pdf`](rl_math.pdf) (source [`rl_math.tex`](rl_math.tex)).
 >
-> **In flight (2026-06-03), two refactors:**
-> 1. **Python-free native loop.** `native/apps/` builds `ow_train`/`ow_eval` executables that
->    read a cached world pool (`.owp`) and read/write checkpoints (`.owc`) via
->    `native/io/serialize.hpp` — the dev loop is `native\build.cmd` → `native\run.cmd ow_train …`
->    with no Python. Python is demoted to one-time world-gen (`scripts/gen_world_pool.py`), the
->    Kaggle submission (pure Python, reads `.owc` via `orbit_wars_rl/native_ckpt.py`), and the
->    parity oracle. **Done & validated.**
-> 2. **PPO → GRPO.** The trainer is being rewritten from actor–critic PPO to **GRPO**
->    (group-relative advantage, **no value network**) with a clean hpp/cpp split:
->    `native/rl/config.hpp`, `native/rl/model/{policy_net,distribution,agent}.hpp`,
->    `native/rl/algo/grpo.hpp`. **Headers in progress.**
+> **Current native RL stack (2026-06-04):**
+> 1. **Python-free native loop.** `native/apps/` builds `ow_train`/`ow_eval`/`ow_train_grpo`
+>    executables that read a cached world pool (`.owp`) and read/write checkpoints (`.owc`) via
+>    `native/io/serialize.hpp` — the dev loop is `native\build.cmd` → `native\run.cmd ow_train_grpo …`
+>    with no Python. Python is demoted to one-time world-gen, BC warm-start, the Kaggle submission
+>    (pure Python, reads `.owc` via `orbit_wars_rl/native_ckpt.py`), and the parity oracle.
+> 2. **GRPO trainer (no value network).** `ow_train_grpo` runs grouped episodic rollouts →
+>    group-relative advantage → clipped surrogate + KL-to-reference + entropy, with a clean
+>    hpp/cpp split: `native/rl/config.hpp`, `native/rl/model/{policy_net,distribution,agent}`,
+>    `native/rl/algo/grpo`, `native/rl/{rollout,grpo_trainer}`. Writes a results folder
+>    (`metrics.csv` + `best/last.owc` + `config.txt`).
+> 3. **Threat-aware observation (F=20).** The encoder adds five incoming-fleet features
+>    (projected ships / ETA-imminence / hold-margin) so a reactive policy can *defend* — the gap
+>    that previously forced inference-time search. Parity-exact C++↔Python (`test_encode_parity`).
+> 4. **Three-stage curriculum** (`RolloutConfig::stage`): solo expansion (γ<1 takeover-time) →
+>    1v1 vs starter → mixed opponents, each warm-started + KL-anchored from the previous stage.
 
 ```
                 ┌──────────────────────────────────────────────┐
@@ -75,19 +80,25 @@ class Agent:
   **serve** native-trained weights in the arena and the kaggle submission.
 
 ### Processors (`processors/`) — "switch the representation"
-- `EntityObservation` — each planet → a fixed feature row, padded to `max_entities`, with
-  `entity_mask` + `action_mask` + a `globals` vector, all relative to the acting player.
-  The C++ `core/encode.hpp` matches it **byte-for-byte** (`tests/test_encode_parity.py`).
-- `PerPlanetAction` — one categorical per planet (class 0 = no-op, else
-  `(angle_bin, ship-fraction)`), `1 + angle_bins·|fractions|` classes; ownership-safe.
+- `EntityObservation` — each planet → a fixed 20-feature row (geometry, ownership, ships,
+  production, fleet pressure, **+5 incoming-fleet threat features**: projected enemy/ally ships,
+  ETA-imminence, hold-margin), padded to `max_entities`, with `entity_mask` + `action_mask` +
+  a `globals` vector, all relative to the acting player. The C++ `core/encode.hpp` matches it
+  **byte-for-byte** (`tests/test_encode_parity.py`).
+- `PerPlanetAction` — one categorical per planet (class 0 = no-op). **Target mode** (default):
+  class ≥1 names a `(target entity, ship-fraction)` and aims analytically to hit it,
+  `1 + max_entities·|fractions|` classes; ownership-safe. (Angle mode names an angle bin instead.)
 
 Want a different state encoding or action parameterization? Implement a new processor (and
 mirror it in `core/encode.hpp`); the policy head size follows `actions_per_entity`.
 
 ### Policy (`agents/ppo_policy.py`)
 `EntityPolicy` (torch): shared per-planet encoder → masked mean-pool ++ globals → core;
-per-entity actor head (masked categorical) + value head. The C++ `rl/policy.hpp` is its
-twin with identical layer shapes, so native weights load 1:1 — verified by
+per-entity **pointer actor** (target-mode: each owned planet scores `(target, fraction)`
+by `⟨q(tok,core), k(tok_target)⟩`, masked categorical). The Python net still carries a value
+head for legacy PPO tooling, but **GRPO uses no critic** — the native training net
+(`rl/model/policy_net`) drops it. The C++ `rl/policy.hpp` (arena) and `rl/model/policy_net`
+(trainer) are twins with identical layer shapes, so BC/native weights load 1:1 — verified by
 `tests/test_native.py` (C++ greedy == exported-Python greedy).
 
 ## Native training path (primary)
@@ -95,16 +106,16 @@ twin with identical layer shapes, so native weights load 1:1 — verified by
 All in C++ (`native/rl/`), so observations stay as `torch::Tensor` and never cross the
 Python boundary during training:
 
-1. **`BatchedEnv`** holds `B` independent games, steps them in parallel
-   (`std::execution::par`), encodes obs to tensors, computes the **dense reward**
-   (per-turn change in `my_score − opp_score` + terminal ±1), and reloads finished games
-   from a world pool. Opponent seat = scripted (random/starter) or a frozen self-play snapshot.
-2. **`Trainer`** collects a `T×B` rollout, computes GAE, and runs clipped-PPO minibatch
-   updates (Adam, entropy bonus, value loss, grad clip), taking self-play snapshots on a
-   schedule.
+1. **`GroupedRollout`** (`rl/rollout`) lays out `B = num_groups · group_size` games where every
+   game in a group shares one `(world, opponent)`, steps them in parallel
+   (`std::execution::par`), encodes obs to tensors, accumulates the discounted shaped reward,
+   and runs each to terminal. Opponent seat is stage-driven: noop (stage 1), starter (stage 2),
+   or a random/starter mix (stage 3).
+2. **`GrpoTrainer`** (`rl/grpo_trainer`) computes per-episode returns, **group-relative
+   advantages** (no critic, no GAE), then clipped-surrogate + KL-to-reference + entropy minibatch
+   updates (Adam, grad clip). Logs/evals vs random+starter every 200k steps into `metrics.csv`.
 3. **Worlds** come from `native_worldgen.py`, which reuses the *official* map generator —
-   so training maps match the competition distribution. (Comets omitted for now; see
-   `NATIVE_CPP.md`.)
+   so training maps match the competition distribution.
 
 Python only: generate the world pool, call `trainer.train()`, then `trainer.get_weights()`.
 
@@ -120,11 +131,11 @@ interface, no TorchScript, no second network definition.
 
 | Tensor | Shape | Notes |
 |--------|-------|-------|
-| `entities` | `(B, 64, 15)` | per-planet features |
+| `entities` | `(B, 64, 20)` | per-planet features (15 base + 5 threat) |
 | `entity_mask` / `action_mask` | `(B, 64)` | real planet / ownable-with-ships |
 | `globals` | `(B, 10)` | board summary |
-| action | `(B, 64)` int | per-planet class in `[0, 65)` |
-| logits | `(B, 64, 65)` | masked to legal launches |
+| action | `(B, 64)` int | per-planet class (target-mode: `1 + target·|F| + frac`) |
+| logits | `(B, 64, 257)` | target-mode: `1 + 64·4`, masked to legal launches |
 
 ## Where things live
 
