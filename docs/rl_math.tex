@@ -7,6 +7,8 @@
 \usepackage[colorlinks=true,linkcolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
 \usepackage{parskip}
 \usepackage{enumitem}
+\usepackage{tikz}
+\usetikzlibrary{positioning, arrows.meta, calc, fit}
 
 \newcommand{\R}{\mathbb{R}}
 \newcommand{\E}{\mathbb{E}}
@@ -133,6 +135,38 @@ $d=128$ (\texttt{hidden}). The trunk is \emph{MLP $+$ residual GLU} (gated linea
 encoder is a two-layer ReLU MLP followed by one residual GLU block, which adds multiplicative
 gating and a skip connection on top of the MLP features.
 
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+  font=\footnotesize, >={Stealth[round]}, node distance=5mm and 6.5mm,
+  io/.style ={draw, rounded corners=1pt, fill=gray!12,  align=center, minimum height=11mm, inner sep=2.5pt},
+  enc/.style={draw, rounded corners=3pt, fill=blue!9,   align=center, minimum height=12mm, inner sep=2.5pt},
+  glu/.style={draw, rounded corners=3pt, fill=orange!18, align=center, minimum height=12mm, inner sep=2.5pt},
+  act/.style={draw, rounded corners=3pt, fill=green!13,  align=center, minimum height=12mm, inner sep=2.5pt}]
+\node[io]  (x)              {entities\\$X{:}E{\times}F$};
+\node[enc, right=of x]   (ent)  {entity enc.\\MLP\\$F{\to}d{\to}d$};
+\node[glu, right=of ent] (eg)   {residual\\GLU};
+\node[enc, right=of eg]  (pool) {masked\\mean-pool};
+\node[enc, right=of pool](ctx)  {context enc.\\MLP\\$d{+}G{\to}d{\to}d$};
+\node[glu, right=of ctx] (cg)   {residual\\GLU};
+\node[act, right=of cg]  (ptr)  {pointer\\actor\\$\langle q_{e,f},k_t\rangle$};
+\node[io,  right=of ptr] (out)  {logits\\$E{\times}A$};
+\draw[->] (x)--(ent); \draw[->] (ent)--(eg); \draw[->] (eg)--(pool);
+\draw[->] (pool)--(ctx); \draw[->] (ctx)--(cg); \draw[->] (cg)--(ptr) node[midway,above,font=\scriptsize]{$c$};
+\draw[->] (ptr)--(out);
+\node[io, below=7mm of ctx] (g) {globals $g$};
+\draw[->] (g)--(ctx);
+\draw[->, dashed] (eg) to[out=65,in=115]
+      node[above, font=\scriptsize] {tokens $h_e$ (keys + query)} (ptr);
+\end{tikzpicture}
+\caption{Policy network data flow (target mode). Each encoder is a two-layer MLP followed by a
+residual GLU block (Fig.~\ref{fig:glu}). The masked mean-pool of the entity tokens $h_e$,
+concatenated with the globals $g$, gives the board context $c$; the pointer actor scores every
+(launcher $e$, target $t$, fraction $f$) from $h_e$ and $c$ (plus a per-launcher no-op),
+producing the $E\times A$ logits, which are then legality-masked.}
+\label{fig:arch}
+\end{figure}
+
 \paragraph{Residual GLU block.} For an input $z\in\R^{d}$, with three $d\times d$ weight
 matrices (gate $W_g$, value $W_v$, output $W_o$),
 \begin{equation}
@@ -141,6 +175,32 @@ matrices (gate $W_g$, value $W_v$, output $W_o$),
 \mathcal{B}(z) = z + W_o\,\mathrm{GLU}(z) + b_o \ \in\R^{d},
 \label{eq:glu}
 \end{equation}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+  font=\footnotesize, >={Stealth[round]},
+  lin/.style={draw, rounded corners=2pt, fill=blue!9, minimum height=7mm, inner sep=3pt},
+  op/.style ={draw, circle, fill=green!14, inner sep=0.5pt, minimum size=5mm}]
+\node (in) {$z$};
+\node[lin, above right=2mm and 10mm of in] (val)  {$W_v z + b_v$};
+\node[lin, below right=2mm and 10mm of in] (gate) {$\sigma(W_g z + b_g)$};
+\node[op,  right=20mm of in] (mul) {$\odot$};
+\node[lin, right=7mm of mul] (outp) {$W_o(\cdot) + b_o$};
+\node[op,  right=7mm of outp] (add) {$+$};
+\node[right=7mm of add] (y) {$\mathcal{B}(z)$};
+\draw[->] (in) -- (val); \draw[->] (in) -- (gate);
+\draw[->] (val) -- (mul); \draw[->] (gate) -- (mul);
+\draw[->] (mul) -- (outp); \draw[->] (outp) -- (add); \draw[->] (add) -- (y);
+\draw[->, dashed] (in) to[out=90, in=90] node[above, font=\scriptsize] {residual} (add);
+\end{tikzpicture}
+\caption{The residual GLU block $\mathcal{B}$ (Eq.~\ref{eq:glu}): a value branch $W_v z$ and a
+sigmoid gate $\sigma(W_g z)$ are multiplied elementwise ($\odot$), projected by $W_o$, and added
+back to the input (the residual skip). One such block (its own $d\times d$ weights) follows each
+encoder MLP.}
+\label{fig:glu}
+\end{figure}
+
 where $\sigma$ is the logistic sigmoid and $\odot$ is elementwise. The sigmoid gate lets the
 block pass, attenuate, or suppress each feature channel conditionally (e.g.\ amplify the
 incoming-threat channels of Section~\ref{sec:threat} when a planet is under attack); the

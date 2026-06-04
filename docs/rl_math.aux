@@ -12,43 +12,47 @@
 \@writefile{toc}{\contentsline {paragraph}{Incoming-fleet threat features (defensive lookahead).}{2}{section*.4}\protected@file@percent }
 \@writefile{toc}{\contentsline {section}{\numberline {3}Policy network $\pi _\theta $}{3}{section.3}\protected@file@percent }
 \newlabel{sec:policy}{{3}{3}{Policy network $\pi _\theta $}{section.3}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Policy network data flow (target mode). Each encoder is a two-layer MLP followed by a residual GLU block (Fig.~\ref {fig:glu}). The masked mean-pool of the entity tokens $h_e$, concatenated with the globals $g$, gives the board context $c$; the pointer actor scores every (launcher $e$, target $t$, fraction $f$) from $h_e$ and $c$ (plus a per-launcher no-op), producing the $E\times A$ logits, which are then legality-masked.}}{3}{figure.1}\protected@file@percent }
+\newlabel{fig:arch}{{1}{3}{Policy network data flow (target mode). Each encoder is a two-layer MLP followed by a residual GLU block (Fig.~\ref {fig:glu}). The masked mean-pool of the entity tokens $h_e$, concatenated with the globals $g$, gives the board context $c$; the pointer actor scores every (launcher $e$, target $t$, fraction $f$) from $h_e$ and $c$ (plus a per-launcher no-op), producing the $E\times A$ logits, which are then legality-masked}{figure.1}{}}
 \@writefile{toc}{\contentsline {paragraph}{Residual GLU block.}{3}{section*.5}\protected@file@percent }
 \newlabel{eq:glu}{{6}{3}{Residual GLU block}{equation.6}{}}
-\@writefile{toc}{\contentsline {paragraph}{Entity encoder (2-layer MLP $+$ GLU).}{3}{section*.6}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Context encoder (2-layer MLP $+$ GLU).}{3}{section*.7}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces The residual GLU block $\mathcal  {B}$ (Eq.~\ref {eq:glu}): a value branch $W_v z$ and a sigmoid gate $\sigma (W_g z)$ are multiplied elementwise ($\odot $), projected by $W_o$, and added back to the input (the residual skip). One such block (its own $d\times d$ weights) follows each encoder MLP.}}{4}{figure.2}\protected@file@percent }
+\newlabel{fig:glu}{{2}{4}{The residual GLU block $\mathcal {B}$ (Eq.~\ref {eq:glu}): a value branch $W_v z$ and a sigmoid gate $\sigma (W_g z)$ are multiplied elementwise ($\odot $), projected by $W_o$, and added back to the input (the residual skip). One such block (its own $d\times d$ weights) follows each encoder MLP}{figure.2}{}}
+\@writefile{toc}{\contentsline {paragraph}{Entity encoder (2-layer MLP $+$ GLU).}{4}{section*.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Context encoder (2-layer MLP $+$ GLU).}{4}{section*.7}\protected@file@percent }
 \@writefile{toc}{\contentsline {paragraph}{Actor head.}{4}{section*.8}\protected@file@percent }
 \@writefile{toc}{\contentsline {paragraph}{Legality masking.}{4}{section*.9}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Layer inventory (target mode, $d=128$).}{4}{section*.10}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {4}Action distribution}{4}{section.4}\protected@file@percent }
-\newlabel{sec:dist}{{4}{4}{Action distribution}{section.4}{}}
-\newlabel{eq:logp}{{13}{4}{Action distribution}{equation.13}{}}
-\newlabel{eq:ent}{{14}{4}{Action distribution}{equation.14}{}}
+\@writefile{toc}{\contentsline {paragraph}{Layer inventory (target mode, $d=128$).}{5}{section*.10}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {4}Action distribution}{5}{section.4}\protected@file@percent }
+\newlabel{sec:dist}{{4}{5}{Action distribution}{section.4}{}}
+\newlabel{eq:logp}{{13}{5}{Action distribution}{equation.13}{}}
+\newlabel{eq:ent}{{14}{5}{Action distribution}{equation.14}{}}
 \@writefile{toc}{\contentsline {section}{\numberline {5}Reward and return}{5}{section.5}\protected@file@percent }
 \newlabel{sec:reward}{{5}{5}{Reward and return}{section.5}{}}
 \@writefile{toc}{\contentsline {paragraph}{Production-only dense reward.}{5}{section*.11}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Outcome and the loss forfeit.}{5}{section*.12}\protected@file@percent }
-\newlabel{eq:return}{{16}{5}{Outcome and the loss forfeit}{equation.16}{}}
-\@writefile{toc}{\contentsline {paragraph}{Note --- 2p vs.\ 4p objective.}{5}{section*.13}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {6}Curriculum}{5}{section.6}\protected@file@percent }
-\newlabel{sec:curriculum}{{6}{5}{Curriculum}{section.6}{}}
+\@writefile{toc}{\contentsline {paragraph}{Outcome and the loss forfeit.}{6}{section*.12}\protected@file@percent }
+\newlabel{eq:return}{{16}{6}{Outcome and the loss forfeit}{equation.16}{}}
+\@writefile{toc}{\contentsline {paragraph}{Note --- 2p vs.\ 4p objective.}{6}{section*.13}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {6}Curriculum}{6}{section.6}\protected@file@percent }
+\newlabel{sec:curriculum}{{6}{6}{Curriculum}{section.6}{}}
 \@writefile{toc}{\contentsline {paragraph}{Stage 1 --- solo expansion (passive opponent).}{6}{section*.14}\protected@file@percent }
 \@writefile{toc}{\contentsline {paragraph}{Stage 2 --- $1$v$1$ vs.\ starter.}{6}{section*.15}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Stage 3 --- mixed opponents.}{6}{section*.16}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {7}GRPO update}{6}{section.7}\protected@file@percent }
-\newlabel{sec:grpo}{{7}{6}{GRPO update}{section.7}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {7.1}Grouped sampling}{6}{subsection.7.1}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {7.2}Group-relative advantage (no critic)}{6}{subsection.7.2}\protected@file@percent }
-\newlabel{eq:adv}{{18}{6}{Group-relative advantage (no critic)}{equation.18}{}}
+\@writefile{toc}{\contentsline {paragraph}{Stage 3 --- mixed opponents.}{7}{section*.16}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {7}GRPO update}{7}{section.7}\protected@file@percent }
+\newlabel{sec:grpo}{{7}{7}{GRPO update}{section.7}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.1}Grouped sampling}{7}{subsection.7.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.2}Group-relative advantage (no critic)}{7}{subsection.7.2}\protected@file@percent }
+\newlabel{eq:adv}{{18}{7}{Group-relative advantage (no critic)}{equation.18}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {7.3}Clipped policy surrogate}{7}{subsection.7.3}\protected@file@percent }
 \newlabel{eq:clip}{{20}{7}{Clipped policy surrogate}{equation.20}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {7.4}KL anchor to a reference policy}{7}{subsection.7.4}\protected@file@percent }
-\newlabel{sec:kl}{{7.4}{7}{KL anchor to a reference policy}{subsection.7.4}{}}
-\newlabel{eq:kl}{{21}{7}{KL anchor to a reference policy}{equation.21}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {7.5}Total objective}{7}{subsection.7.5}\protected@file@percent }
-\newlabel{eq:loss}{{22}{7}{Total objective}{equation.22}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {7.6}Optimization}{7}{subsection.7.6}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {8}Self-play league}{7}{section.8}\protected@file@percent }
-\newlabel{sec:league}{{8}{7}{Self-play league}{section.8}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {9}Symbols $\leftrightarrow $ \texttt  {config.hpp}}{8}{section.9}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {A}Appendix: the PPO/GAE method being replaced}{8}{appendix.A}\protected@file@percent }
-\gdef \@abspage@last{8}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.4}KL anchor to a reference policy}{8}{subsection.7.4}\protected@file@percent }
+\newlabel{sec:kl}{{7.4}{8}{KL anchor to a reference policy}{subsection.7.4}{}}
+\newlabel{eq:kl}{{21}{8}{KL anchor to a reference policy}{equation.21}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.5}Total objective}{8}{subsection.7.5}\protected@file@percent }
+\newlabel{eq:loss}{{22}{8}{Total objective}{equation.22}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.6}Optimization}{8}{subsection.7.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {8}Self-play league}{8}{section.8}\protected@file@percent }
+\newlabel{sec:league}{{8}{8}{Self-play league}{section.8}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {9}Symbols $\leftrightarrow $ \texttt  {config.hpp}}{9}{section.9}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {A}Appendix: the PPO/GAE method being replaced}{9}{appendix.A}\protected@file@percent }
+\gdef \@abspage@last{9}
