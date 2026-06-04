@@ -27,14 +27,16 @@ public:
     int B, max_entities, angle_bins, episode_steps, num_agents;
     std::vector<double> fractions;
     Config cfg;
-    double reward_scale, terminal_bonus, reward_clip;
+    double reward_scale, terminal_bonus, reward_clip, prod_weight;
 
     BatchedEnv(int batch, int max_entities_, int angle_bins_, std::vector<double> fracs,
                Config cfg_, int episode_steps_, double reward_scale_ = 50.0,
-               double terminal_bonus_ = 1.0, double reward_clip_ = 5.0, uint64_t seed = 0)
+               double terminal_bonus_ = 1.0, double reward_clip_ = 5.0, double prod_weight_ = 0.0,
+               uint64_t seed = 0)
         : B(batch), max_entities(max_entities_), angle_bins(angle_bins_),
           episode_steps(episode_steps_), num_agents(2), fractions(std::move(fracs)), cfg(cfg_),
-          reward_scale(reward_scale_), terminal_bonus(terminal_bonus_), reward_clip(reward_clip_) {
+          reward_scale(reward_scale_), terminal_bonus(terminal_bonus_), reward_clip(reward_clip_),
+          prod_weight(prod_weight_) {
         states.resize(B);
         prev_margin.resize(B, 0.0);
         opp_kind.resize(B, OPP_STARTER);
@@ -53,6 +55,16 @@ public:
         ow_random = w_random; ow_starter = w_starter; ow_self = w_self;
     }
     void set_selfplay_available(bool avail) { selfplay_available = avail; }
+    void set_target_mode(bool t) { target_mode = t; }
+
+    // Decode a per-entity class vector into a move list (target-based or angle-bin).
+    Action decode(const GameState& s, const long* cls, const float* am, const long* rid,
+                  const long* rsh) const {
+        if (target_mode)
+            return decode_action_target(s, cls, am, rid, rsh, max_entities,
+                                        (int)fractions.size(), fractions);
+        return decode_action(cls, am, rid, rsh, max_entities, angle_bins, fractions);
+    }
 
     void reset_all() {
         for (int i = 0; i < B; ++i) load_world(i);
@@ -100,8 +112,8 @@ public:
             for (int r = 0; r < max_entities; ++r)
                 am0[r] = (row_pid[0][i][r] >= 0 && states[i].planets.size() &&
                           owned_with_ships(s, 0, row_pid[0][i][r])) ? 1.f : 0.f;
-            Action move0 = decode_action(cls0.data(), am0.data(), row_pid[0][i].data(),
-                                         row_ships[0][i].data(), max_entities, angle_bins, fractions);
+            Action move0 = decode(s, cls0.data(), am0.data(), row_pid[0][i].data(),
+                                  row_ships[0][i].data());
             // Opponent (player 1).
             Action move1;
             if (opp_kind[i] == OPP_RANDOM) {
@@ -115,15 +127,15 @@ public:
                 std::vector<float> am1(max_entities);
                 for (int r = 0; r < max_entities; ++r)
                     am1[r] = (row_pid[1][i][r] >= 0 && owned_with_ships(s, 1, row_pid[1][i][r])) ? 1.f : 0.f;
-                move1 = decode_action(cls1.data(), am1.data(), row_pid[1][i].data(),
-                                      row_ships[1][i].data(), max_entities, angle_bins, fractions);
+                move1 = decode(s, cls1.data(), am1.data(), row_pid[1][i].data(),
+                               row_ships[1][i].data());
             }
 
             std::vector<Action> acts = {move0, move1};
             ow::step(s, acts, cfg);
             s.step += 1;
 
-            double margin = score_margin(s);
+            double margin = potential(s);
             double dense = (margin - prev_margin[i]) / reward_scale;
             dense = std::max(-reward_clip, std::min(reward_clip, dense));
             prev_margin[i] = margin;
@@ -165,6 +177,7 @@ private:
     size_t pool_cursor = 0;
     double ow_random = 1.0, ow_starter = 1.0, ow_self = 0.0;
     bool selfplay_available = false;
+    bool target_mode = false;
 
     static bool owned_with_ships(const GameState& s, int player, long pid) {
         for (const auto& p : s.planets)
@@ -179,6 +192,21 @@ private:
         }
         for (const auto& f : s.fleets) { if (f.owner == 0) s0 += f.ships; else if (f.owner == 1) s1 += f.ships; }
         return (double)(s0 - s1);
+    }
+
+    // Reward potential: ship margin + prod_weight * production margin. Adding the
+    // production advantage makes *capturing a planet* immediately rewarding (it raises
+    // your production this step), which counteracts the short-term ship cost of
+    // expansion -- the local optimum that made the ship-only reward collapse to passivity.
+    double potential(const GameState& s) const {
+        long s0 = 0, s1 = 0;
+        double pr0 = 0.0, pr1 = 0.0;
+        for (const auto& p : s.planets) {
+            if (p.owner == 0) { s0 += p.ships; pr0 += p.production; }
+            else if (p.owner == 1) { s1 += p.ships; pr1 += p.production; }
+        }
+        for (const auto& f : s.fleets) { if (f.owner == 0) s0 += f.ships; else if (f.owner == 1) s1 += f.ships; }
+        return (double)(s0 - s1) + prod_weight * (pr0 - pr1);
     }
 
     bool terminal(const GameState& s) const {
@@ -201,7 +229,7 @@ private:
         if (world_pool.empty()) return;
         states[i] = world_pool[pool_cursor % world_pool.size()];
         pool_cursor++;
-        prev_margin[i] = score_margin(states[i]);
+        prev_margin[i] = potential(states[i]);
         // Resample opponent kind.
         std::uniform_real_distribution<double> u(0.0, 1.0);
         double total = ow_random + ow_starter + (selfplay_available ? ow_self : 0.0);

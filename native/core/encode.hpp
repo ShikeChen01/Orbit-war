@@ -118,6 +118,46 @@ inline void encode_obs(const GameState& s, int player, int max_entities,
     globals[9] = (float)((double)n / max_entities);
 }
 
+// TARGET-BASED decode. class 0 = noop; else class-1 splits into (target_row, frac_bin):
+// target_row = launch / num_fracs, frac_bin = launch % num_fracs. The launch angle is
+// computed to aim straight at the target entity's current position (like the scripted
+// starter's atan2), so every launch actually hits something -- this removes the precise-
+// aiming barrier that 16 angle bins impose and makes exploration land real captures.
+// Ownership-safe (action_mask) + target must be a real, different entity.
+inline Action decode_action_target(const GameState& s, const long* classes,
+                                   const float* action_mask, const long* row_planet_id,
+                                   const long* row_planet_ships, int max_entities, int num_fracs,
+                                   const std::vector<double>& fractions, long min_ships = 1) {
+    Action moves;
+    auto pos_of = [&](long id, double& x, double& y) -> bool {
+        for (const auto& p : s.planets)
+            if (p.id == id) { x = p.x; y = p.y; return true; }
+        return false;
+    };
+    for (int row = 0; row < max_entities; ++row) {
+        long c = classes[row];
+        if (c <= 0) continue;
+        if (action_mask[row] < 0.5f) continue;
+        long pid = row_planet_id[row];
+        if (pid < 0) continue;
+        long avail = row_planet_ships[row];
+        if (avail <= 0) continue;
+        long launch = c - 1;
+        long target_row = launch / num_fracs;
+        long fi = launch % num_fracs;
+        if (target_row < 0 || target_row >= max_entities || target_row == row) continue;
+        long tpid = row_planet_id[target_row];
+        if (tpid < 0) continue;  // padding / invalid target
+        double fx, fy, tx, ty;
+        if (!pos_of(pid, fx, fy) || !pos_of(tpid, tx, ty)) continue;
+        double angle = std::atan2(ty - fy, tx - fx);
+        long ships = (long)(fractions[fi] * avail);
+        ships = std::max(min_ships, std::min(ships, avail));
+        if (ships > 0) moves.push_back(Move{pid, angle, ships});
+    }
+    return moves;
+}
+
 // Per-planet action classes -> moves. class 0 = noop; else (angle_bin, frac_bin).
 // Mirrors PerPlanetAction.decode (ownership-safe via action_mask).
 inline Action decode_action(const long* classes, const float* action_mask,

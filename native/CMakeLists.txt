@@ -32,3 +32,38 @@ set_target_properties(orbitwars_native PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../orbit_wars_rl/_native"
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../orbit_wars_rl/_native"
 )
+
+# --- Native executables: Python-free train/eval loop -----------------------
+# Same headers as the module, but driven by a C++ main() so the dev loop is
+# edit -> build -> native\run.cmd ow_train ... with no Python / no .pyd reimport.
+# They load-time-link the wheel's torch DLLs, so run via native\run.cmd (puts
+# torch\lib on PATH). Executables land in the build dir (e.g. _bld\ow_train.exe).
+foreach(_app ow_train ow_eval)
+  if(_app STREQUAL ow_train)
+    add_executable(${_app} apps/train.cpp)
+  else()
+    add_executable(${_app} apps/eval.cpp)
+  endif()
+  target_include_directories(${_app} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(${_app} PRIVATE torch_local)
+  target_compile_options(${_app} PRIVATE /EHsc /bigobj /Zc:__cplusplus)
+endforeach()
+
+# --- GRPO refactor: agent-model + algorithm sources (hpp/cpp split) ---------
+set(OW_RL_SRC
+  rl/model/policy_net.cpp
+  rl/model/distribution.cpp
+  rl/model/agent.cpp
+  rl/algo/grpo.cpp
+)
+# Parity gate: new PolicyNet/Agent vs the old EntityPolicy on a checkpoint.
+add_executable(ow_test_model apps/test_model.cpp ${OW_RL_SRC})
+target_include_directories(ow_test_model PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(ow_test_model PRIVATE torch_local)
+target_compile_options(ow_test_model PRIVATE /EHsc /bigobj /Zc:__cplusplus)
+
+# GRPO trainer (grouped episodic rollout + KL-anchored update).
+add_executable(ow_train_grpo apps/train_grpo.cpp ${OW_RL_SRC} rl/rollout.cpp rl/grpo_trainer.cpp)
+target_include_directories(ow_train_grpo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(ow_train_grpo PRIVATE torch_local)
+target_compile_options(ow_train_grpo PRIVATE /EHsc /bigobj /Zc:__cplusplus)

@@ -1,0 +1,331 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage[colorlinks=true,linkcolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
+\usepackage{parskip}
+\usepackage{enumitem}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\softmax}{\operatorname{softmax}}
+\newcommand{\relu}{\operatorname{ReLU}}
+\newcommand{\clip}{\operatorname{clip}}
+\newcommand{\sg}{\operatorname{stopgrad}}
+\newcommand{\Adv}{\hat{A}}
+\newcommand{\pol}{\pi_\theta}
+\newcommand{\polold}{\pi_{\theta_{\mathrm{old}}}}
+\newcommand{\polref}{\pi_{\mathrm{ref}}}
+
+\title{\textbf{Orbit Wars --- RL Formulation and GRPO Training Math}}
+\author{Native C++/LibTorch stack}
+\date{\today}
+
+\begin{document}
+\maketitle
+\vspace{-1.5em}
+\begin{center}\small This document specifies the policy, the reward, and the
+\emph{Group Relative Policy Optimization} (GRPO) update used by the native trainer.
+Symbols map to \texttt{native/rl/config.hpp} and \texttt{native/rl/model/}.\end{center}
+\tableofcontents
+\bigskip
+
+%==============================================================
+\section{Problem setup}\label{sec:problem}
+Orbit Wars is an $N$-player symmetric Markov game with $N\in\{2,4\}$. The engine sets
+$N=\lvert\text{state}\rvert$ (\texttt{num\_agents}) and assigns $N$ home planets from a
+4-fold-symmetric quadrant group ($N=2$: two opposite quadrants; $N=4$: all four). Each turn all
+players \emph{simultaneously} issue a set of fleet \emph{launches}; the deterministic engine then
+moves fleets, resolves collisions/combat, rotates planets, produces ships, and (on scheduled
+steps) spawns comets. Scoring is a \textbf{free-for-all}: at termination player $i$'s score is its
+total ship count $\mathrm{ships}_i$ (planets $+$ fleets), and the seat(s) with the maximum score
+receive reward $+1$, all others $-1$ (so $N=4$ is winner-take-all among four individuals --- not
+teams).
+
+\paragraph{Training scope of this document.} We currently train the \textbf{two-player special
+case} ($N=2$: ego $p=0$ against one opponent in the opposite quadrant). The native world generator
+places exactly two homes; the shaped reward (Section~\ref{sec:reward}) uses the zero-sum margin
+$\mathrm{ships}_0-\mathrm{ships}_1$; and each group plays a single opponent (scripted, or a frozen
+snapshot, Section~\ref{sec:league}). The policy (Section~\ref{sec:policy}) and the GRPO update
+(Section~\ref{sec:grpo}) are \emph{$N$-agnostic}; lifting to 4-player FFA requires only (i) 4-home
+world generation, (ii) replacing the zero-sum margin with the FFA return (max-score seat $+1$ else
+$-1$, or a rank-based shaping), and (iii) seating $\geq 1$ extra opponents per game. This 2p$\to$4p
+gap is an open modeling item, revisited in Section~\ref{sec:reward}.
+
+\paragraph{Factored action space.}
+A turn's action is \emph{factored over the ego player's planets} (``entities''). The
+observation exposes up to $E$ entity slots ($E=64$). Each owned planet $e$ independently
+chooses a class
+\begin{equation}
+a_e \in \{0,1,\dots,A-1\}, \qquad A = 1 + C\,|\mathcal{F}|,
+\end{equation}
+where class $0$ is \emph{no-op}, $\mathcal{F}=\{0.25,0.5,0.75,1.0\}$ is the set of
+ship-fraction choices, and $C$ is the number of target choices: $C=E$ in
+\emph{target mode} (each class $\geq 1$ names a target entity $t$ and a fraction $f$, with
+aim angle computed analytically to hit $t$), or $C=$ \texttt{angle\_bins} in
+\emph{angle mode} (class names an angle bin and a fraction). The class index for a launch is
+\begin{equation}
+\text{class}(t,f) = 1 + t\,|\mathcal{F}| + f .
+\end{equation}
+
+%==============================================================
+\section{Observation encoding}
+For ego player $p$ and state $s$, the encoder (\texttt{native/core/encode.hpp}) emits
+\begin{itemize}[nosep]
+  \item entity features $X\in\R^{E\times F}$ ($F=15$): per planet/fleet geometry, ownership
+        (ego/ally/enemy/neutral one-hots), ships, production, comet flags;
+  \item entity mask $m\in\{0,1\}^{E}$: $m_e=1$ iff slot $e$ is a real entity;
+  \item action mask $u\in\{0,1\}^{E}$: $u_e=1$ iff $e$ is an ego-owned planet with $>0$ ships
+        (i.e.\ legally able to launch);
+  \item globals $g\in\R^{G}$ ($G=10$): step/phase, board-wide ship and production margins,
+        counts, angular velocity, etc.
+\end{itemize}
+
+%==============================================================
+\section{Policy network $\pi_\theta$}\label{sec:policy}
+The network (\texttt{native/rl/model/policy\_net.hpp}) maps $(X,m,u,g)$ to per-entity class
+logits $Z\in\R^{E\times A}$. It has \textbf{no value head}; GRPO needs no critic. Let
+$d=128$ (\texttt{hidden}).
+
+\paragraph{Entity encoder.} A shared two-layer MLP over each entity row:
+\begin{equation}
+h_e = W_2\,\relu\!\big(W_1 x_e + b_1\big) + b_2 \in \R^{d},
+\qquad e=1,\dots,E .
+\end{equation}
+
+\paragraph{Context encoder.} A mask-aware mean pool followed by a two-layer MLP on the pooled
+tokens concatenated with the globals:
+\begin{equation}
+\bar h = \frac{\sum_{e} m_e\, h_e}{\max\!\big(\sum_e m_e,\,1\big)},
+\qquad
+c = W_4\,\relu\!\big(W_3\,[\,\bar h\,;\,g\,] + b_3\big) + b_4 \in\R^{d}.
+\end{equation}
+
+\paragraph{Actor head.} Two interchangeable heads produce the raw logits $\tilde Z$:
+\begin{description}[nosep,leftmargin=1.2em]
+\item[Angle mode:] an MLP on each entity token concatenated with the context,
+\begin{equation}
+\tilde z_e = W_6\,\relu\!\big(W_5\,[\,h_e\,;\,c\,] + b_5\big) + b_6 \in\R^{A}.
+\end{equation}
+\item[Target mode (pointer actor):] for each launcher $e$ and fraction $f$ a query
+$q_{e,f}\in\R^{d}$ (from $W_q[\,h_e;c\,]$ reshaped to $|\mathcal{F}|\times d$), for each target
+$t$ a key $k_t=W_k h_t$, and a per-launcher no-op logit $n_e=w_n^{\!\top}[\,h_e;c\,]$:
+\begin{equation}
+\mathrm{score}(e,t,f) = \frac{\langle q_{e,f},\,k_t\rangle}{\sqrt{d}},
+\qquad
+\tilde z_{e,0}=n_e,\quad \tilde z_{e,\,\text{class}(t,f)} = \mathrm{score}(e,t,f).
+\end{equation}
+The score depends on \emph{both} launcher and target encodings, so the head can rank targets
+by geometry (the property a plain MLP actor lacks).
+\end{description}
+
+\paragraph{Legality masking.} Illegal classes are set to $-\infty$ (numerically $-10^{9}$).
+Class $0$ (no-op) is always legal. For a launch class $(t,f)$,
+\begin{equation}
+Z_{e,\,\text{class}(t,f)} =
+\begin{cases}
+\tilde z_{e,\,\text{class}(t,f)} & \text{if } u_e=1 \ \wedge\ m_t=1 \ \wedge\ t\neq e \quad(\text{target mode}),\\[2pt]
+\tilde z_{e,\,\text{class}(t,f)} & \text{if } u_e=1 \quad(\text{angle mode}),\\[2pt]
+-\infty & \text{otherwise.}
+\end{cases}
+\end{equation}
+
+%==============================================================
+\section{Action distribution}\label{sec:dist}
+Each entity is an independent masked categorical; a turn's joint action is their product over
+\emph{real} entities (\texttt{native/rl/model/distribution.hpp}):
+\begin{align}
+\pol(a_e\mid s) &= \softmax(Z_e)_{a_e}, &
+\pol(a\mid s) &= \prod_{e:\,m_e=1}\pol(a_e\mid s).
+\end{align}
+Hence the joint log-probability and entropy are entity sums:
+\begin{align}
+\log\pol(a\mid s) &= \sum_{e} m_e\,\log\softmax(Z_e)_{a_e},
+\label{eq:logp}\\
+\mathcal{H}\big[\pol(\cdot\mid s)\big] &= \sum_{e} m_e\,
+\Big(-\!\sum_{a'} \softmax(Z_e)_{a'}\,\log\softmax(Z_e)_{a'}\Big).
+\label{eq:ent}
+\end{align}
+Sampling draws $a_e\sim\mathrm{Categorical}(\softmax(Z_e))$ per entity (greedy uses
+$\arg\max_a Z_{e,a}$ at evaluation).
+
+%==============================================================
+\section{Reward and return}\label{sec:reward}
+\paragraph{Shaped potential.} Let $\mathrm{ships}_p(s)$ and $\mathrm{prod}_p(s)$ be player
+$p$'s total ships (planets $+$ fleets) and total planetary production in $s$. Define the
+production-aware potential (\texttt{native/rl/reward}; \texttt{prod\_weight}$=w_{\Phi}$)
+\begin{equation}
+\Phi(s) = \big(\mathrm{ships}_0(s)-\mathrm{ships}_1(s)\big)
+        + w_{\Phi}\big(\mathrm{prod}_0(s)-\mathrm{prod}_1(s)\big).
+\end{equation}
+Including production makes \emph{capturing a planet} immediately rewarding, counteracting the
+short-term ship cost of expansion that made a ship-only reward collapse to passivity.
+
+\paragraph{Per-step shaped reward.} With scale $\sigma$ (\texttt{reward\_scale}) and clip
+$\kappa$ (\texttt{reward\_clip}),
+\begin{equation}
+r^{\mathrm{sh}}_t = \clip\!\left(\frac{\Phi(s_{t+1})-\Phi(s_t)}{\sigma},\,-\kappa,\,\kappa\right).
+\end{equation}
+
+\paragraph{Outcome.} At the terminal step $T_i$ of trajectory $i$, the game is scored by total
+ships; let $o_i=+1$ if ego wins, $-1$ if it loses, $0$ on a draw.
+
+\paragraph{GRPO return.} GRPO scores a \emph{whole trajectory} by a scalar return blending the
+discounted shaped reward and the outcome (\texttt{gamma}~$\gamma$, weights
+$w_{\mathrm{d}}=$\texttt{dense\_weight}, $w_{\mathrm{o}}=$\texttt{outcome\_weight}):
+\begin{equation}
+\boxed{\;
+R_i \;=\; w_{\mathrm{d}}\sum_{t=0}^{T_i-1}\gamma^{t}\,r^{\mathrm{sh}}_{i,t}
+       \;+\; w_{\mathrm{o}}\,o_i
+\;}
+\label{eq:return}
+\end{equation}
+Setting $w_{\mathrm{d}}=0$ recovers \emph{pure-outcome} GRPO; $\gamma=1$ is the
+undiscounted Monte-Carlo return (the default).
+
+\paragraph{Note --- 2p vs.\ 4p objective.} The margin potential $\Phi$ and the outcome $o_i$ are
+the two-player ($N=2$) zero-sum forms. In $N=4$ free-for-all the objective is \emph{ordinal} ---
+be the maximum of four --- which is not zero-sum: e.g.\ $\Phi$ would become
+$\mathrm{ships}_0 - \max_{k\neq 0}\mathrm{ships}_k$ (margin over the \emph{strongest} rival, or a
+soft-max thereof) and $o_i$ the FFA win/lose of Section~\ref{sec:problem}. The GRPO machinery
+(advantage, surrogate, KL) is unchanged --- only $R_i$ in Eq.~\eqref{eq:return} is redefined.
+
+%==============================================================
+\section{GRPO update}\label{sec:grpo}
+GRPO replaces the value baseline of actor--critic methods with a \emph{group-relative}
+baseline: the policy plays a group of trajectories from the \emph{same} start against the
+\emph{same} opponent, and each trajectory's return is centered against its group.
+
+\subsection{Grouped sampling}
+For iteration we draw $N$ groups (\texttt{num\_groups}); group $j$ fixes an initial state
+$s_0^{(j)}$ (a world) and an opponent, and rolls out $G$ trajectories (\texttt{group\_size})
+under the current behavior policy $\polold$ (stochastic). The only within-group variation is
+the policy's own action sampling, so the group mean is a valid, low-variance baseline. The
+env count is $N\cdot G$ (\texttt{num\_envs}). For every transition we store
+$(X,m,u,g)$, the action $a_{i,t}$, the behavior log-prob $\log\polold(a_{i,t}\mid s_{i,t})$,
+and the reference log-prob $\log\polref(a_{i,t}\mid s_{i,t})$ (Section~\ref{sec:kl}).
+
+\subsection{Group-relative advantage (no critic)}
+Let $\mathcal{G}_j$ be the trajectories of group $j$, with mean and standard deviation
+\begin{equation}
+\mu_j = \frac{1}{G}\sum_{i\in\mathcal{G}_j} R_i,
+\qquad
+\varsigma_j = \sqrt{\frac{1}{G}\sum_{i\in\mathcal{G}_j}(R_i-\mu_j)^2}.
+\end{equation}
+The advantage of trajectory $i$ (group $j=j(i)$), \emph{broadcast to all of its timesteps}, is
+\begin{equation}
+\boxed{\;
+\Adv_i =
+\begin{cases}
+\dfrac{R_i-\mu_j}{\varsigma_j+\varepsilon}, & \text{whiten\_advantage = true},\\[1.2em]
+R_i-\mu_j, & \text{otherwise,}
+\end{cases}
+\;}
+\label{eq:adv}
+\end{equation}
+with floor $\varepsilon=$\texttt{adv\_eps}. There is no learned $V(s)$ and no temporal-difference
+or GAE term --- the entire baseline is Eq.~\eqref{eq:adv}.
+
+\subsection{Clipped policy surrogate}
+With the per-step importance ratio
+\begin{equation}
+\rho_{i,t}(\theta) = \exp\!\Big(\log\pol(a_{i,t}\mid s_{i,t}) - \log\polold(a_{i,t}\mid s_{i,t})\Big),
+\end{equation}
+(each log-prob the entity sum of Eq.~\eqref{eq:logp}), the surrogate is the PPO clip objective
+\begin{equation}
+\mathcal{L}^{\mathrm{clip}}(\theta) =
+-\,\frac{1}{\sum_i T_i}\sum_{i,t}
+\min\!\Big(\rho_{i,t}\,\Adv_i,\ \ \clip(\rho_{i,t},\,1-\epsilon,\,1+\epsilon)\,\Adv_i\Big),
+\label{eq:clip}
+\end{equation}
+with clip range $\epsilon=$\texttt{clip}.
+
+\subsection{KL anchor to a reference policy}\label{sec:kl}
+A reference policy $\polref$ (the fixed behavior-cloning checkpoint) anchors training, which
+counteracts the empirically observed drift of plain PPO away from the strong BC behavior. We
+penalize the unbiased, non-negative $k_3$ estimator of $\KL(\pol\,\|\,\polref)$. With
+$\Delta_{i,t}=\log\polref(a_{i,t}\mid s_{i,t})-\log\pol(a_{i,t}\mid s_{i,t})$,
+\begin{equation}
+\widehat{\KL}_{i,t} = \exp(\Delta_{i,t}) - \Delta_{i,t} - 1 \ \ (\geq 0),
+\qquad
+\mathcal{L}^{\mathrm{KL}}(\theta) = \frac{1}{\sum_i T_i}\sum_{i,t}\widehat{\KL}_{i,t}.
+\label{eq:kl}
+\end{equation}
+
+\subsection{Total objective}
+Combining the surrogate, the KL anchor (weight $\beta=$\texttt{kl\_beta}) and an entropy bonus
+(weight $c_{\mathcal H}=$\texttt{ent\_coef}, from Eq.~\eqref{eq:ent}):
+\begin{equation}
+\boxed{\;
+\mathcal{L}(\theta) =
+\mathcal{L}^{\mathrm{clip}}(\theta)
+\;+\; \beta\,\mathcal{L}^{\mathrm{KL}}(\theta)
+\;-\; c_{\mathcal H}\,\overline{\mathcal{H}}\big[\pol\big]
+\;}
+\label{eq:loss}
+\end{equation}
+where $\overline{\mathcal H}$ is the mean entropy over transitions.
+
+\subsection{Optimization}
+For each iteration: collect the grouped trajectories under $\polold=\pol$; compute returns
+\eqref{eq:return} and advantages \eqref{eq:adv}; then for \texttt{update\_epochs} passes over
+\texttt{minibatches} shuffled minibatches, take Adam steps on \eqref{eq:loss} with learning
+rate $\eta=$\texttt{lr}, $\epsilon_{\mathrm{Adam}}=$\texttt{adam\_eps}, and global gradient-norm
+clip \texttt{max\_grad\_norm}. Advantages are computed once per iteration (off $\polold$); the
+ratio \eqref{eq:clip} and KL \eqref{eq:kl} are recomputed each minibatch under the live $\pol$.
+
+%==============================================================
+\section{Self-play league}\label{sec:league}
+Once training has reached \texttt{start\_step}, the opponent for each group is sampled from a
+mix of \{\,\texttt{random}, \texttt{starter}, league\,\} with weights
+$(\,$\texttt{mix\_random}, \texttt{mix\_starter}, \texttt{mix\_pool}$\,)$. The league is a
+bounded set (\texttt{pool\_capacity}) of \emph{historical} frozen snapshots --- not a single
+latest self --- which avoids the cycling/forgetting of single-snapshot self-play. Promotion is
+\emph{win-gated}: a new snapshot is admitted only when the current policy beats the pool with
+win rate $\geq$ \texttt{promote\_winrate}, so the policy never trains against a regression of
+itself.
+
+%==============================================================
+\section{Symbols $\leftrightarrow$ \texttt{config.hpp}}
+\begin{center}\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Symbol & \texttt{config.hpp} field & Default \\
+\midrule
+$d$ & \texttt{ModelConfig::hidden} & $128$ \\
+$E$ & \texttt{ModelConfig::max\_entities} & $64$ \\
+$\mathcal{F}$ & \texttt{ModelConfig::fractions} & $\{.25,.5,.75,1\}$ \\
+$G,\,N$ & \texttt{GrpoConfig::group\_size}, \texttt{num\_groups} & $8,\ 64$ \\
+$\epsilon$ & \texttt{GrpoConfig::clip} & $0.2$ \\
+$\beta$ & \texttt{GrpoConfig::kl\_beta} & $0.04$ \\
+$c_{\mathcal H}$ & \texttt{GrpoConfig::ent\_coef} & $0.01$ \\
+$\varepsilon$ & \texttt{GrpoConfig::adv\_eps} & $10^{-4}$ \\
+$w_{\mathrm d},\,w_{\mathrm o}$ & \texttt{GrpoConfig::dense\_weight}, \texttt{outcome\_weight} & $1,\ 1$ \\
+$\gamma$ & \texttt{GrpoConfig::gamma} & $1.0$ \\
+$w_{\Phi}$ & \texttt{RolloutConfig::prod\_weight} & $20$ \\
+$\sigma,\,\kappa$ & \texttt{RolloutConfig::reward\_scale}, \texttt{reward\_clip} & $50,\ 5$ \\
+$\eta$ & \texttt{OptimConfig::lr} & $3\!\times\!10^{-4}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\appendix
+%==============================================================
+\section{Appendix: the PPO/GAE method being replaced}
+The previous trainer (\texttt{native/rl/trainer.hpp}) used actor--critic PPO with a value head
+$V_\phi$ and Generalized Advantage Estimation. For completeness, with TD residual
+$\delta_t = r_t + \gamma V_\phi(s_{t+1}) - V_\phi(s_t)$,
+\begin{align}
+\Adv^{\mathrm{GAE}}_t &= \sum_{l\geq 0}(\gamma\lambda)^{l}\,\delta_{t+l},
+&
+\mathcal{L}^{V} &= \tfrac12\,\big(V_\phi(s_t) - \hat R_t\big)^2,
+\quad \hat R_t = \Adv^{\mathrm{GAE}}_t + V_\phi(s_t),
+\end{align}
+and total loss $\mathcal{L}^{\mathrm{clip}} + c_V\,\mathcal{L}^{V} - c_{\mathcal H}\overline{\mathcal H}$.
+GRPO removes $V_\phi$ (and thus $\lambda$, $c_V$, and value warmup) entirely, replacing
+$\Adv^{\mathrm{GAE}}_t$ with the group-relative $\Adv_i$ of Eq.~\eqref{eq:adv}.
+
+\end{document}

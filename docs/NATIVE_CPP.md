@@ -98,22 +98,76 @@ TorchScript needed, and no second network definition for serving.
 | Gate | Result |
 |------|--------|
 | Env step parity vs official engine (`test_parity.py`) | **bit-exact** over 1127 real transitions |
+| **Comet-spawn parity** incl. RNG spawn steps (`test_comet_parity.py`) | **bit-exact** over 1138 transitions (11 spawn steps) |
 | Encoder parity vs `EntityObservation` (`test_encode_parity.py`) | **0 mismatches** / 330 encodings |
 | Policy-forward / weight-export parity (`test_native.py`) | C++ greedy == exported-Python greedy, **0 mismatches** |
+| **Native arena vs real kaggle engine** (`eval_native.py --crosscheck`) | **24/24 outcomes agree** on identical seeds |
 | End-to-end native PPO on GPU | trains; ~**7,200 env-steps/s** (≈55× the 130/s Python baseline), including policy + PPO update |
+| Fast arena throughput | **~250 full games/s** (≈1000× the Python arena) |
 
 Run them: `python -m pytest tests/` (the native tests require the built `.pyd`).
 
+## Evaluation (the fitness function)
+
+`native/rl/arena.hpp` (`Arena`, bound as `native.Arena`) plays a loaded `EntityPolicy`
+against a fixed opponent (random / starter / a second policy) in the bit-exact engine
+*with comets*, scoring exactly like the competition (terminal total-ship score, highest
+wins). It is the project's fitness function: ~250 full games/s vs ~0.25/s for the Python
+arena, and outcome-identical to the real engine (24/24 crosscheck on matched seeds; tiny
+score-margin differences only, from CUDA-vs-CPU policy float — the *decisions* match).
+
+```powershell
+# win rate vs the scripted baselines (256 comet-aware games each, in seconds)
+.venv\Scripts\python scripts\eval_native.py runs\native\run.pt --opponent starter --games 256
+# prove faithfulness against the real kaggle engine on identical seeds
+.venv\Scripts\python scripts\eval_native.py runs\native\run.pt --opponent starter --crosscheck 40
+```
+
 ## Train
+
+`scripts/train_native.py` runs a **chunked** loop: train a chunk in C++, then evaluate
+the live weights in the fast arena (true win rate vs the baselines) — a real learning
+curve, not the reward-sign proxy. The best checkpoint by win-rate-vs-starter is saved to
+`--out`; the latest to `*.last.pt`. The reward is a **production-aware potential**
+(`Δ(ship_margin + prod_weight·prod_margin)`) so capturing a planet is immediately
+rewarded — without this the policy collapses to passivity (see the failure-diagnosis
+memo). The world pool is disk-cached (`generate_pool_cached`) so re-runs start instantly.
 
 ```powershell
 .venv\Scripts\python scripts\train_native.py `
-  --total-steps 2000000 --num-envs 256 --episode-steps 500 `
-  --selfplay-start-step 300000 --out runs\native\final.pt
-
-# then evaluate in the REAL engine
-.venv\Scripts\python scripts\play_episode.py --p0 runs\native\final.pt --p1 starter --episodes 50
+  --total-steps 8000000 --num-envs 512 --eval-every 400000 `
+  --prod-weight 20 --ent-coef 0.02 --out runs\native\run.pt
 ```
+
+## Strength pipeline (action space, BC, self-play, search)
+
+Getting a *strong* policy (not just correct machinery) needed four changes, each gated by
+the fast arena (see `docs/EXPERIMENTS.md` for numbers):
+
+1. **Production-aware reward.** Dense reward = `Δ(ship_margin + prod_weight·prod_margin)/scale`.
+   Ship-margin alone punishes the short-term cost of capturing a planet, so the policy
+   collapsed to passivity; rewarding production margin makes a capture immediately positive.
+2. **Target-based actions** (`--target-mode`). A per-planet action picks a *target entity*
+   + ship-fraction and aims via `atan2` (like starter), instead of a coarse angle bin that
+   can't hit small distant planets. `decode_action_target` in `core/encode.hpp`.
+3. **Pointer actor** (the key architecture fix). The old MLP actor mapped
+   `[tok_r ++ mean_pooled_core] → target logits`, which has **no per-target information** —
+   it literally can't tell where target `t` is, so it can't pick good targets (from-scratch
+   RL stalled at random-level; BC's launch-accuracy was ~0). The pointer actor scores
+   `logit(r,t,f)=⟨q_f(tok_r,core), k(tok_t)⟩` so the score depends on both launcher and
+   target. `EntityPolicy(target_mode=True)` builds it (C++ `aq/ak/anoop`, Python
+   `actor_q/k/noop`); parity-verified C++↔Python.
+4. **BC warm start → PPO finetune → self-play.** Target mode makes starter's move exactly
+   representable, so `scripts/bc_pretrain.py` clones starter (class-weighted CE — noop is the
+   majority class), then `train_native.py --init-from <bc>.pt` finetunes. PPO from a fresh
+   BC policy has a random critic that wrecks the actor, so `--value-warmup-updates N` fits
+   the critic first (policy frozen). Self-play (`--opp-self`) then drives past starter.
+
+**Inference search** (`scripts/search_agent.py`): the CPU/1s-per-turn budget + the fast
+exact forward model = value-guided lookahead. The policy proposes K candidate turns, each is
+rolled out H steps (both seats by the policy) and scored by the value head (or the heuristic
+potential); the best is played. ~60ms/turn at K=6,H=6 on CPU. For a Kaggle submission the
+same logic runs on a pure-Python step port (the `.pyd` isn't on the eval box).
 
 ## Limitations & next steps
 
@@ -122,11 +176,12 @@ Run them: `python -m pytest tests/` (the native tests require the built `.pyd`).
   hard game and action space. The *machinery* is correct (proven by the parity chain);
   strength is a budget/hyperparameter matter. Next: train 10–100M steps, tune
   `reward_scale`/`ent_coef`/`lr`/`gamma`, and curette the opponent mix.
-- **No comets in the native trainer (yet).** Comet *mechanics* are parity-proven in
-  `ow::step`, but the native trainer trains on the no-comet variant; mid-episode comet
-  spawning (RNG) isn't wired into the batched env. Add by pre-generating each episode's
-  comet schedule in `native_worldgen` (reusing the official `generate_comet_paths`) and
-  injecting it from the schedule in `BatchedEnv::step`.
+- **Comets: DONE.** Each world now carries a pre-generated comet schedule
+  (`native_worldgen.build_comet_schedule`, official `generate_comet_paths` + the same
+  seed-derived RNG the engine uses), injected deterministically inside `ow::step` at the
+  scheduled steps. Bit-exact incl. spawn steps (`test_comet_parity.py`). Training and the
+  arena now run the *full* competition game. Because the comet RNG is seeded identically,
+  a native game from seed S has the same comets the real env makes for `{"seed": S}`.
 - **Throughput headroom.** 7.2k steps/s is end-to-end (env + GPU policy + PPO). Larger
   `num_envs`, CUDA graphs, and an env-only benchmark would push the env component toward
   the 10⁵ target; the env is no longer the bottleneck — the GPU update is.

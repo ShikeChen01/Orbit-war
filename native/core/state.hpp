@@ -43,6 +43,17 @@ struct CometGroup {
     long path_index;
 };
 
+// A pre-generated comet spawn event (mirrors the RNG block in the reference
+// interpreter, lines 431-474). The full schedule for an episode is computed once in
+// Python (native_worldgen) from the official generate_comet_paths + seed-derived RNG,
+// then injected deterministically at the matching step inside ow::step. Keeping the
+// schedule in the state (not the hot path) means the simulation stays RNG-free.
+struct ScheduledComet {
+    int spawn_step;  // fires when state.step + 1 == spawn_step (one of 50/150/250/350/450)
+    std::vector<std::vector<std::pair<double, double>>> paths;  // the 4 symmetric paths
+    long ships;                                                 // comet ship count
+};
+
 struct Config {
     int episodeSteps = 500;
     double shipSpeed = 6.0;
@@ -55,6 +66,7 @@ struct GameState {
     std::vector<CometGroup> comets;
     std::vector<long> comet_planet_ids;
     std::vector<Planet> initial_planets;
+    std::vector<ScheduledComet> comet_schedule;  // pre-generated spawns, injected in ow::step
     double angular_velocity = 0.0;
     long next_fleet_id = 0;
     int step = 0;

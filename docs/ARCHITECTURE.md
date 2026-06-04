@@ -13,6 +13,21 @@ The original pure-Python gym-env + PPO training loop has been **archived**
 faster, bit-exact env). What remains in Python is the engine wrapper, the abstractions,
 and the serving/eval path.
 
+> **RL math:** the full policy architecture, reward shaping, and the training update are
+> derived in [`rl_math.pdf`](rl_math.pdf) (LaTeX source [`rl_math.tex`](rl_math.tex)).
+>
+> **In flight (2026-06-03), two refactors:**
+> 1. **Python-free native loop.** `native/apps/` builds `ow_train`/`ow_eval` executables that
+>    read a cached world pool (`.owp`) and read/write checkpoints (`.owc`) via
+>    `native/io/serialize.hpp` — the dev loop is `native\build.cmd` → `native\run.cmd ow_train …`
+>    with no Python. Python is demoted to one-time world-gen (`scripts/gen_world_pool.py`), the
+>    Kaggle submission (pure Python, reads `.owc` via `orbit_wars_rl/native_ckpt.py`), and the
+>    parity oracle. **Done & validated.**
+> 2. **PPO → GRPO.** The trainer is being rewritten from actor–critic PPO to **GRPO**
+>    (group-relative advantage, **no value network**) with a clean hpp/cpp split:
+>    `native/rl/config.hpp`, `native/rl/model/{policy_net,distribution,agent}.hpp`,
+>    `native/rl/algo/grpo.hpp`. **Headers in progress.**
+
 ```
                 ┌──────────────────────────────────────────────┐
                 │  kaggle_environments "orbit_wars" (engine)     │  ← ground truth

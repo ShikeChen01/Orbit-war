@@ -110,6 +110,8 @@ class EntityObservation(ObservationProcessor):
         action_mask = np.zeros((self.max_entities,), np.float32)
         planet_ids = np.full((self.max_entities,), -1, np.int64)
         planet_ships = np.zeros((self.max_entities,), np.int64)
+        planet_x = np.zeros((self.max_entities,), np.float64)
+        planet_y = np.zeros((self.max_entities,), np.float64)
 
         # Stable ordering: own planets first, then by id -- keeps actionable rows dense.
         order = sorted(
@@ -124,6 +126,8 @@ class EntityObservation(ObservationProcessor):
             entity_mask[row] = 1.0
             planet_ids[row] = p.id
             planet_ships[row] = p.ships
+            planet_x[row] = p.x
+            planet_y[row] = p.y
             if p.owner == player and p.ships > 0:
                 action_mask[row] = 1.0
 
@@ -138,6 +142,8 @@ class EntityObservation(ObservationProcessor):
         context = {
             "planet_ids": planet_ids,
             "planet_ships": planet_ships,
+            "planet_x": planet_x,
+            "planet_y": planet_y,
             "actionable": action_mask,  # 1 where this player owns the planet and it has ships
             "player": player,
         }

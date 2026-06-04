@@ -22,7 +22,7 @@ import torch.nn as nn
 from torch.distributions import Categorical
 
 from orbit_wars_rl.agents.base import Agent
-from orbit_wars_rl.processors.action import PerPlanetAction
+from orbit_wars_rl.processors.action import DEFAULT_FRACTIONS, PerPlanetAction
 from orbit_wars_rl.processors.observation import EntityObservation
 
 _NEG_INF = -1e9
@@ -44,13 +44,27 @@ class EntityPolicy(nn.Module):
         n_global_features: int,
         actions_per_entity: int,
         hidden: int = 128,
+        target_mode: bool = False,
+        num_fracs: int = 4,
     ):
         super().__init__()
         self.actions_per_entity = actions_per_entity
+        self.target_mode = target_mode
+        self.num_fracs = num_fracs
+        self.hidden = hidden
         self.entity_encoder = _mlp([n_entity_features, hidden, hidden])
         self.context_encoder = _mlp([hidden + n_global_features, hidden, hidden])
-        self.actor = _mlp([hidden + hidden, hidden, actions_per_entity])
         self.critic = _mlp([hidden, hidden, 1])
+        if target_mode:
+            # Pointer actor: logit(r,t,f) = <q_f(tok_r,core), k(tok_t)>; the score depends
+            # on BOTH launcher and target encodings, so target selection (e.g. "nearest
+            # non-owned static") is representable -- an MLP over (tok_r,core) alone cannot
+            # pick a target because it has no per-target information.
+            self.actor_q = nn.Linear(hidden + hidden, num_fracs * hidden)
+            self.actor_k = nn.Linear(hidden, hidden)
+            self.actor_noop = nn.Linear(hidden + hidden, 1)
+        else:
+            self.actor = _mlp([hidden + hidden, hidden, actions_per_entity])
 
     def forward(self, obs: dict[str, torch.Tensor]):
         """Returns (logits (B,E,A), value (B,)). Logits are masked to legal actions."""
@@ -69,14 +83,35 @@ class EntityPolicy(nn.Module):
         core = self.context_encoder(torch.cat([pooled, glob], dim=-1))  # (B,h)
 
         core_b = core.unsqueeze(1).expand(-1, tok.size(1), -1)          # (B,E,h)
-        logits = self.actor(torch.cat([tok, core_b], dim=-1))          # (B,E,A)
-        logits = self._mask_logits(logits, act_mask)
+        if self.target_mode:
+            B, E, h = tok.shape
+            q = self.actor_q(torch.cat([tok, core_b], dim=-1)).reshape(B, E, self.num_fracs, h)
+            k = self.actor_k(tok)                                      # (B,E,h)
+            score = torch.einsum("brfh,bth->brtf", q, k) / (h ** 0.5)  # (B,r,t,f)
+            noop = self.actor_noop(torch.cat([tok, core_b], dim=-1))   # (B,E,1)
+            logits = torch.cat([noop, score.reshape(B, E, E * self.num_fracs)], dim=-1)
+        else:
+            logits = self.actor(torch.cat([tok, core_b], dim=-1))      # (B,E,A)
+        logits = self._mask_logits(logits, act_mask, ent_mask)
         value = self.critic(core).squeeze(-1)                          # (B,)
         return logits, value
 
-    def _mask_logits(self, logits: torch.Tensor, act_mask: torch.Tensor) -> torch.Tensor:
-        # Rows that cannot act are forced to the no-op class (index 0):
-        # allow class 0 everywhere, allow classes >0 only where act_mask == 1.
+    def _mask_logits(self, logits: torch.Tensor, act_mask: torch.Tensor,
+                     ent_mask: torch.Tensor) -> torch.Tensor:
+        if self.target_mode:
+            # Classes 1.. are (target_row t, frac f). Allow only if launcher r is
+            # actionable, target t is real, and t != r. Class 0 (noop) always allowed.
+            B, E, A = logits.shape
+            nf = (A - 1) // E
+            noop = logits[..., :1]
+            launch = logits[..., 1:].reshape(B, E, E, nf)              # (B,r,t,f)
+            launcher_ok = (act_mask > 0.5).view(B, E, 1, 1)
+            tgt_real = (ent_mask > 0.5).view(B, 1, E, 1)
+            eye = torch.eye(E, device=logits.device, dtype=torch.bool).view(1, E, E, 1)
+            allowed = launcher_ok & tgt_real & (~eye)                 # (B,E,E,1)
+            launch = torch.where(allowed, launch, torch.full_like(launch, _NEG_INF))
+            return torch.cat([noop, launch.reshape(B, E, A - 1)], dim=-1)
+        # Angle-bin mode: allow class 0 everywhere, classes >0 only where act_mask == 1.
         allowed = torch.ones_like(logits, dtype=torch.bool)
         non_actionable = act_mask < 0.5                                # (B,E)
         allowed[..., 1:] = ~non_actionable.unsqueeze(-1)
@@ -132,8 +167,19 @@ class PolicyAgent(Agent):
     ):
         self.policy = policy.to(device).eval()
         self.device = torch.device(device)
-        self.obs_processor = obs_processor or EntityObservation()
-        self.act_processor = act_processor or PerPlanetAction()
+        # Build processors that MATCH the policy head, so decode never mismatches the
+        # trained action layout (target-based vs angle-bin; #bins / #targets).
+        target_mode = bool(getattr(policy, "target_mode", False))
+        nf = len(DEFAULT_FRACTIONS)
+        if act_processor is None:
+            if target_mode:
+                max_entities = (policy.actions_per_entity - 1) // nf
+                act_processor = PerPlanetAction(max_entities=max_entities, target_mode=True)
+            else:
+                angle_bins = (policy.actions_per_entity - 1) // nf
+                act_processor = PerPlanetAction(angle_bins=angle_bins)
+        self.obs_processor = obs_processor or EntityObservation(max_entities=act_processor.max_entities)
+        self.act_processor = act_processor
         self.deterministic = deterministic
 
     def act(self, obs: dict, config: dict) -> list[list]:

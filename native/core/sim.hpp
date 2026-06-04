@@ -55,6 +55,34 @@ inline void step(GameState& s, const std::vector<Action>& actions, const Config&
         if (!expired.empty()) remove_planets(s, expired);
     }
 
+    // --- Comet spawn (lines 431-474), schedule-driven (RNG pre-resolved in Python) ---
+    // Fires when (step + 1) hits a scheduled spawn step. Each event adds 4 symmetric
+    // neutral "comet" planets starting off-board at (-99,-99) with path_index = -1; the
+    // movement block below advances them onto path[0]. Mirrors the reference exactly:
+    // new ids are max(current planet id) + 1 (comets never coexist across spawns, so
+    // this is the original max), rows [pid,-1,-99,-99,COMET_RADIUS,ships,COMET_PRODUCTION].
+    for (const auto& sc : s.comet_schedule) {
+        if (sc.spawn_step != s.step + 1) continue;
+        long next_id = 0;
+        bool any = false;
+        for (const auto& p : s.planets) {
+            if (!any || p.id >= next_id) { next_id = p.id; any = true; }
+        }
+        next_id = any ? next_id + 1 : 0;
+        CometGroup group;
+        group.path_index = -1;
+        group.paths = sc.paths;
+        for (size_t i = 0; i < sc.paths.size(); ++i) {
+            long pid = next_id + (long)i;
+            group.planet_ids.push_back(pid);
+            s.comet_planet_ids.push_back(pid);
+            Planet pl{pid, -1, -99.0, -99.0, COMET_RADIUS, sc.ships, COMET_PRODUCTION};
+            s.planets.push_back(pl);
+            s.initial_planets.push_back(pl);
+        }
+        s.comets.push_back(std::move(group));
+    }
+
     // --- 0. Fleet launch (lines 477-509) ---
     for (int pid = 0; pid < s.num_agents && pid < (int)actions.size(); ++pid) {
         for (const auto& mv : actions[pid]) {

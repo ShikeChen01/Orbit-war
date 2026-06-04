@@ -8,18 +8,25 @@ swappable agent/representation abstractions, and serves trained policies.
 
 > **New here? Read [`docs/SETUP.md`](docs/SETUP.md)**, then
 > [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/NATIVE_CPP.md`](docs/NATIVE_CPP.md),
-> and [`docs/GAME_REFERENCE.md`](docs/GAME_REFERENCE.md).
+> and [`docs/GAME_REFERENCE.md`](docs/GAME_REFERENCE.md). The **strength work** (what makes a
+> policy that plays well, with measured results) lives in [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md).
 
 ## Layout
 
 ```
 orbit_wars_rl/      env.game (engine wrapper) · agents · processors · ppo_policy (serving)
-                    native_worldgen · _native (compiled core) · _bootstrap (SSL fix)
-native/             C++/LibTorch: core (env sim + encoders) · rl (policy + batched env + PPO)
-scripts/            train_native · play_episode (arena)
-tests/              test_parity · test_encode_parity · test_native
+                    native_worldgen (worlds+comet schedules) · py_engine (pure-Python step,
+                    for search submission) · _native (compiled core) · _bootstrap (SSL fix)
+native/             C++/LibTorch: core (env sim + encoders) · rl (policy + batched env + PPO
+                    + arena fitness fn). Policy supports target-mode pointer actor.
+scripts/            train_native (chunked PPO + in-train arena eval; --target-mode,
+                    --init-from, --value-warmup-updates) · bc_pretrain (clone starter) ·
+                    eval_native (fast arena + --crosscheck) · search_agent (lookahead) ·
+                    inspect_agent (behavior diagnosis) · sweep_native · play_episode
+tests/              test_parity · test_comet_parity · test_encode_parity · test_native
 deploy/vertex_ai/   cloud-training scaffold (for later)
-docs/               SETUP · ARCHITECTURE · NATIVE_CPP · GAME_REFERENCE · archive/
+docs/               SETUP · ARCHITECTURE · NATIVE_CPP · GAME_REFERENCE · EXPERIMENTS ·
+                    SUBMISSION (how to deploy to Kaggle) · archive/
 REFERENCE_*         verbatim copies of the official env spec/rules/tests (the port source)
 ```
 
@@ -47,15 +54,33 @@ cmd /c native\build.cmd
 ## Use it
 
 ```powershell
-# train PPO natively on the GPU
-.venv\Scripts\python.exe scripts\train_native.py --total-steps 2000000 --num-envs 256 --out runs\native\final.pt
+# 1) clone the starter heuristic into a target-mode policy (warm start)
+.venv\Scripts\python.exe scripts\bc_pretrain.py --seeds 400 --epochs 15 --out runs\native\bc_start.pt
 
-# arena: any two agents in the REAL engine (random|starter|noop|<checkpoint>.pt)
-.venv\Scripts\python.exe scripts\play_episode.py --p0 runs\native\final.pt --p1 starter --episodes 50
+# 2) PPO finetune + self-play from the BC warm start (comet-aware, value-warmup stabilizes it)
+.venv\Scripts\python.exe scripts\train_native.py --target-mode --init-from runs\native\bc_start.pt `
+  --total-steps 6000000 --num-envs 512 --value-warmup-updates 25 --opp-self 1.5 --out runs\native\sp1.pt
 
-# tests (env step parity, encoder parity, native train+export parity)
+# 3) evaluate FAST in the comet-aware native arena (~1000x the Python arena, outcome-identical)
+.venv\Scripts\python.exe scripts\eval_native.py runs\native\bc_start.pt --opponent starter --games 256
+.venv\Scripts\python.exe scripts\eval_native.py runs\native\bc_start.pt --opponent starter --crosscheck 20
+
+# 4) inference-time lookahead on top of a fixed policy (the CPU-budget edge)
+.venv\Scripts\python.exe scripts\search_agent.py runs\native\bc_start.pt --opponent starter `
+  --episodes 10 --K 8 --H 10 --value heuristic --opp-model starter --compare-greedy
+
+# arena in the REAL engine (random|starter|noop|<checkpoint>.pt); tests (all parity incl. comets)
+.venv\Scripts\python.exe scripts\play_episode.py --p0 runs\native\bc_start.pt --p1 starter --episodes 50
 .venv\Scripts\python.exe -m pytest
 ```
+
+**State of play (see `docs/EXPERIMENTS.md`):** BC clones starter (96% vs random); from-scratch
+and finetune RL beat random but plateau ~0–2% vs starter — the policy *over-extends* (expands
+then loses undefended planets to starter's snowball). **Inference search fixes it — from the
+same fixed BC policy: greedy 0% → joint search 42% → per-planet search 70% vs starter.**
+Per-planet 1-ply lookahead (decide each planet hold-vs-attack, opponent modeled as starter,
+bit-exact `py_engine` forward model — submits without the `.pyd`). The deployable agent is
+`submission.py` (+ `docs/SUBMISSION.md`). Next levers: a learned win-value, attention encoder.
 
 ## Swapping things (the point of the abstraction layer)
 

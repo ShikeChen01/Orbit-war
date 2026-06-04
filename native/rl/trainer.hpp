@@ -16,14 +16,17 @@ namespace ow {
 struct TrainerConfig {
     int num_envs = 256;
     int rollout_steps = 16;
-    int total_steps = 2'000'000;
+    int total_steps = 5'000'000;
     int update_epochs = 4;
     int minibatches = 8;
     double gamma = 0.997, gae_lambda = 0.95, clip = 0.2;
     double ent_coef = 0.01, vf_coef = 0.5, max_grad_norm = 0.5, lr = 3e-4;
     int hidden = 128, max_entities = 64, angle_bins = 16, episode_steps = 500;
+    bool target_mode = false;  // true: per-planet action picks a target entity (precise aim)
     std::vector<double> fractions = {0.25, 0.5, 0.75, 1.0};
     double reward_scale = 50.0, terminal_bonus = 1.0, reward_clip = 5.0;
+    double prod_weight = 20.0;  // production-margin weight in the reward potential
+    int value_warmup_updates = 0;  // critic-only updates before policy moves (BC finetune)
     int selfplay_start_step = 200'000, snapshot_every = 200'000;
     double opp_random = 1.0, opp_starter = 1.0, opp_self = 2.0;
     std::string device = "cuda";
@@ -47,25 +50,35 @@ public:
           device(c.device == "cuda" && torch::cuda::is_available() ? torch::kCUDA : torch::kCPU),
           env(c.num_envs, c.max_entities, c.angle_bins, c.fractions,
               Config{c.episode_steps, 6.0, 4.0}, c.episode_steps, c.reward_scale,
-              c.terminal_bonus, c.reward_clip, c.seed) {
+              c.terminal_bonus, c.reward_clip, c.prod_weight, c.seed) {
         torch::manual_seed(c.seed);
         n_entity_features = N_ENTITY_FEATURES;
         n_global_features = N_GLOBAL_FEATURES;
-        actions_per_entity = 1 + c.angle_bins * (int)c.fractions.size();
-        policy = EntityPolicy(n_entity_features, n_global_features, actions_per_entity, c.hidden);
+        int nf = (int)c.fractions.size();
+        actions_per_entity = c.target_mode ? 1 + c.max_entities * nf : 1 + c.angle_bins * nf;
+        policy = EntityPolicy(n_entity_features, n_global_features, actions_per_entity, c.hidden,
+                              c.target_mode, nf);
         policy->to(device);
         opt = std::make_shared<torch::optim::Adam>(policy->parameters(),
                                                    torch::optim::AdamOptions(c.lr).eps(1e-5));
         env.set_opp_weights(c.opp_random, c.opp_starter, c.opp_self);
         env.set_selfplay_available(false);
+        env.set_target_mode(c.target_mode);
     }
 
     void set_world_pool(std::vector<GameState> pool) { env.set_world_pool(std::move(pool)); }
 
     void train(long total_steps) {
-        env.reset_all();
-        auto obs = to_device(env.observe(0));
-        std::vector<float> ep_ret(cfg.num_envs, 0.f);
+        // Continue across chunked train() calls (Python evals between chunks): only do
+        // the cold reset once, so partial episodes aren't discarded every chunk.
+        if (!train_started_) {
+            env.reset_all();
+            cur_obs_ = to_device(env.observe(0));
+            ep_ret_.assign(cfg.num_envs, 0.f);
+            train_started_ = true;
+        }
+        ObsTensors& obs = cur_obs_;
+        std::vector<float>& ep_ret = ep_ret_;
 
         int B = cfg.num_envs, T = cfg.rollout_steps, E = cfg.max_entities;
         int F = n_entity_features, G = n_global_features;
@@ -141,6 +154,15 @@ public:
         }
     }
 
+    // Load Python EntityPolicy state_dict weights into the live policy (e.g. a BC warm
+    // start before PPO finetuning). Rebuilds the optimizer so Adam moments reset.
+    void load_weights(const std::map<std::string, torch::Tensor>& sd) {
+        load_python_state_dict(policy, sd);
+        policy->to(device);
+        opt = std::make_shared<torch::optim::Adam>(policy->parameters(),
+                                                   torch::optim::AdamOptions(cfg.lr).eps(1e-5));
+    }
+
     // Weights with Python EntityPolicy state_dict keys, as CPU tensors.
     std::map<std::string, torch::Tensor> get_state_dict() {
         std::map<std::string, torch::Tensor> w;
@@ -150,8 +172,12 @@ public:
         };
         put("entity_encoder.0", policy->ent0); put("entity_encoder.2", policy->ent2);
         put("context_encoder.0", policy->ctx0); put("context_encoder.2", policy->ctx2);
-        put("actor.0", policy->act0); put("actor.2", policy->act2);
         put("critic.0", policy->crit0); put("critic.2", policy->crit2);
+        if (cfg.target_mode) {
+            put("actor_q", policy->aq); put("actor_k", policy->ak); put("actor_noop", policy->anoop);
+        } else {
+            put("actor.0", policy->act0); put("actor.2", policy->act2);
+        }
         return w;
     }
 
@@ -187,6 +213,9 @@ public:
 
 private:
     bool selfplay_on = false;
+    bool train_started_ = false;
+    ObsTensors cur_obs_;
+    std::vector<float> ep_ret_;
     bool env_selfplay_active() { return selfplay_on && frozen; }
 
     ObsTensors to_device(const ObsTensors& o) {
@@ -238,7 +267,12 @@ private:
                 auto pg2 = -a * torch::clamp(ratio, 1 - cfg.clip, 1 + cfg.clip);
                 auto pg_loss = torch::max(pg1, pg2).mean();
                 auto v_loss = 0.5 * (value - ret.index({mbidx})).pow(2).mean();
-                auto loss = pg_loss + cfg.vf_coef * v_loss - cfg.ent_coef * entropy;
+                // Value warmup: for the first few updates only fit the critic, so a freshly
+                // warm-started (BC) policy isn't wrecked by garbage advantages from an
+                // uncalibrated value head before it has learned to predict returns.
+                torch::Tensor loss = (updates < cfg.value_warmup_updates)
+                    ? cfg.vf_coef * v_loss
+                    : pg_loss + cfg.vf_coef * v_loss - cfg.ent_coef * entropy;
                 opt->zero_grad();
                 loss.backward();
                 torch::nn::utils::clip_grad_norm_(policy->parameters(), cfg.max_grad_norm);
@@ -252,7 +286,8 @@ private:
         long bucket = global_step / std::max<long>(1, cfg.snapshot_every);
         if (bucket > last_snap_bucket) {
             last_snap_bucket = bucket;
-            frozen = EntityPolicy(n_entity_features, n_global_features, actions_per_entity, cfg.hidden);
+            frozen = EntityPolicy(n_entity_features, n_global_features, actions_per_entity,
+                                  cfg.hidden, cfg.target_mode, (int)cfg.fractions.size());
             std::stringstream ss;
             torch::save(policy, ss);
             torch::load(frozen, ss);
