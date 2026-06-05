@@ -65,7 +65,7 @@ int main(int argc, char** argv) try {
     printf("reset ok: B=%d Ec=%d Fc=%d\n", B, env.planet_cap(), env.fleet_cap());
 
     Config econf{cfg.episode_steps, cfg.ship_speed, cfg.comet_speed};
-    const int twoK = 2 * K;
+    const int nap = 3 * K;  // (dx,dy,phi) per fleet
     std::mt19937_64 rng(seed);
     std::uniform_real_distribution<double> U(0.0, 1.0);
     auto f32 = torch::TensorOptions().dtype(torch::kFloat32);
@@ -128,9 +128,9 @@ int main(int argc, char** argv) try {
             printf("\n");
         }
 
-        std::vector<float> act((size_t)B * Ec * twoK);
+        std::vector<float> act((size_t)B * Ec * nap);
         for (auto& v : act) v = (float)U(rng);
-        auto act_t = torch::from_blob(act.data(), {B, Ec, twoK}, f32).clone().to(dev);
+        auto act_t = torch::from_blob(act.data(), {B, Ec, nap}, f32).clone().to(dev);
         env.step(act_t, opp, thr);
 
         for (int b = 0; b < B; ++b) {
@@ -150,7 +150,7 @@ int main(int argc, char** argv) try {
                 am[slot] = (p.owner == 0 && p.ships > 0) ? 1.f : 0.f;
             }
             int inv = 0;
-            Action move0 = decode_action_continuous(act.data() + (size_t)b * Ec * twoK, am.data(),
+            Action move0 = decode_action_continuous(act.data() + (size_t)b * Ec * nap, am.data(),
                                                     rid.data(), rsh.data(), Ec, K, thr, &inv);
             std::vector<Action> acts = {move0};  // opp==2 noop: player 1 absent
             if (opp == 1) acts.push_back(starter_agent(s, 1));  // deterministic, parity-exact

@@ -1,5 +1,5 @@
 # Fdb version 4
-["pdflatex"] 1780612901.63118 "rl_math.tex" "rl_math.pdf" "rl_math" 1780612902.9401 0
+["pdflatex"] 1780663949.37861 "rl_math.tex" "rl_math.pdf" "rl_math" 1780663950.65596 0
   "C:/Users/doubi/AppData/Local/MiKTeX/fonts/map/pdftex/pdftex.map" 1780005151.93882 82011 97247c01f6bfb6f6d0c40fab12a08423 ""
   "C:/Users/doubi/AppData/Local/MiKTeX/fonts/pk/ljfour/jknappen/ec/dpi600/tcrm1095.pk" 1780538905.42881 12668 378bc4a45d28452d46acdbe578167531 ""
   "C:/Users/doubi/AppData/Local/MiKTeX/miktex/data/le/pdftex/pdflatex.fmt" 1778278504.64437 13333486 adf65fe8192f6338bb80d8712efd4a4a ""
@@ -32,6 +32,8 @@
   "C:/Users/doubi/AppData/Local/Programs/MiKTeX/fonts/tfm/public/cm/cmr6.tfm" 1136765053 1300 b62933e007d01cfd073f79b963c01526 ""
   "C:/Users/doubi/AppData/Local/Programs/MiKTeX/fonts/tfm/public/cm/cmr8.tfm" 1136765053 1292 21c1c5bfeaebccffdb478fd231a0997d ""
   "C:/Users/doubi/AppData/Local/Programs/MiKTeX/fonts/tfm/public/cm/cmr9.tfm" 1136765053 1292 6b21b9c2c7bebb38aa2273f7ca0fb3af ""
+  "C:/Users/doubi/AppData/Local/Programs/MiKTeX/fonts/tfm/public/cm/cmss10.tfm" 1136765053 1316 b636689f1933f24d1294acdf6041daaa ""
+  "C:/Users/doubi/AppData/Local/Programs/MiKTeX/fonts/tfm/public/cm/cmssbx10.tfm" 1136765053 1272 e2d13f0df30bf3ad990bb9d028e37f34 ""
   "C:/Users/doubi/AppData/Local/Programs/MiKTeX/fonts/tfm/public/cm/cmsy10.tfm" 1136765053 1124 6c73e740cf17375f03eec0ee63599741 ""
   "C:/Users/doubi/AppData/Local/Programs/MiKTeX/fonts/tfm/public/cm/cmsy6.tfm" 1136765053 1116 933a60c408fc0a863a92debe84b2d294 ""
   "C:/Users/doubi/AppData/Local/Programs/MiKTeX/fonts/tfm/public/cm/cmsy8.tfm" 1136765053 1120 8b7d695260f3cff42e636090a8002094 ""
@@ -58,6 +60,8 @@
   "C:/Users/doubi/AppData/Local/Programs/MiKTeX/fonts/type1/public/amsfonts/cm/cmr7.pfb" 1247596667 32762 224316ccc9ad3ca0423a14971cfa7fc1 ""
   "C:/Users/doubi/AppData/Local/Programs/MiKTeX/fonts/type1/public/amsfonts/cm/cmr8.pfb" 1247596667 32726 0a1aea6fcd6468ee2cf64d891f5c43c8 ""
   "C:/Users/doubi/AppData/Local/Programs/MiKTeX/fonts/type1/public/amsfonts/cm/cmr9.pfb" 1247596666 33993 9b89b85fd2d9df0482bd47194d1d3bf3 ""
+  "C:/Users/doubi/AppData/Local/Programs/MiKTeX/fonts/type1/public/amsfonts/cm/cmss10.pfb" 1247596666 24457 5cbb7bdf209d5d1ce9892a9b80a307cc ""
+  "C:/Users/doubi/AppData/Local/Programs/MiKTeX/fonts/type1/public/amsfonts/cm/cmssbx10.pfb" 1247596666 28902 2f5c04fd2884d1878057baa5aad22765 ""
   "C:/Users/doubi/AppData/Local/Programs/MiKTeX/fonts/type1/public/amsfonts/cm/cmsy10.pfb" 1247596667 32569 5e5ddc8df908dea60932f3c484a54c0d ""
   "C:/Users/doubi/AppData/Local/Programs/MiKTeX/fonts/type1/public/amsfonts/cm/cmsy7.pfb" 1247596666 32716 08e384dc442464e7285e891af9f45947 ""
   "C:/Users/doubi/AppData/Local/Programs/MiKTeX/fonts/type1/public/amsfonts/cm/cmsy8.pfb" 1247596667 32626 4f5c1b83753b1dd3a97d1b399a005b4b ""
@@ -189,10 +193,10 @@
   "C:/Users/doubi/AppData/Local/Programs/MiKTeX/tex/latex/rerunfilecheck/rerunfilecheck.sty" 1751104012 9684 a33a14b82ce60d6e77cb9be689d79ee6 ""
   "C:/Users/doubi/AppData/Local/Programs/MiKTeX/tex/latex/url/url.sty" 1388490452 12796 8edb7d69a20b857904dd0ea757c14ec9 ""
   "C:/Users/doubi/AppData/Local/Programs/MiKTeX/tex/latex/xcolor/xcolor.sty" 1729265222 55384 b454dec21c2d9f45ec0b793f0995b992 ""
-  "rl_math.aux" 1780612902.50797 8503 315294ef714a738a2c1df7c843ee6571 "pdflatex"
-  "rl_math.out" 1780612902.50897 2455 0e2b34826107fc3c092721a710b7c2d6 "pdflatex"
-  "rl_math.tex" 1780612895.72718 40188 7f5e38a7284ca861390b83c3ba110d1d ""
-  "rl_math.toc" 1780612902.51097 2957 fd85384ade0354b477e8e0ee25651cef "pdflatex"
+  "rl_math.aux" 1780663950.21551 9589 ceeb56d5e990cc7f3e6fd4360429a85a "pdflatex"
+  "rl_math.out" 1780663950.21651 2611 dc9fbcade11ec70276989b7553f1a441 "pdflatex"
+  "rl_math.tex" 1780663905.71575 50495 f51e067a255b5e1ad6f170b25f0570fe ""
+  "rl_math.toc" 1780663950.21751 3639 a88f3f660de57a7dd3240d68648dcaee "pdflatex"
   (generated)
   "rl_math.aux"
   "rl_math.log"

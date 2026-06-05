@@ -65,10 +65,12 @@ int main(int argc, char** argv) try {
     cfg.rollout.stage1_frac = a.f("stage1-frac", 0.40);
     cfg.rollout.stage2_frac = a.f("stage2-frac", 0.75);
     cfg.rollout.prod_reward_weight = a.f("prod-reward-weight", 2.5);
-    cfg.rollout.prod_reward_cap = a.f("prod-reward-cap", 200.0);
+    cfg.rollout.prod_reward_cap = a.f("prod-reward-cap", 100.0);
+    cfg.rollout.prod_reward_decay = a.f("prod-reward-decay", 0.997);  // per-step prod decay (front-load)
     cfg.rollout.valid_launch_reward = a.f("valid-launch-reward", 0.02);
     cfg.rollout.valid_reward_cap = a.f("valid-reward-cap", 30.0);
     cfg.rollout.illegal_launch_penalty = a.f("illegal-launch-penalty", 0.005);
+    cfg.rollout.miss_launch_penalty = a.f("miss-launch-penalty", 0.01);  // aiming STICK (<= valid reward)
     cfg.rollout.win_bonus = a.f("win-bonus", 300.0);
     cfg.rollout.loss_penalty = a.f("loss-penalty", 100.0);
     cfg.rollout.enemy_growth_weight = a.f("enemy-growth-weight", 0.5);

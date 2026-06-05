@@ -66,8 +66,8 @@ int main(int argc, char** argv) try {
     cfg.init_phi_bias = a.f("init-phi-bias", -2.0);
 
     const int E = cfg.max_entities, F = N_ENTITY_FEATURES, G = N_GLOBAL_FEATURES;
-    const int K = cfg.fleets_per_planet, twoK = 2 * K;
-    const double TWO_PI = 2.0 * PI;
+    const int K = cfg.fleets_per_planet, nap = 3 * K;  // (dx,dy,phi) per fleet
+    (void)nap;
 
     auto pool = read_world_pool(worlds_path);
     if (pool.empty()) { printf("empty world pool %s\n", worlds_path.c_str()); return 1; }
@@ -75,7 +75,7 @@ int main(int argc, char** argv) try {
     // --- generate (obs for player 0, starter-target) samples. player0 = starter (the expert we
     //     imitate); player1 alternates starter/random for state diversity. ---
     printf("generating up to %ld samples (gen_steps=%d)...\n", n_samples, gen_steps);
-    std::vector<float> ent, em, am, gl, talpha, tphi, cmask;
+    std::vector<float> ent, em, am, gl, tdx, tdy, tphi, cmask;
     ent.reserve((size_t)n_samples * E * F);
     Config econf{500, 6.0, 4.0};
     std::mt19937_64 rng(12345);
@@ -87,7 +87,7 @@ int main(int argc, char** argv) try {
             std::vector<float> e(E * F, 0.f), m(E, 0.f), amask(E, 0.f), g(G, 0.f);
             std::vector<long> rid(E, -1), rsh(E, 0);
             encode_obs(s, 0, E, e.data(), m.data(), amask.data(), g.data(), rid.data(), rsh.data(), 500);
-            std::vector<float> ta(E * K, 0.f), tp(E * K, 0.f), cm(E * K, 0.f);
+            std::vector<float> tx(E * K, 0.5f), ty(E * K, 0.5f), tp(E * K, 0.f), cm(E * K, 0.f);
             Action mv0 = starter_agent(s, 0);
             for (const auto& mvv : mv0) {
                 int r = -1;
@@ -95,11 +95,12 @@ int main(int argc, char** argv) try {
                     if (rid[rr] == mvv.from_id) { r = rr; break; }
                 if (r < 0) continue;
                 double ang = mvv.angle;
-                while (ang < 0) ang += TWO_PI;
-                double alpha = std::fmod(ang, TWO_PI) / TWO_PI;
+                // direction-vector target: decode reads (2a-1), so a=(cos/sin+1)/2 recovers the unit
+                // heading and atan2 maps it back to ang. dx,dy in [0,1]; aiming is linear in positions.
                 long sh = rsh[r] > 0 ? rsh[r] : 1;
                 double phi = std::min(1.0, std::max(0.0, (double)mvv.ships / (double)sh));
-                ta[r * K + 0] = (float)alpha;
+                tx[r * K + 0] = (float)(0.5 * (std::cos(ang) + 1.0));
+                ty[r * K + 0] = (float)(0.5 * (std::sin(ang) + 1.0));
                 tp[r * K + 0] = (float)phi;
                 cm[r * K + 0] = 1.f;
             }
@@ -107,7 +108,8 @@ int main(int argc, char** argv) try {
             em.insert(em.end(), m.begin(), m.end());
             am.insert(am.end(), amask.begin(), amask.end());
             gl.insert(gl.end(), g.begin(), g.end());
-            talpha.insert(talpha.end(), ta.begin(), ta.end());
+            tdx.insert(tdx.end(), tx.begin(), tx.end());
+            tdy.insert(tdy.end(), ty.begin(), ty.end());
             tphi.insert(tphi.end(), tp.begin(), tp.end());
             cmask.insert(cmask.end(), cm.begin(), cm.end());
             ++S;
@@ -125,7 +127,8 @@ int main(int argc, char** argv) try {
     auto T_em = torch::from_blob(em.data(), {S, E}, fo).clone();
     auto T_am = torch::from_blob(am.data(), {S, E}, fo).clone();
     auto T_gl = torch::from_blob(gl.data(), {S, G}, fo).clone();
-    auto T_ta = torch::from_blob(talpha.data(), {S, E, K}, fo).clone();
+    auto T_tdx = torch::from_blob(tdx.data(), {S, E, K}, fo).clone();
+    auto T_tdy = torch::from_blob(tdy.data(), {S, E, K}, fo).clone();
     auto T_tp = torch::from_blob(tphi.data(), {S, E, K}, fo).clone();
     auto T_cm = torch::from_blob(cmask.data(), {S, E, K}, fo).clone();
 
@@ -144,14 +147,16 @@ int main(int argc, char** argv) try {
             auto em_b = T_em.index_select(0, mi).to(dev);
             auto am_b = T_am.index_select(0, mi).to(dev);
             auto gl_b = T_gl.index_select(0, mi).to(dev);
-            auto ta_b = T_ta.index_select(0, mi).to(dev);
+            auto tdx_b = T_tdx.index_select(0, mi).to(dev);
+            auto tdy_b = T_tdy.index_select(0, mi).to(dev);
             auto tp_b = T_tp.index_select(0, mi).to(dev);
             auto cm_b = T_cm.index_select(0, mi).to(dev);
 
-            auto mean = policy.net->forward(ent_b, em_b, am_b, gl_b).first;  // (B,E,2K)
+            auto mean = policy.net->forward(ent_b, em_b, am_b, gl_b).first;  // (B,E,3K)
             auto act = torch::sigmoid(mean);
-            auto a_alpha = act.index({Slice(), Slice(), Slice(0, None, 2)});  // (B,E,K)
-            auto a_phi = act.index({Slice(), Slice(), Slice(1, None, 2)});    // (B,E,K)
+            auto a_dx = act.index({Slice(), Slice(), Slice(0, None, 3)});   // (B,E,K)
+            auto a_dy = act.index({Slice(), Slice(), Slice(1, None, 3)});   // (B,E,K)
+            auto a_phi = act.index({Slice(), Slice(), Slice(2, None, 3)});  // (B,E,K)
 
             // phi: BALANCED by the commit mask. ~3 of ~200 slots/sample are launches (target ~0.5)
             // vs ~197 zeros; a plain mean(mse) is dominated by the zeros so the policy outputs phi~0
@@ -159,21 +164,21 @@ int main(int argc, char** argv) try {
             auto phi_commit = (cm_b * (a_phi - tp_b).pow(2)).sum() / (cm_b.sum() + 1e-6);
             auto phi_zero = ((1.0 - cm_b) * a_phi.pow(2)).sum() / ((1.0 - cm_b).sum() + 1e-6);
             auto phi_loss = phi_commit + 0.2 * phi_zero;
-            auto ang_pred = a_alpha * TWO_PI, ang_tgt = ta_b * TWO_PI;
-            auto dcos = torch::cos(ang_pred) - torch::cos(ang_tgt);
-            auto dsin = torch::sin(ang_pred) - torch::sin(ang_tgt);
-            auto alpha_loss = (cm_b * (dcos * dcos + dsin * dsin)).sum() / (cm_b.sum() + 1e-6);
-            auto loss = phi_loss + 0.3 * alpha_loss;
+            // aiming: direct MSE on the direction-vector target (linear in positions) -- replaces the
+            // old circular alpha loss; decode's atan2(2a-1) maps it back to the heading.
+            auto dir_loss = (cm_b * ((a_dx - tdx_b).pow(2) + (a_dy - tdy_b).pow(2))).sum() /
+                            (cm_b.sum() + 1e-6);
+            auto loss = phi_loss + 0.3 * dir_loss;
 
             opt.zero_grad();
             loss.backward();
             opt.step();
             ep_loss += loss.item<double>();
             ep_phi += phi_loss.item<double>();
-            ep_al += alpha_loss.item<double>();
+            ep_al += dir_loss.item<double>();
             ++nb;
         }
-        if (nb) printf("epoch %2d/%d  loss %.5f (phi %.5f  alpha %.5f)\n", ep + 1, epochs,
+        if (nb) printf("epoch %2d/%d  loss %.5f (phi %.5f  dir %.5f)\n", ep + 1, epochs,
                        ep_loss / nb, ep_phi / nb, ep_al / nb);
     }
 

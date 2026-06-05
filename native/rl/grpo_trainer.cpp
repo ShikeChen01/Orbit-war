@@ -62,7 +62,7 @@ GrpoTrainer::UpdateStats GrpoTrainer::update(const TrajectoryBatch& tb) {
     if (mbsize == 0) return s;
     s.adv_mean = tb.advantage.mean().item<float>();
     s.adv_std = tb.advantage.std().item<float>();
-    const int E = (int)tb.entities.size(1), twoK = cfg_.model.n_action_params();  // E = actual obs dim
+    const int E = (int)tb.entities.size(1), nap = cfg_.model.n_action_params();  // E = actual obs dim
     const double kHalfLog2PiE = 1.4189385332046727;  // entropy const per component
     int nsteps = 0;
     for (int e = 0; e < cfg_.grpo.update_epochs; ++e) {
@@ -89,7 +89,7 @@ GrpoTrainer::UpdateStats GrpoTrainer::update(const TrajectoryBatch& tb) {
             }
             // per-component entropy (scale-invariant in E,K) so ent_coef behaves like standard PPO
             // -- the raw sum over 400 components would otherwise swamp the policy gradient.
-            auto ent_b = sc.entropy.mean() / (double)(E * twoK);
+            auto ent_b = sc.entropy.mean() / (double)(E * nap);
             auto loss = pol + cfg_.grpo.kl_beta * kl - cfg_.grpo.ent_coef * ent_b;
 
             opt_->zero_grad();
@@ -180,7 +180,7 @@ void GrpoTrainer::train() {
         std::ofstream c(run_dir_ + "/config.txt", std::ios::trunc);
         c << "total_steps=" << cfg_.total_steps << "\nnum_envs=" << cfg_.num_envs()
           << " (group_size=" << cfg_.grpo.group_size << " num_groups=" << cfg_.grpo.num_groups
-          << ")\n# actor: continuous squashed-Gaussian over E x 2K\n"
+          << ")\n# actor: continuous squashed-Gaussian over E x 3K (dx,dy,phi per fleet)\n"
           << "max_entities(E)=" << cfg_.model.max_entities
           << " fleets_per_planet(K)=" << cfg_.model.fleets_per_planet
           << " hidden(d)=" << cfg_.model.hidden << " d_g=" << cfg_.model.d_g
@@ -201,9 +201,11 @@ void GrpoTrainer::train() {
           << " stage=" << cfg_.rollout.stage
           << " prod_reward_weight=" << cfg_.rollout.prod_reward_weight
           << " prod_reward_cap=" << cfg_.rollout.prod_reward_cap
+          << " prod_reward_decay=" << cfg_.rollout.prod_reward_decay
           << " valid_launch_reward=" << cfg_.rollout.valid_launch_reward
           << " valid_reward_cap=" << cfg_.rollout.valid_reward_cap
           << " illegal_launch_penalty=" << cfg_.rollout.illegal_launch_penalty
+          << " miss_launch_penalty=" << cfg_.rollout.miss_launch_penalty
           << " win_bonus=" << cfg_.rollout.win_bonus
           << " loss_penalty=" << cfg_.rollout.loss_penalty
           << " enemy_growth_weight=" << cfg_.rollout.enemy_growth_weight

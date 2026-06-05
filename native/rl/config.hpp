@@ -17,11 +17,14 @@ struct ModelConfig {
     int hidden = 128;             // d: trunk width
     int max_entities = 40;        // E: planet slots (docs/rl_math.pdf)
 
-    // --- v4 CONTINUOUS actor (squashed diagonal Gaussian over E x 2K controls) ----------------
-    // Each planet emits K fleet pairs (alpha=heading, phi=fraction), so 2K params/planet. The
-    // trunk is per-planet (proj -> [GLU] -> 2 residual MLP); the G board globals enter through a
-    // SEPARATE embedding g'=relu(W_g g) broadcast to the mean/log-std heads (NOT merged per row).
-    int fleets_per_planet = 5;    // K: max fleets launched per planet per step -> 2K action params
+    // --- v4 CONTINUOUS actor (squashed diagonal Gaussian over E x 3K controls) ----------------
+    // Each planet emits K fleet TRIPLES (dx, dy, phi): (dx,dy) is a DIRECTION VECTOR and phi the
+    // launch fraction, so 3K params/planet. Decode aims via angle = atan2(2*dy-1, 2*dx-1) -- aiming
+    // is then LINEAR in relative position (attention-computable) instead of the nonlinear scalar
+    // atan2(target-self) a linear head cannot represent. The trunk is per-planet (proj -> [GLU] ->
+    // res MLP); the G board globals enter through a SEPARATE embedding g'=relu(W_g g) broadcast to
+    // the mean/log-std heads (NOT merged per row).
+    int fleets_per_planet = 5;    // K: max fleets launched per planet per step -> 3K action params
     int d_g = 32;                 // board-globals embedding dim (separate broadcast path)
     bool use_glu = true;          // trunk A/B: GLU block on (true) vs plain stacked-MLP (false)
     int n_res_blocks = 2;         // residual MLP blocks after the (optional) GLU
@@ -36,7 +39,7 @@ struct ModelConfig {
     double init_mu_scale = 0.02;   // mu_head weight multiplier at init
     double init_phi_bias = -4.0;   // mu_head phi-bias at init (sigmoid(-4)=0.018; w/ sigma=1 ~14% commit)
 
-    int n_action_params() const { return 2 * fleets_per_planet; }  // 2K continuous controls/planet
+    int n_action_params() const { return 3 * fleets_per_planet; }  // 3K continuous controls/planet (dx,dy,phi)
 };
 
 // --- optimizer -------------------------------------------------------------
@@ -99,11 +102,24 @@ struct RolloutConfig {
     //   R = outcome + P(prod, +/-cap) + V(valid, 0..cap) - I(invalid, uncapped) + S(suppression)
     // outcome is applied ONLY at stage >= 2 (stage 1 is pure "valid dispatch + better production").
     double prod_reward_weight = 2.5;      // w_prod: rate of production gain into P
-    double prod_reward_cap = 200.0;       // per-game cap on the production reward |P|
+    double prod_reward_cap = 100.0;       // per-game cap on the production reward |P|
+    double prod_reward_decay = 0.997;     // delta_Pi: per-STEP multiplicative decay on the production
+                                          // term (weights step t's prod gain by decay^t). <1 front-
+                                          // loads early expansion and shrinks production's share of the
+                                          // return so the aiming (V/M) + outcome terms drive the
+                                          // group-relative advantage. 1.0 = no decay (legacy).
     double valid_launch_reward = 0.02;    // w_valid: rate of valid (landing) launches into V
     double valid_reward_cap = 30.0;       // per-game cap on the valid-launch reward V
     double illegal_launch_penalty = 0.005;// w_inv: rate of invalid dispatches into I (uncapped:
                                           // a hard cap would remove the gradient while invalid is high)
+    double miss_launch_penalty = 0.01;    // w_miss: rate of MISSED launches into M (uncapped). A miss
+                                          // is a legal, in-budget launch from an OWNED planet whose
+                                          // heading lands on no planet (= launches - valid): ships
+                                          // thrown into space. This is the aiming STICK that
+                                          // complements the valid-launch carrot. GUARDRAIL: keep
+                                          // w_miss <= valid_launch_reward so a >50%-accurate launcher
+                                          // stays net-positive (else "do nothing" becomes optimal ->
+                                          // the passive basin the carrot-only design avoided).
     double win_bonus = 300.0;             // outcome (stage>=2): + on a win
     double loss_penalty = 100.0;          // outcome (stage>=2): - on a loss (draw = 0)
     bool loss_forfeit = false;            // legacy/unused in the bounded scheme (outcome is explicit)

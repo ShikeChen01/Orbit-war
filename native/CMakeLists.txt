@@ -59,3 +59,9 @@ add_executable(ow_bc apps/bc_pretrain.cpp ${OW_RL_SRC})
 target_include_directories(ow_bc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(ow_bc PRIVATE torch_local)
 target_compile_options(ow_bc PRIVATE /EHsc /bigobj /Zc:__cplusplus)
+
+# --- reward-curve diagnostic: trace one game's per-step reward channels + standing to CSV ---------
+add_executable(ow_reward_trace apps/reward_trace.cpp ${OW_RL_SRC})
+target_include_directories(ow_reward_trace PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(ow_reward_trace PRIVATE torch_local)
+target_compile_options(ow_reward_trace PRIVATE /EHsc /bigobj /Zc:__cplusplus)

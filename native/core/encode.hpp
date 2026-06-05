@@ -204,34 +204,37 @@ inline void encode_obs(const GameState& s, int player, int max_entities,
     }
 }
 
-// CONTINUOUS decode (docs/rl_math.pdf sec:decode). `actions` is row-major (E x 2K): per planet,
-// K fleet pairs [alpha, phi] in [0,1]. A fleet is COMMITTED when phi >= act_threshold; it launches
-// n = floor(phi * S) ships (S = planet ships at decode time) at heading theta = 2*pi*alpha, with the
-// engine's sequential deduction mimicked (later over-budget fleets drop). `*out_invalid` accumulates
-// the COMMITTED fleets that fail to execute -- on a phantom slot, an unowned/0-ship planet, or past
-// the ship budget -- i.e. the x_t penalized by the reward. The actor is NOT masked: it may commit
-// anywhere and learns the legal action space from that penalty.
+// CONTINUOUS decode (docs/rl_math.pdf sec:decode). `actions` is row-major (E x 3K): per planet,
+// K fleet TRIPLES [dx, dy, phi] in [0,1]. (dx,dy) is a DIRECTION VECTOR (recentred to [-1,1] as
+// 2a-1); the heading is theta = atan2(2*dy-1, 2*dx-1) -- so aiming is LINEAR in relative position
+// (attention-friendly), unlike the old scalar 2*pi*alpha a linear head could not represent. A fleet
+// is COMMITTED when phi >= act_threshold; it launches n = floor(phi * S) ships (S = planet ships at
+// decode time), with the engine's sequential deduction mimicked (later over-budget fleets drop).
+// `*out_invalid` accumulates the COMMITTED fleets that fail to execute -- on a phantom slot, an
+// unowned/0-ship planet, or past the ship budget -- i.e. the x_t penalized by the reward. The actor
+// is NOT masked: it may commit anywhere and learns the legal action space from that penalty.
 inline Action decode_action_continuous(const float* actions, const float* action_mask,
                                        const long* row_planet_id, const long* row_planet_ships,
                                        int max_entities, int fleets_per_planet, double act_threshold,
                                        int* out_invalid = nullptr) {
     Action moves;
     int invalid = 0;
-    const int twoK = 2 * fleets_per_planet;
+    const int nap = 3 * fleets_per_planet;  // (dx,dy,phi) per fleet
     for (int row = 0; row < max_entities; ++row) {
-        const float* a = actions + (size_t)row * twoK;
+        const float* a = actions + (size_t)row * nap;
         bool legal = (action_mask[row] >= 0.5f) && (row_planet_id[row] >= 0);
         long pid = row_planet_id[row];
         long S = row_planet_ships[row];  // ships available at decode time (pre-production)
         long remaining = S;
         for (int k = 0; k < fleets_per_planet; ++k) {
-            double alpha = (double)a[2 * k];
-            double phi = (double)a[2 * k + 1];
+            double dx = 2.0 * (double)a[3 * k] - 1.0;      // direction vector, recentred to [-1,1]
+            double dy = 2.0 * (double)a[3 * k + 1] - 1.0;
+            double phi = (double)a[3 * k + 2];
             if (phi < act_threshold) continue;  // not committed -> genuine no-op, no penalty
             if (!legal) { ++invalid; continue; }
             long n = (long)std::floor(phi * (double)S);
             if (n >= 1 && remaining >= n) {
-                double angle = 2.0 * PI * alpha;  // alpha in [0,1] -> [0, 2pi)
+                double angle = std::atan2(dy, dx);  // direction vector -> heading (linear aiming)
                 moves.push_back(Move{pid, angle, n});
                 remaining -= n;
             } else {

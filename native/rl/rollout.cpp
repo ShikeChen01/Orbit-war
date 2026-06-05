@@ -22,12 +22,14 @@ GroupedRollout::GroupedRollout(const TrainConfig& cfg, torch::Device device)
 TrajectoryBatch GroupedRollout::collect(Agent& policy, RolloutStats& stats) {
     const int G = cfg_.grpo.group_size, N = cfg_.grpo.num_groups, B = N * G;
     const int E = cfg_.model.max_entities, F = N_ENTITY_FEATURES, Gl = N_GLOBAL_FEATURES;
-    const int K = cfg_.model.fleets_per_planet, twoK = 2 * K;
+    const int K = cfg_.model.fleets_per_planet, nap = 3 * K;  // (dx,dy,phi) per fleet
     const int T = cfg_.rollout.episode_steps;
     const double gamma = cfg_.grpo.gamma;
     const double w_prod = cfg_.rollout.prod_reward_weight, prod_cap = cfg_.rollout.prod_reward_cap,
+                 prod_decay = cfg_.rollout.prod_reward_decay,
                  w_valid = cfg_.rollout.valid_launch_reward, valid_cap = cfg_.rollout.valid_reward_cap,
                  w_inv = cfg_.rollout.illegal_launch_penalty,
+                 w_miss = cfg_.rollout.miss_launch_penalty,
                  w_e = cfg_.rollout.enemy_growth_weight, beta = cfg_.rollout.enemy_growth_ema,
                  win_bonus = cfg_.rollout.win_bonus, loss_penalty = cfg_.rollout.loss_penalty;
     const int x0 = cfg_.rollout.enemy_growth_warmup;
@@ -58,8 +60,8 @@ TrajectoryBatch GroupedRollout::collect(Agent& policy, RolloutStats& stats) {
     // Per-game reward channels (accumulated over the episode, capped at the end). prodR/validR get
     // capped; invR (invalid penalty) is uncapped; suppR (enemy suppression) only fills at stage>=2;
     // the win/draw/loss outcome is added only at stage>=2 (stage 1 = pure dispatch+production).
-    std::vector<double> prodR(B, 0.0), validR(B, 0.0), invR(B, 0.0), suppR(B, 0.0), gpow(B, 1.0),
-        prev_p0(B), prev_p1(B), gbar(B, 0.0), outcome(B, 0.0);
+    std::vector<double> prodR(B, 0.0), validR(B, 0.0), invR(B, 0.0), missR(B, 0.0), suppR(B, 0.0),
+        gpow(B, 1.0), ppow(B, 1.0), prev_p0(B), prev_p1(B), gbar(B, 0.0), outcome(B, 0.0);
     std::vector<long> inv_acc(B, 0), lnch_acc(B, 0), valid_acc(B, 0), step_acc(B, 0);
     std::vector<int> ep_len(B, T);
     for (int i = 0; i < B; ++i) { prev_p0[i] = my_production(st[i], 0); prev_p1[i] = my_production(st[i], 1); }
@@ -69,7 +71,7 @@ TrajectoryBatch GroupedRollout::collect(Agent& policy, RolloutStats& stats) {
     auto em_buf = torch::zeros({T, B, E}, fo);
     auto am_buf = torch::zeros({T, B, E}, fo);
     auto gl_buf = torch::zeros({T, B, Gl}, fo);
-    auto act_buf = torch::zeros({T, B, E, twoK}, fo);
+    auto act_buf = torch::zeros({T, B, E, nap}, fo);
     auto oldlogp_buf = torch::zeros({T, B}, fo);
     auto valid_buf = torch::zeros({T, B}, fo);
 
@@ -110,7 +112,7 @@ TrajectoryBatch GroupedRollout::collect(Agent& policy, RolloutStats& stats) {
             std::vector<float> am0(E);
             for (int r = 0; r < E; ++r) am0[r] = am[(size_t)i * E + r];
             int invalid = 0;
-            Action move0 = decode_action_continuous(ad + (size_t)i * E * twoK, am0.data(),
+            Action move0 = decode_action_continuous(ad + (size_t)i * E * nap, am0.data(),
                                                     rid[i].data(), rsh[i].data(), E, K, act_thr,
                                                     &invalid);
             // VALID launches: legal+committed fleets whose heading actually lands on a planet
@@ -137,11 +139,15 @@ TrajectoryBatch GroupedRollout::collect(Agent& policy, RolloutStats& stats) {
             double g_t = p1 - prev_p1[i];                 // enemy production growth this step
             double y_t = g_t - gbar[i];                   // vs the enemy's own recent average
             gbar[i] = (1.0 - beta) * gbar[i] + beta * g_t;
-            prodR[i] += gpow[i] * w_prod * dprod;               // production gain (capped per game)
+            prodR[i] += gpow[i] * ppow[i] * w_prod * dprod;     // production gain (decayed, capped)
             validR[i] += gpow[i] * w_valid * (double)valid;     // valid landing launches (capped)
             invR[i] += gpow[i] * w_inv * (double)invalid;       // invalid dispatches (uncapped penalty)
+            missR[i] += gpow[i] * w_miss * (double)((long)move0.size() - valid);  // MISSED launches:
+            // executed from an owned planet but landed on no planet (= launches - valid). Uncapped
+            // aiming stick (the ships are thrown away); pushes phi+heading toward real targets.
             if (stage >= 2 && t >= x0) suppR[i] += gpow[i] * (-w_e * y_t);  // bend enemy growth down
             gpow[i] *= gamma;
+            ppow[i] *= prod_decay;  // production-only per-step decay (front-load expansion)
             prev_p0[i] = p0;
             prev_p1[i] = p1;
 
@@ -169,7 +175,7 @@ TrajectoryBatch GroupedRollout::collect(Agent& policy, RolloutStats& stats) {
         double o = outcome[i];
         // outcome only at stage >= 2; stage 1 is pure dispatch + production (no win/draw/loss reward)
         double O = (stage >= 2) ? (o > 0.0 ? win_bonus : (o < 0.0 ? -loss_penalty : 0.0)) : 0.0;
-        Rv[i] = (float)(O + P + V - invR[i] + suppR[i]);
+        Rv[i] = (float)(O + P + V - invR[i] - missR[i] + suppR[i]);
     }
     auto R = torch::from_blob(Rv.data(), {B}, fo).clone();
     std::vector<int64_t> gidv(B);
@@ -188,7 +194,7 @@ TrajectoryBatch GroupedRollout::collect(Agent& policy, RolloutStats& stats) {
     tb.entity_mask = sel(em_buf.narrow(0, 0, Tu).reshape({(long)Tu * B, E}));
     tb.action_mask = sel(am_buf.narrow(0, 0, Tu).reshape({(long)Tu * B, E}));
     tb.globals = sel(gl_buf.narrow(0, 0, Tu).reshape({(long)Tu * B, Gl}));
-    tb.action = sel(act_buf.narrow(0, 0, Tu).reshape({(long)Tu * B, E, twoK}));
+    tb.action = sel(act_buf.narrow(0, 0, Tu).reshape({(long)Tu * B, E, nap}));
     tb.old_logp = sel(oldlogp_buf.narrow(0, 0, Tu).reshape({(long)Tu * B}));
     tb.advantage = adv_full.index_select(0, keep);  // ref_logp computed in the update
     tb.n_transitions = keep.size(0);
@@ -223,11 +229,13 @@ TrajectoryBatch GroupedRollout::collect_gpu(Agent& policy, RolloutStats& stats) 
     using torch::Tensor;
     const int G = cfg_.grpo.group_size, N = cfg_.grpo.num_groups, B = N * G;
     const int Ec = cfg_.rollout.planet_cap, F = N_ENTITY_FEATURES, Gl = N_GLOBAL_FEATURES;
-    const int K = cfg_.model.fleets_per_planet, twoK = 2 * K, T = cfg_.rollout.episode_steps;
+    const int K = cfg_.model.fleets_per_planet, nap = 3 * K, T = cfg_.rollout.episode_steps;  // (dx,dy,phi)
     const double gamma = cfg_.grpo.gamma;
     const double w_prod = cfg_.rollout.prod_reward_weight, prod_cap = cfg_.rollout.prod_reward_cap,
+                 prod_decay = cfg_.rollout.prod_reward_decay,
                  w_valid = cfg_.rollout.valid_launch_reward, valid_cap = cfg_.rollout.valid_reward_cap,
-                 w_inv = cfg_.rollout.illegal_launch_penalty, w_e = cfg_.rollout.enemy_growth_weight,
+                 w_inv = cfg_.rollout.illegal_launch_penalty,
+                 w_miss = cfg_.rollout.miss_launch_penalty, w_e = cfg_.rollout.enemy_growth_weight,
                  beta = cfg_.rollout.enemy_growth_ema, win_bonus = cfg_.rollout.win_bonus,
                  loss_penalty = cfg_.rollout.loss_penalty;
     const int x0 = cfg_.rollout.enemy_growth_warmup;
@@ -262,12 +270,14 @@ TrajectoryBatch GroupedRollout::collect_gpu(Agent& policy, RolloutStats& stats) 
     auto cpuf = torch::TensorOptions().dtype(kF).pinned_memory(device_.is_cuda());
     auto ent_buf = torch::zeros({T, B, Ec, F}, cpuf), em_buf = torch::zeros({T, B, Ec}, cpuf),
          am_buf = torch::zeros({T, B, Ec}, cpuf), gl_buf = torch::zeros({T, B, Gl}, cpuf),
-         act_buf = torch::zeros({T, B, Ec, twoK}, cpuf), oldlogp_buf = torch::zeros({T, B}, cpuf),
+         act_buf = torch::zeros({T, B, Ec, nap}, cpuf), oldlogp_buf = torch::zeros({T, B}, cpuf),
          valid_buf = torch::zeros({T, B}, cpuf);
 
     Tensor active = torch::ones({B}, fo), prodR = torch::zeros({B}, fo),
            validR = torch::zeros({B}, fo), invR = torch::zeros({B}, fo),
-           suppR = torch::zeros({B}, fo), gpow = torch::ones({B}, fo), gbar = torch::zeros({B}, fo),
+           missR = torch::zeros({B}, fo),
+           suppR = torch::zeros({B}, fo), gpow = torch::ones({B}, fo), ppow = torch::ones({B}, fo),
+           gbar = torch::zeros({B}, fo),
            outcome = torch::zeros({B}, fo), inv_sum = torch::zeros({B}, fo),
            lnch_sum = torch::zeros({B}, fo), valid_sum = torch::zeros({B}, fo),
            step_sum = torch::zeros({B}, fo);
@@ -298,13 +308,16 @@ TrajectoryBatch GroupedRollout::collect_gpu(Agent& policy, RolloutStats& stats) 
 
         auto out = gpu_->step(dec.action, opp, act_thr);
         Tensor a = active;
-        prodR = prodR + a * gpow * (w_prod * out.dprod_ego);
+        prodR = prodR + a * gpow * ppow * (w_prod * out.dprod_ego);  // production decayed per step
         validR = validR + a * gpow * (w_valid * out.valid);
         invR = invR + a * gpow * (w_inv * out.invalid);
+        missR = missR + a * gpow * (w_miss * (out.launches - out.valid));  // MISSED launches (= executed
+        // from an owned planet but landed on no planet): uncapped aiming stick, mirrors collect().
         Tensor y_t = out.dprod_enemy - gbar;
         gbar = (1.0 - beta) * gbar + beta * out.dprod_enemy;
         if (stage >= 2 && t >= x0) suppR = suppR - a * gpow * (w_e * y_t);
         gpow = gpow * gamma;
+        ppow = ppow * prod_decay;  // production-only per-step decay (front-load expansion)
         inv_sum = inv_sum + a * out.invalid;
         lnch_sum = lnch_sum + a * out.launches;
         valid_sum = valid_sum + a * out.valid;
@@ -329,7 +342,7 @@ TrajectoryBatch GroupedRollout::collect_gpu(Agent& policy, RolloutStats& stats) 
                                   torch::where(outcome < 0.0, torch::full_like(outcome, -loss_penalty),
                                                torch::zeros_like(outcome)))
                    : torch::zeros_like(outcome);
-    Tensor R = O + P + V - invR + suppR;  // (B,)
+    Tensor R = O + P + V - invR - missR + suppR;  // (B,)
     Tensor gid = torch::arange(B, torch::TensorOptions().dtype(torch::kLong).device(device_))
                      .floor_divide(G);  // int64 group id (plain / would true-divide to float)
     Tensor adv_env = group_advantage(R, gid, N, cfg_.grpo.adv_eps, cfg_.grpo.whiten_advantage);
@@ -345,7 +358,7 @@ TrajectoryBatch GroupedRollout::collect_gpu(Agent& policy, RolloutStats& stats) 
     tb.entity_mask = sel(em_buf.narrow(0, 0, Tu).reshape({(long)Tu * B, Ec}));
     tb.action_mask = sel(am_buf.narrow(0, 0, Tu).reshape({(long)Tu * B, Ec}));
     tb.globals = sel(gl_buf.narrow(0, 0, Tu).reshape({(long)Tu * B, Gl}));
-    tb.action = sel(act_buf.narrow(0, 0, Tu).reshape({(long)Tu * B, Ec, twoK}));
+    tb.action = sel(act_buf.narrow(0, 0, Tu).reshape({(long)Tu * B, Ec, nap}));
     tb.old_logp = sel(oldlogp_buf.narrow(0, 0, Tu).reshape({(long)Tu * B}));
     tb.advantage = adv_full.index_select(0, keep);
     tb.n_transitions = keep.size(0);

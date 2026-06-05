@@ -21,14 +21,14 @@ struct PolicyNetImpl : torch::nn::Module {
     explicit PolicyNetImpl(const ModelConfig& cfg);
 
     // entities (B,E,F), entity_mask (B,E) [unused], action_mask (B,E) [unused], globals (B,G)
-    //   -> {mean (B,E,2K), logstd (B,E,2K)}. logstd is clipped to [logstd_min, logstd_max].
+    //   -> {mean (B,E,3K), logstd (B,E,3K)}. logstd is clipped to [logstd_min, logstd_max].
     std::pair<torch::Tensor, torch::Tensor> forward(const torch::Tensor& entities,
                                                     const torch::Tensor& entity_mask,
                                                     const torch::Tensor& action_mask,
                                                     const torch::Tensor& globals);
 
     ModelConfig cfg;
-    int twoK;  // 2 * fleets_per_planet, cached from cfg
+    int nap;  // n_action_params = 3*fleets_per_planet (dx,dy,phi per fleet), cached from cfg
 
     // per-planet trunk
     torch::nn::Linear proj{nullptr};                                          // F -> d

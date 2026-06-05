@@ -396,7 +396,7 @@ GpuEnv::Obs GpuEnv::encode(int ego) {
 // ---------------------------------------------------------------------------------------------
 GpuEnv::StepOut GpuEnv::step(const Tensor& ego_action, int opponent, double act_threshold) {
     const int B = B_, Ec = cfg_.planet_cap, Fc = cfg_.fleet_cap;
-    const int K = (int)(ego_action.size(2) / 2);
+    const int K = (int)(ego_action.size(2) / 3);  // action layout is 3K: (dx,dy,phi) per fleet
     const int Cs = cfg_.comet_slots, Ev = (int)t_.c_path.size(1), Lmax = (int)t_.c_path.size(3);
     const double vmax = cfg_.ship_speed;
     auto fo = torch::TensorOptions().dtype(torch::kFloat32).device(dev_);
@@ -458,8 +458,11 @@ GpuEnv::StepOut GpuEnv::step(const Tensor& ego_action, int opponent, double act_
     Tensor invalid = torch::zeros({B}, fo);
     Tensor launches = torch::zeros({B}, fo);
     for (int k = 0; k < K; ++k) {
-        Tensor alpha = ego_action.index({Slice(), Slice(), 2 * k});
-        Tensor phi = ego_action.index({Slice(), Slice(), 2 * k + 1});
+        // per-fleet layout (dx,dy,phi); aim via atan2 of the recentred [-1,1] direction vector
+        // (mirrors decode_action_continuous) -- linear aiming, attention-computable.
+        Tensor dx = ego_action.index({Slice(), Slice(), 3 * k}) * 2.0 - 1.0;
+        Tensor dy = ego_action.index({Slice(), Slice(), 3 * k + 1}) * 2.0 - 1.0;
+        Tensor phi = ego_action.index({Slice(), Slice(), 3 * k + 2});
         Tensor commit = phi >= act_threshold;                       // (B,Ec) bool
         Tensor n = torch::floor(phi * S);                           // ships to send
         Tensor ok = commit & legal & (n >= 1.0) & (remaining >= n);  // launches this k
@@ -468,7 +471,7 @@ GpuEnv::StepOut GpuEnv::step(const Tensor& ego_action, int opponent, double act_
         remaining = remaining - torch::where(ok, n, torch::zeros_like(n));
         invalid = invalid + (inv_k.to(torch::kFloat32)).sum(1);
         launches = launches + (ok.to(torch::kFloat32)).sum(1);
-        Tensor angle = 2.0 * kPI * alpha;
+        Tensor angle = torch::atan2(dy, dx);
         e_ang.push_back(angle);
         e_shp.push_back(torch::where(ok, n, torch::zeros_like(n)));
         e_can.push_back(ok.to(torch::kFloat32));

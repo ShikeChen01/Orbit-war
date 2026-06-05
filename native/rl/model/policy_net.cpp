@@ -12,7 +12,7 @@
 
 namespace ow {
 
-PolicyNetImpl::PolicyNetImpl(const ModelConfig& c) : cfg(c), twoK(2 * c.fleets_per_planet) {
+PolicyNetImpl::PolicyNetImpl(const ModelConfig& c) : cfg(c), nap(c.n_action_params()) {
     int F = c.n_entity_features, h = c.hidden, G = c.n_global_features, dg = c.d_g;
     proj = register_module("proj", torch::nn::Linear(F, h));
     attn_q = register_module("attn_q", torch::nn::Linear(h, h));
@@ -34,24 +34,26 @@ PolicyNetImpl::PolicyNetImpl(const ModelConfig& c) : cfg(c), twoK(2 * c.fleets_p
     }
     g_embed = register_module("g_embed", torch::nn::Linear(G, dg));
     mu_h1 = register_module("mu_h1", torch::nn::Linear(h + dg, h));
-    mu_h2 = register_module("mu_h2", torch::nn::Linear(h, twoK));
+    mu_h2 = register_module("mu_h2", torch::nn::Linear(h, nap));
     {
         // Prior: start the policy nearly INERT so it learns to act, instead of spamming ~E*K illegal
         // dispatches and slowly suppressing them. Small final-layer weights make every head output
         // start ~= its bias regardless of the deep random trunk (without this, a deep scratch trunk
         // emits large, varied means -> ~half of all E*K slots commit illegally from step 1). A
         // strongly negative phi bias (sigmoid(-5)=0.0067 << tau_act) keeps almost nothing committed
-        // at init; the policy then LEARNS to raise phi on owned planets. phi = odd (alpha,phi) comps.
+        // at init; the policy then LEARNS to raise phi on owned planets. Layout per fleet is
+        // (dx,dy,phi), so phi is every 3rd component (index 3k+2); dx,dy keep zero bias -> at init
+        // a=sigmoid(0)=0.5 -> centred dir (0,0) -> angle 0 (heading is then learned/explored).
         torch::NoGradGuard ng;
         mu_h2->weight.mul_(c.init_mu_scale);
         mu_h2->bias.zero_();
-        for (int k = 0; k < c.fleets_per_planet; ++k) mu_h2->bias[2 * k + 1].fill_(c.init_phi_bias);
+        for (int k = 0; k < c.fleets_per_planet; ++k) mu_h2->bias[3 * k + 2].fill_(c.init_phi_bias);
     }
     if (c.std_state_dependent) {
-        logstd_head = register_module("logstd_head", torch::nn::Linear(h + dg, twoK));
+        logstd_head = register_module("logstd_head", torch::nn::Linear(h + dg, nap));
     } else {
         // one shared learnable log-std vector (state-independent exploration); init sigma ~ 1.
-        logstd_param = register_parameter("logstd_param", torch::zeros({twoK}));
+        logstd_param = register_parameter("logstd_param", torch::zeros({nap}));
     }
 }
 
@@ -86,12 +88,12 @@ std::pair<torch::Tensor, torch::Tensor> PolicyNetImpl::forward(const torch::Tens
     auto gpb = gp.unsqueeze(1).expand({B, E, cfg.d_g});          // broadcast to every planet
     auto h = torch::cat({tok, gpb}, -1);                         // (B,E,d+d_g)
 
-    auto mean = mu_h2->forward(torch::relu(mu_h1->forward(h)));  // (B,E,2K) nonlinear mean head
+    auto mean = mu_h2->forward(torch::relu(mu_h1->forward(h)));  // (B,E,3K) nonlinear mean head
     torch::Tensor logstd;
     if (cfg.std_state_dependent) {
-        logstd = logstd_head->forward(h);                       // (B,E,2K)
+        logstd = logstd_head->forward(h);                       // (B,E,3K)
     } else {
-        logstd = logstd_param.view({1, 1, twoK}).expand({B, E, twoK});
+        logstd = logstd_param.view({1, 1, nap}).expand({B, E, nap});
     }
     logstd = logstd.clamp(cfg.logstd_min, cfg.logstd_max);
     return {mean, logstd};
