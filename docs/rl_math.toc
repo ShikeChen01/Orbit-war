@@ -1,31 +1,34 @@
 \contentsline {section}{\numberline {1}Problem setup}{1}{section.1}%
 \contentsline {paragraph}{Training scope of this document.}{2}{section*.2}%
-\contentsline {paragraph}{Factored action space.}{2}{section*.3}%
+\contentsline {paragraph}{Continuous, per-planet action space.}{2}{section*.3}%
+\contentsline {paragraph}{No masking --- the legal action space is \emph {learned} from penalties.}{2}{section*.4}%
 \contentsline {section}{\numberline {2}Observation encoding}{2}{section.2}%
-\contentsline {paragraph}{Incoming-fleet threat features (defensive lookahead).}{2}{section*.4}%
-\contentsline {section}{\numberline {3}Policy network $\pi _\theta $}{3}{section.3}%
-\contentsline {paragraph}{Residual GLU block.}{3}{section*.5}%
-\contentsline {paragraph}{Entity encoder (2-layer MLP $+$ GLU).}{4}{section*.6}%
-\contentsline {paragraph}{Context encoder (2-layer MLP $+$ GLU).}{4}{section*.7}%
-\contentsline {paragraph}{Actor head.}{4}{section*.8}%
-\contentsline {paragraph}{Legality masking.}{4}{section*.9}%
-\contentsline {paragraph}{Layer inventory (target mode, $d=128$).}{5}{section*.10}%
-\contentsline {section}{\numberline {4}Action distribution}{5}{section.4}%
-\contentsline {section}{\numberline {5}Reward and return}{5}{section.5}%
-\contentsline {paragraph}{Production-only dense reward.}{5}{section*.11}%
-\contentsline {paragraph}{Outcome and the loss forfeit.}{6}{section*.12}%
-\contentsline {paragraph}{Note --- 2p vs.\ 4p objective.}{6}{section*.13}%
-\contentsline {section}{\numberline {6}Curriculum}{6}{section.6}%
-\contentsline {paragraph}{Stage 1 --- solo expansion (passive opponent).}{6}{section*.14}%
-\contentsline {paragraph}{Stage 2 --- $1$v$1$ vs.\ starter.}{6}{section*.15}%
-\contentsline {paragraph}{Stage 3 --- mixed opponents.}{7}{section*.16}%
-\contentsline {section}{\numberline {7}GRPO update}{7}{section.7}%
-\contentsline {subsection}{\numberline {7.1}Grouped sampling}{7}{subsection.7.1}%
-\contentsline {subsection}{\numberline {7.2}Group-relative advantage (no critic)}{7}{subsection.7.2}%
-\contentsline {subsection}{\numberline {7.3}Clipped policy surrogate}{7}{subsection.7.3}%
-\contentsline {subsection}{\numberline {7.4}KL anchor to a reference policy}{8}{subsection.7.4}%
-\contentsline {subsection}{\numberline {7.5}Total objective}{8}{subsection.7.5}%
-\contentsline {subsection}{\numberline {7.6}Optimization}{8}{subsection.7.6}%
-\contentsline {section}{\numberline {8}Self-play league}{8}{section.8}%
-\contentsline {section}{\numberline {9}Symbols $\leftrightarrow $ \texttt {config.hpp}}{9}{section.9}%
-\contentsline {section}{\numberline {A}Appendix: the PPO/GAE method being replaced}{9}{appendix.A}%
+\contentsline {paragraph}{Incoming-fleet threat block (per planet, baked into the row).}{3}{section*.5}%
+\contentsline {subparagraph}{Two ranked views per planet (tuneable counts).}{3}{section*.6}%
+\contentsline {section}{\numberline {3}Policy network $\pi _\theta $}{4}{section.3}%
+\contentsline {paragraph}{Single-stream trunk (the two variants under comparison).}{4}{section*.7}%
+\contentsline {paragraph}{Residual GLU block.}{5}{section*.8}%
+\contentsline {paragraph}{Continuous action heads (mean, and a switchable log-std).}{5}{section*.9}%
+\contentsline {paragraph}{Layer inventory ($d=128$, variant A).}{5}{section*.10}%
+\contentsline {section}{\numberline {4}Action distribution}{6}{section.4}%
+\contentsline {paragraph}{How the mean and log-std heads are learned (no separate target).}{6}{section*.11}%
+\contentsline {paragraph}{Decode: controls $\to $ engine launches.}{7}{section*.12}%
+\contentsline {section}{\numberline {5}Reward and return}{7}{section.5}%
+\contentsline {paragraph}{Production-only dense reward $+$ invalid-dispatch penalty.}{7}{section*.13}%
+\contentsline {paragraph}{Enemy-suppression term (relative to the enemy's own recent growth).}{8}{section*.14}%
+\contentsline {paragraph}{Outcome, the draw anchor, and the loss forfeit.}{8}{section*.15}%
+\contentsline {paragraph}{Note --- 2p vs.\ 4p objective.}{8}{section*.16}%
+\contentsline {section}{\numberline {6}Curriculum}{8}{section.6}%
+\contentsline {paragraph}{Stage 1 --- solo expansion (passive opponent).}{9}{section*.17}%
+\contentsline {paragraph}{Stage 2 --- $1$v$1$ vs.\ starter.}{9}{section*.18}%
+\contentsline {paragraph}{Stage 3 --- mixed opponents.}{9}{section*.19}%
+\contentsline {section}{\numberline {7}GRPO update}{9}{section.7}%
+\contentsline {subsection}{\numberline {7.1}Grouped sampling}{9}{subsection.7.1}%
+\contentsline {subsection}{\numberline {7.2}Group-relative advantage (no critic)}{9}{subsection.7.2}%
+\contentsline {subsection}{\numberline {7.3}Clipped policy surrogate}{10}{subsection.7.3}%
+\contentsline {subsection}{\numberline {7.4}KL anchor to a reference policy}{10}{subsection.7.4}%
+\contentsline {subsection}{\numberline {7.5}Total objective}{10}{subsection.7.5}%
+\contentsline {subsection}{\numberline {7.6}Optimization}{10}{subsection.7.6}%
+\contentsline {section}{\numberline {8}Self-play league}{10}{section.8}%
+\contentsline {section}{\numberline {9}Symbols $\leftrightarrow $ \texttt {config.hpp}}{11}{section.9}%
+\contentsline {section}{\numberline {A}Appendix: the PPO/GAE method being replaced}{11}{appendix.A}%

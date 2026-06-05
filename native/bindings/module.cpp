@@ -15,8 +15,6 @@
 #include "core/sim.hpp"
 #include "core/state.hpp"
 #include "io/serialize.hpp"
-#include "rl/arena.hpp"
-#include "rl/trainer.hpp"
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -143,19 +141,6 @@ static nb::dict state_to_dict(const ow::GameState& s) {
     return d;
 }
 
-// numpy float dict (Python EntityPolicy.state_dict, e.g. "actor.0.weight") -> tensors.
-static std::map<std::string, torch::Tensor> tensors_from_numpy_dict(nb::dict d) {
-    std::map<std::string, torch::Tensor> out;
-    for (auto [k, v] : d) {
-        std::string key = nb::cast<std::string>(k);
-        auto arr = nb::cast<nb::ndarray<nb::numpy, float, nb::c_contig>>(v);
-        std::vector<int64_t> shape;
-        for (size_t i = 0; i < arr.ndim(); ++i) shape.push_back((int64_t)arr.shape(i));
-        out[key] = torch::from_blob((void*)arr.data(), shape, torch::kFloat32).clone();
-    }
-    return out;
-}
-
 static std::vector<ow::Action> actions_from_list(nb::list actions) {
     std::vector<ow::Action> out;
     for (nb::handle pa : actions) {
@@ -249,104 +234,4 @@ NB_MODULE(orbitwars_native, m) {
         for (nb::handle w : worlds) pool.push_back(world_from_dict(nb::cast<nb::dict>(w)));
         ow::write_world_pool(pool, path);
     }, "worlds"_a, "path"_a);
-
-    // --- Native PPO trainer ---
-    nb::class_<ow::TrainerConfig>(m, "TrainerConfig")
-        .def(nb::init<>())
-        .def_rw("num_envs", &ow::TrainerConfig::num_envs)
-        .def_rw("rollout_steps", &ow::TrainerConfig::rollout_steps)
-        .def_rw("total_steps", &ow::TrainerConfig::total_steps)
-        .def_rw("update_epochs", &ow::TrainerConfig::update_epochs)
-        .def_rw("minibatches", &ow::TrainerConfig::minibatches)
-        .def_rw("gamma", &ow::TrainerConfig::gamma)
-        .def_rw("gae_lambda", &ow::TrainerConfig::gae_lambda)
-        .def_rw("clip", &ow::TrainerConfig::clip)
-        .def_rw("ent_coef", &ow::TrainerConfig::ent_coef)
-        .def_rw("vf_coef", &ow::TrainerConfig::vf_coef)
-        .def_rw("max_grad_norm", &ow::TrainerConfig::max_grad_norm)
-        .def_rw("lr", &ow::TrainerConfig::lr)
-        .def_rw("hidden", &ow::TrainerConfig::hidden)
-        .def_rw("max_entities", &ow::TrainerConfig::max_entities)
-        .def_rw("angle_bins", &ow::TrainerConfig::angle_bins)
-        .def_rw("episode_steps", &ow::TrainerConfig::episode_steps)
-        .def_rw("target_mode", &ow::TrainerConfig::target_mode)
-        .def_rw("fractions", &ow::TrainerConfig::fractions)
-        .def_rw("reward_scale", &ow::TrainerConfig::reward_scale)
-        .def_rw("terminal_bonus", &ow::TrainerConfig::terminal_bonus)
-        .def_rw("reward_clip", &ow::TrainerConfig::reward_clip)
-        .def_rw("prod_weight", &ow::TrainerConfig::prod_weight)
-        .def_rw("value_warmup_updates", &ow::TrainerConfig::value_warmup_updates)
-        .def_rw("selfplay_start_step", &ow::TrainerConfig::selfplay_start_step)
-        .def_rw("snapshot_every", &ow::TrainerConfig::snapshot_every)
-        .def_rw("opp_random", &ow::TrainerConfig::opp_random)
-        .def_rw("opp_starter", &ow::TrainerConfig::opp_starter)
-        .def_rw("opp_self", &ow::TrainerConfig::opp_self)
-        .def_rw("device", &ow::TrainerConfig::device)
-        .def_rw("seed", &ow::TrainerConfig::seed);
-
-    nb::class_<ow::Trainer>(m, "Trainer")
-        .def(nb::init<ow::TrainerConfig>())
-        .def("set_world_pool",
-             [](ow::Trainer& t, nb::list worlds) {
-                 std::vector<ow::GameState> pool;
-                 for (nb::handle w : worlds) pool.push_back(world_from_dict(nb::cast<nb::dict>(w)));
-                 t.set_world_pool(std::move(pool));
-             })
-        .def("train", [](ow::Trainer& t, long steps) {
-                 nb::gil_scoped_release rel;
-                 t.train(steps);
-             }, "total_steps"_a)
-        .def("greedy_classes",
-             [](ow::Trainer& t, nb::dict obs) {
-                 return t.greedy_classes(state_from_dict(obs));
-             })
-        .def("load_weights",
-             [](ow::Trainer& t, nb::dict w) { t.load_weights(tensors_from_numpy_dict(w)); })
-        .def("recent_winrate", &ow::Trainer::recent_winrate)
-        .def("recent_return", &ow::Trainer::recent_return)
-        .def("get_weights", [](ow::Trainer& t) {
-                 nb::dict out;
-                 for (auto& kv : t.get_state_dict()) {
-                     auto& ten = kv.second;  // CPU float32 contiguous
-                     size_t n = ten.numel();
-                     float* buf = new float[n];
-                     std::memcpy(buf, ten.data_ptr<float>(), n * sizeof(float));
-                     std::vector<size_t> shape;
-                     for (auto d : ten.sizes()) shape.push_back((size_t)d);
-                     out[kv.first.c_str()] = own_array(buf, shape);
-                 }
-                 return out;
-             });
-
-    // --- Fast native arena (fitness function) ---
-    nb::class_<ow::ArenaResult>(m, "ArenaResult")
-        .def_ro("p0_wins", &ow::ArenaResult::p0_wins)
-        .def_ro("p1_wins", &ow::ArenaResult::p1_wins)
-        .def_ro("draws", &ow::ArenaResult::draws)
-        .def_ro("mean_margin", &ow::ArenaResult::mean_margin)
-        .def_ro("mean_len", &ow::ArenaResult::mean_len)
-        .def("__repr__", [](const ow::ArenaResult& r) {
-            int n = r.p0_wins + r.p1_wins + r.draws;
-            double wr = n ? (double)r.p0_wins / n : 0.0;
-            char buf[160];
-            snprintf(buf, sizeof(buf),
-                     "ArenaResult(p0_wins=%d p1_wins=%d draws=%d winrate=%.3f margin=%.1f len=%.0f)",
-                     r.p0_wins, r.p1_wins, r.draws, wr, r.mean_margin, r.mean_len);
-            return std::string(buf);
-        });
-
-    nb::class_<ow::Arena>(m, "Arena")
-        .def(nb::init<int, int, std::vector<double>, int, int, std::string, bool>(),
-             "max_entities"_a, "angle_bins"_a, "fractions"_a, "hidden"_a, "episode_steps"_a,
-             "device"_a, "target_mode"_a = false)
-        .def("load_p0", [](ow::Arena& a, nb::dict w) { a.load_p0(tensors_from_numpy_dict(w)); })
-        .def("load_p1", [](ow::Arena& a, nb::dict w) { a.load_p1(tensors_from_numpy_dict(w)); })
-        .def("play",
-             [](ow::Arena& a, nb::list worlds, int opponent, bool deterministic, uint64_t seed) {
-                 std::vector<ow::GameState> pool;
-                 for (nb::handle w : worlds) pool.push_back(world_from_dict(nb::cast<nb::dict>(w)));
-                 nb::gil_scoped_release rel;
-                 return a.play(std::move(pool), opponent, deterministic, seed);
-             },
-             "worlds"_a, "opponent"_a, "deterministic"_a = true, "seed"_a = 0);
 }

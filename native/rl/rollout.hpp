@@ -19,6 +19,9 @@ namespace ow {
 
 struct RolloutStats {
     double mean_return = 0.0, mean_len = 0.0, win_rate = 0.0;
+    double mean_invalid = 0.0;   // committed-but-failed fleet dispatches per env-step (the penalty x_t)
+    double mean_launches = 0.0;  // executed launches per env-step
+    double mean_valid = 0.0;     // executed launches that will LAND on a planet per env-step
     long episodes = 0, transitions = 0;
 };
 
@@ -34,7 +37,12 @@ public:
     // on the fixed taken action, so deferring it avoids a per-step reference forward.)
     TrajectoryBatch collect(Agent& policy, RolloutStats& stats);
 
+    // Curriculum: the trainer sets the active stage each iteration (1 passive / 2 starter / 3 mix).
+    // 0 means "use the static cfg.rollout.stage".
+    void set_stage(int s) { cur_stage_ = s; }
+
 private:
+    int cur_stage_ = 0;
     TrainConfig cfg_;
     torch::Device device_;
     std::vector<GameState> world_pool_;

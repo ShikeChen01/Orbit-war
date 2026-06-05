@@ -1,12 +1,17 @@
-// The agent's network: entity encoder + context encoder + actor head -> per-entity action
-// logits. There is **no value head** -- GRPO needs no critic. Parameter names mirror the
-// Python EntityPolicy (entity_encoder.* / context_encoder.* / actor_*) so behavior-cloning
-// checkpoints load 1:1; the (unused) "critic.*" tensors in a BC checkpoint are simply
-// ignored on load.
+// The agent's network: a per-planet trunk + a separate board-globals embedding feeding two
+// continuous action heads (mean and log-std of a squashed diagonal Gaussian over E x 2K controls).
+// There is **no value head** -- GRPO needs no critic. Architecture (docs/rl_math.pdf sec:policy):
+//   trunk:   tok = proj(x);  tok += GLU(tok) [if use_glu];  tok += resblock_i(tok) x n_res
+//   globals: g' = relu(g_embed(globals))            (a SEPARATE path, broadcast to every planet)
+//   heads:   mu = mu_head([tok; g']);  logstd = logstd_head([tok; g'])  OR  shared vector
+// Two A/B switches live in ModelConfig: `use_glu` (trunk) and `std_state_dependent` (log-std).
 //
 // Interface only -- the forward pass and module registration live in policy_net.cpp.
 #pragma once
 #include <torch/torch.h>
+
+#include <utility>
+#include <vector>
 
 #include "rl/config.hpp"
 
@@ -15,25 +20,25 @@ namespace ow {
 struct PolicyNetImpl : torch::nn::Module {
     explicit PolicyNetImpl(const ModelConfig& cfg);
 
-    // entities (B,E,F), entity_mask (B,E), action_mask (B,E), globals (B,G)
-    //   -> logits (B,E,A), with illegal classes set to NEG_INF.
-    // Angle mode: classes are (angle_bin, fraction). Target mode: a pointer actor scores
-    // (launcher r, target t, fraction f) = <q_f(tok_r, core), k(tok_t)> + a noop head.
-    torch::Tensor forward(const torch::Tensor& entities,
-                          const torch::Tensor& entity_mask,
-                          const torch::Tensor& action_mask,
-                          const torch::Tensor& globals);
+    // entities (B,E,F), entity_mask (B,E) [unused], action_mask (B,E) [unused], globals (B,G)
+    //   -> {mean (B,E,2K), logstd (B,E,2K)}. logstd is clipped to [logstd_min, logstd_max].
+    std::pair<torch::Tensor, torch::Tensor> forward(const torch::Tensor& entities,
+                                                    const torch::Tensor& entity_mask,
+                                                    const torch::Tensor& action_mask,
+                                                    const torch::Tensor& globals);
 
     ModelConfig cfg;
-    int A;  // actions_per_entity, cached from cfg
+    int twoK;  // 2 * fleets_per_planet, cached from cfg
 
-    torch::nn::Linear ent0{nullptr}, ent2{nullptr};   // entity encoder (2-layer MLP)
-    torch::nn::Linear ctx0{nullptr}, ctx2{nullptr};   // context (pooled + globals) encoder (2-layer MLP)
-    // Residual GLU blocks (one per encoder): out = x + W_o( (W_v x) * sigmoid(W_g x) ).
-    torch::nn::Linear ent_glu_gate{nullptr}, ent_glu_val{nullptr}, ent_glu_out{nullptr};
-    torch::nn::Linear ctx_glu_gate{nullptr}, ctx_glu_val{nullptr}, ctx_glu_out{nullptr};
-    torch::nn::Linear act0{nullptr}, act2{nullptr};   // angle-mode actor MLP
-    torch::nn::Linear aq{nullptr}, ak{nullptr}, anoop{nullptr};  // target-mode pointer actor
+    // per-planet trunk
+    torch::nn::Linear proj{nullptr};                                          // F -> d
+    torch::nn::Linear glu_gate{nullptr}, glu_val{nullptr}, glu_out{nullptr};  // one GLU block (opt)
+    std::vector<torch::nn::Linear> res_a, res_b;                              // n_res_blocks res MLPs
+    // separate board-globals path + heads (operate on [tok; g'], dim d + d_g)
+    torch::nn::Linear g_embed{nullptr};                                       // G -> d_g
+    torch::nn::Linear mu_head{nullptr};                                       // d+d_g -> 2K
+    torch::nn::Linear logstd_head{nullptr};                                   // d+d_g -> 2K (state-dep)
+    torch::Tensor logstd_param;                                               // 2K vector (state-indep)
 };
 TORCH_MODULE(PolicyNet);
 

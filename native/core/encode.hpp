@@ -12,15 +12,23 @@
 
 namespace ow {
 
-constexpr int N_ENTITY_FEATURES = 20;  // 15 base + 5 incoming-fleet threat features
+// v4 LEAN per-planet encoding (docs/rl_math.pdf sec "Observation encoding"):
+//   F = 11 body + 21 threat = 32 features/planet; the G=10 board globals are a SEPARATE input
+//   (no longer merged into each row -- the net has a dedicated globals embedding path).
+//   Body[0..10]  : x, y, orbital speed, cw/ccw sign, radius, production, ships(log), ownership
+//                  code (0 neutral/1 ego/2-4 enemy), dist-to-center, comet flag, action mask.
+//   Threat[11..31]: N_SOON soonest + N_BIG largest inbound fleets, 3 feats each [sgn, ETA, ships].
+constexpr int N_SOON = 2;   // per-planet inbound fleets kept by soonest arrival (smallest ETA)
+constexpr int N_BIG = 5;    // per-planet inbound fleets kept by largest ship count
+constexpr int N_THREAT_FLEETS = N_SOON + N_BIG;  // 7 slots x 3 feats = 21
+constexpr int N_BODY_FEATURES = 11;
+constexpr int N_ENTITY_FEATURES = N_BODY_FEATURES + 3 * N_THREAT_FLEETS;  // 11 + 21 = 32
 constexpr int N_GLOBAL_FEATURES = 10;
 inline const double SHIP_LOG_DENOM = std::log(1000.0);
 inline const double DIAG_HALF = std::sqrt(BOARD_SIZE * BOARD_SIZE + BOARD_SIZE * BOARD_SIZE) / 2.0;
-constexpr double PRESSURE_RADIUS = 25.0;
 constexpr double PI = 3.141592653589793;  // == Python math.pi
 constexpr double THREAT_MAX_SPEED = 6.0;  // == Config.shipSpeed; fleet speed cap for the ETA model
-constexpr double THREAT_ETA_TAU = 8.0;    // imminence = exp(-eta/tau); ~half-life of 5-6 ticks
-constexpr double THREAT_MARGIN_SCALE = 100.0;  // hold-margin -> tanh divisor
+constexpr double THREAT_ETA_SCALE = 100.0;  // raw ETA (ticks) feature divisor (linear, not imminence)
 
 inline double ship_log(double n) {
     return std::log1p(std::max(0.0, n)) / SHIP_LOG_DENOM;
@@ -98,74 +106,11 @@ inline void encode_obs(const GameState& s, int player, int max_entities,
     auto is_comet = [&](long id) {
         return std::find(comet_set.begin(), comet_set.end(), id) != comet_set.end();
     };
-
-    // Per-planet fleet pressure (raw proximity sum) + projected incoming threat (who a fleet
-    // will actually reach, and when). Threat is the signal a reactive policy needs to defend:
-    // a fleet inside the pressure radius but aimed away is harmless; one aimed in from afar is
-    // the danger. fleet_target() filters out fleets that hit nothing.
     size_t np = s.planets.size();
-    std::vector<double> enemy_press(np, 0.0), ally_press(np, 0.0);
-    std::vector<double> inc_enemy(np, 0.0), inc_ally(np, 0.0);
-    std::vector<double> eta_enemy(np, 1e18), eta_ally(np, 1e18);
-    for (const auto& f : s.fleets) {
-        for (size_t i = 0; i < np; ++i) {
-            if (distance2(f.x, f.y, s.planets[i].x, s.planets[i].y) <= PRESSURE_RADIUS) {
-                if (f.owner == player) ally_press[i] += f.ships;
-                else enemy_press[i] += f.ships;
-            }
-        }
-        auto tgt = fleet_target(f, s.planets);
-        if (tgt.first < 0) continue;
-        int ti = tgt.first;
-        double eta = tgt.second;
-        if (f.owner == player) {
-            inc_ally[ti] += (double)f.ships;
-            if (eta < eta_ally[ti]) eta_ally[ti] = eta;
-        } else {
-            inc_enemy[ti] += (double)f.ships;
-            if (eta < eta_enemy[ti]) eta_enemy[ti] = eta;
-        }
-    }
+    auto labs = [](long v) { return v < 0 ? -v : v; };
 
-    auto order = entity_order(s, player, max_entities);
-    int n = (int)order.size();
-    for (int row = 0; row < n; ++row) {
-        int i = order[row];
-        const Planet& p = s.planets[i];
-        float* e = entities + row * N_ENTITY_FEATURES;
-        double dx = (p.x - CENTER) / CENTER, dy = (p.y - CENTER) / CENTER;
-        double dist_center = std::sqrt((p.x - CENTER) * (p.x - CENTER) + (p.y - CENTER) * (p.y - CENTER));
-        e[0] = (p.owner == player) ? 1.f : 0.f;
-        e[1] = (p.owner != player && p.owner != -1) ? 1.f : 0.f;
-        e[2] = (p.owner == -1) ? 1.f : 0.f;
-        e[3] = (float)(p.x / BOARD_SIZE);
-        e[4] = (float)(p.y / BOARD_SIZE);
-        e[5] = (float)dx;
-        e[6] = (float)dy;
-        e[7] = (float)(dist_center / DIAG_HALF);
-        e[8] = (float)(p.radius / 3.0);
-        e[9] = (float)ship_log((double)p.ships);
-        e[10] = (float)(p.production / 5.0);
-        e[11] = is_comet(p.id) ? 1.f : 0.f;
-        e[12] = ((dist_center + p.radius) < ROTATION_RADIUS_LIMIT) ? 1.f : 0.f;
-        e[13] = (float)ship_log(enemy_press[i]);
-        e[14] = (float)ship_log(ally_press[i]);
-        // Incoming-fleet threat (projected): how much / how soon, plus a net hold-margin.
-        double ie = inc_enemy[i], ia = inc_ally[i], ee = eta_enemy[i], ea = eta_ally[i];
-        e[15] = (float)ship_log(ie);                                       // enemy ships inbound
-        e[16] = ie > 0.0 ? (float)std::exp(-ee / THREAT_ETA_TAU) : 0.f;    // enemy imminence (->1 soon)
-        e[17] = (float)ship_log(ia);                                       // my reinforcements inbound
-        e[18] = ia > 0.0 ? (float)std::exp(-ea / THREAT_ETA_TAU) : 0.f;    // reinforcement imminence
-        // Hold-margin at impact: current ships + production banked until impact + help - attack.
-        double margin = ie > 0.0 ? ((double)p.ships + (double)p.production * ee + ia - ie) : 0.0;
-        e[19] = ie > 0.0 ? (float)std::tanh(margin / THREAT_MARGIN_SCALE) : 0.f;  // >0 hold, <0 fall
-        entity_mask[row] = 1.f;
-        row_planet_id[row] = p.id;
-        row_planet_ships[row] = p.ships;
-        if (p.owner == player && p.ships > 0) action_mask[row] = 1.f;
-    }
-
-    // Globals.
+    // --- Globals (board summary): computed once and written to the SEPARATE `globals` buffer.
+    // The net embeds these on their own path and broadcasts to the heads (NOT merged per row). ---
     long my_ships = 0, enemy_ships = 0, my_fleet = 0, enemy_fleet = 0;
     int my_planets = 0, enemy_planets = 0, neutral_planets = 0;
     for (const auto& p : s.planets) {
@@ -176,83 +121,125 @@ inline void encode_obs(const GameState& s, int player, int max_entities,
     for (const auto& f : s.fleets) {
         if (f.owner == player) my_fleet += f.ships; else enemy_fleet += f.ships;
     }
-    int total_planets = std::max<int>(1, (int)s.planets.size());
-    globals[0] = (float)((double)s.step / std::max(1, episode_steps));
-    globals[1] = (float)(s.angular_velocity * 10.0);
-    globals[2] = (float)ship_log((double)my_ships);
-    globals[3] = (float)ship_log((double)enemy_ships);
-    globals[4] = (float)((double)my_planets / total_planets);
-    globals[5] = (float)((double)enemy_planets / total_planets);
-    globals[6] = (float)((double)neutral_planets / total_planets);
-    globals[7] = (float)ship_log((double)my_fleet);
-    globals[8] = (float)ship_log((double)enemy_fleet);
-    globals[9] = (float)((double)n / max_entities);
+    int total_planets = std::max<int>(1, (int)np);
+    float g[N_GLOBAL_FEATURES];
+    g[0] = (float)((double)s.step / std::max(1, episode_steps));
+    g[1] = (float)(s.angular_velocity * 10.0);
+    g[2] = (float)ship_log((double)my_ships);
+    g[3] = (float)ship_log((double)enemy_ships);
+    g[4] = (float)((double)my_planets / total_planets);
+    g[5] = (float)((double)enemy_planets / total_planets);
+    g[6] = (float)((double)neutral_planets / total_planets);
+    g[7] = (float)ship_log((double)my_fleet);
+    g[8] = (float)ship_log((double)enemy_fleet);
+    g[9] = (float)((double)std::min<int>((int)np, max_entities) / max_entities);
+    for (int k = 0; k < N_GLOBAL_FEATURES; ++k) globals[k] = g[k];
+
+    // --- Top-N inbound fleets per planet (by |ships| desc): replaces the aggregate-threat
+    // scalars. fleet_target gives the planet a fleet reaches + its ETA; misses are dropped.
+    // Signed ships: +mine (reinforcement) / -enemy. (FFA -> there are no allies.) ---
+    std::vector<std::vector<std::pair<long, double>>> inbound(np);  // (signed_ships, eta_ticks)
+    for (const auto& f : s.fleets) {
+        auto tgt = fleet_target(f, s.planets);
+        if (tgt.first < 0) continue;
+        long signed_ships = (f.owner == player) ? f.ships : -f.ships;
+        inbound[(size_t)tgt.first].push_back({signed_ships, tgt.second});
+    }
+
+    auto order = entity_order(s, player, max_entities);
+    int n = (int)order.size();
+    int na = std::max(1, s.num_agents);
+    for (int row = 0; row < n; ++row) {
+        int i = order[row];
+        const Planet& p = s.planets[i];
+        float* e = entities + row * N_ENTITY_FEATURES;
+        double dist_center =
+            std::sqrt((p.x - CENTER) * (p.x - CENTER) + (p.y - CENTER) * (p.y - CENTER));
+        bool comet = is_comet(p.id);
+        // A body orbits only if it is not a comet and sits inside the rotation limit; comets and
+        // far "static stars" do not rotate (orbital velocity 0). cw/ccw is the board's spin sign.
+        bool rotating = (!comet) && ((dist_center + p.radius) < ROTATION_RADIUS_LIMIT);
+        double vmag = rotating ? std::abs(s.angular_velocity) * dist_center : 0.0;  // tangential speed
+        double cw = rotating ? (s.angular_velocity >= 0.0 ? 1.0 : -1.0) : 0.0;
+        // ownership code, ego-relative: 0 neutral, 1 ego, 2..(na) enemy seats (stable under rotation)
+        int own_code = (p.owner == -1) ? 0 : (1 + ((p.owner - player + na) % na));
+
+        // --- 11 body features ---
+        e[0] = (float)(p.x / BOARD_SIZE);
+        e[1] = (float)(p.y / BOARD_SIZE);
+        e[2] = (float)(vmag / THREAT_MAX_SPEED);  // orbital speed, relative to ship speed
+        e[3] = (float)cw;                          // +1 ccw / -1 cw / 0 not orbiting
+        e[4] = (float)(p.radius / 3.0);            // radius (hit geometry)
+        e[5] = (float)(p.production / 5.0);         // production (reward-defining; redundant w/ radius)
+        e[6] = (float)ship_log((double)p.ships);   // ships (log)
+        e[7] = (float)own_code;                    // ownership code 0/1/2-4
+        e[8] = (float)(dist_center / DIAG_HALF);   // distance to board center
+        e[9] = comet ? 1.f : 0.f;                  // comet flag
+        e[10] = (p.owner == player && p.ships > 0) ? 1.f : 0.f;  // action mask u_e
+
+        // --- 21 threat features: N_SOON soonest-arriving then N_BIG largest inbound fleets ---
+        // each slot: [sgn (+1 mine / -1 enemy / 0 empty), raw ETA (ticks, scaled), ship_log]
+        auto& vec = inbound[(size_t)i];  // (signed_ships, eta_ticks)
+        std::vector<int> by_eta(vec.size()), by_ships(vec.size());
+        std::iota(by_eta.begin(), by_eta.end(), 0);
+        std::iota(by_ships.begin(), by_ships.end(), 0);
+        std::stable_sort(by_eta.begin(), by_eta.end(),
+                         [&](int a, int b) { return vec[a].second < vec[b].second; });
+        std::stable_sort(by_ships.begin(), by_ships.end(),
+                         [&](int a, int b) { return labs(vec[a].first) > labs(vec[b].first); });
+        auto fill = [&](int slot, int vi) {
+            float* fe = e + N_BODY_FEATURES + 3 * slot;
+            long sh = vec[vi].first;
+            fe[0] = sh >= 0 ? 1.f : -1.f;                        // owner sign
+            fe[1] = (float)(vec[vi].second / THREAT_ETA_SCALE);  // raw ETA (ticks), scaled
+            fe[2] = (float)ship_log((double)labs(sh));           // ships (log)
+        };
+        for (int k = 0; k < N_SOON && k < (int)by_eta.size(); ++k) fill(k, by_eta[k]);
+        for (int k = 0; k < N_BIG && k < (int)by_ships.size(); ++k) fill(N_SOON + k, by_ships[k]);
+
+        entity_mask[row] = 1.f;
+        row_planet_id[row] = p.id;
+        row_planet_ships[row] = p.ships;
+        if (p.owner == player && p.ships > 0) action_mask[row] = 1.f;
+    }
 }
 
-// TARGET-BASED decode. class 0 = noop; else class-1 splits into (target_row, frac_bin):
-// target_row = launch / num_fracs, frac_bin = launch % num_fracs. The launch angle is
-// computed to aim straight at the target entity's current position (like the scripted
-// starter's atan2), so every launch actually hits something -- this removes the precise-
-// aiming barrier that 16 angle bins impose and makes exploration land real captures.
-// Ownership-safe (action_mask) + target must be a real, different entity.
-inline Action decode_action_target(const GameState& s, const long* classes,
-                                   const float* action_mask, const long* row_planet_id,
-                                   const long* row_planet_ships, int max_entities, int num_fracs,
-                                   const std::vector<double>& fractions, long min_ships = 1) {
+// CONTINUOUS decode (docs/rl_math.pdf sec:decode). `actions` is row-major (E x 2K): per planet,
+// K fleet pairs [alpha, phi] in [0,1]. A fleet is COMMITTED when phi >= act_threshold; it launches
+// n = floor(phi * S) ships (S = planet ships at decode time) at heading theta = 2*pi*alpha, with the
+// engine's sequential deduction mimicked (later over-budget fleets drop). `*out_invalid` accumulates
+// the COMMITTED fleets that fail to execute -- on a phantom slot, an unowned/0-ship planet, or past
+// the ship budget -- i.e. the x_t penalized by the reward. The actor is NOT masked: it may commit
+// anywhere and learns the legal action space from that penalty.
+inline Action decode_action_continuous(const float* actions, const float* action_mask,
+                                       const long* row_planet_id, const long* row_planet_ships,
+                                       int max_entities, int fleets_per_planet, double act_threshold,
+                                       int* out_invalid = nullptr) {
     Action moves;
-    auto pos_of = [&](long id, double& x, double& y) -> bool {
-        for (const auto& p : s.planets)
-            if (p.id == id) { x = p.x; y = p.y; return true; }
-        return false;
-    };
+    int invalid = 0;
+    const int twoK = 2 * fleets_per_planet;
     for (int row = 0; row < max_entities; ++row) {
-        long c = classes[row];
-        if (c <= 0) continue;
-        if (action_mask[row] < 0.5f) continue;
+        const float* a = actions + (size_t)row * twoK;
+        bool legal = (action_mask[row] >= 0.5f) && (row_planet_id[row] >= 0);
         long pid = row_planet_id[row];
-        if (pid < 0) continue;
-        long avail = row_planet_ships[row];
-        if (avail <= 0) continue;
-        long launch = c - 1;
-        long target_row = launch / num_fracs;
-        long fi = launch % num_fracs;
-        if (target_row < 0 || target_row >= max_entities || target_row == row) continue;
-        long tpid = row_planet_id[target_row];
-        if (tpid < 0) continue;  // padding / invalid target
-        double fx, fy, tx, ty;
-        if (!pos_of(pid, fx, fy) || !pos_of(tpid, tx, ty)) continue;
-        double angle = std::atan2(ty - fy, tx - fx);
-        long ships = (long)(fractions[fi] * avail);
-        ships = std::max(min_ships, std::min(ships, avail));
-        if (ships > 0) moves.push_back(Move{pid, angle, ships});
+        long S = row_planet_ships[row];  // ships available at decode time (pre-production)
+        long remaining = S;
+        for (int k = 0; k < fleets_per_planet; ++k) {
+            double alpha = (double)a[2 * k];
+            double phi = (double)a[2 * k + 1];
+            if (phi < act_threshold) continue;  // not committed -> genuine no-op, no penalty
+            if (!legal) { ++invalid; continue; }
+            long n = (long)std::floor(phi * (double)S);
+            if (n >= 1 && remaining >= n) {
+                double angle = 2.0 * PI * alpha;  // alpha in [0,1] -> [0, 2pi)
+                moves.push_back(Move{pid, angle, n});
+                remaining -= n;
+            } else {
+                ++invalid;  // n < 1, or beyond the remaining ship budget (over-dispatch)
+            }
+        }
     }
-    return moves;
-}
-
-// Per-planet action classes -> moves. class 0 = noop; else (angle_bin, frac_bin).
-// Mirrors PerPlanetAction.decode (ownership-safe via action_mask).
-inline Action decode_action(const long* classes, const float* action_mask,
-                            const long* row_planet_id, const long* row_planet_ships,
-                            int max_entities, int angle_bins,
-                            const std::vector<double>& fractions, long min_ships = 1) {
-    Action moves;
-    for (int row = 0; row < max_entities; ++row) {
-        long c = classes[row];
-        if (c <= 0) continue;
-        if (action_mask[row] < 0.5f) continue;
-        long pid = row_planet_id[row];
-        if (pid < 0) continue;
-        long avail = row_planet_ships[row];
-        if (avail <= 0) continue;
-        long launch = c - 1;  // index into angle_bins*fractions
-        long k = launch % angle_bins;
-        long fi = launch / angle_bins;
-        double angle = 2.0 * PI * (double)k / angle_bins;
-        double frac = fractions[fi];
-        long ships = (long)(frac * avail);
-        ships = std::max(min_ships, std::min(ships, avail));
-        if (ships > 0) moves.push_back(Move{pid, angle, ships});
-    }
+    if (out_invalid) *out_invalid = invalid;
     return moves;
 }
 

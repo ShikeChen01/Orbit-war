@@ -1,85 +1,76 @@
-// PolicyNet implementation. Ported 1:1 from the old EntityPolicyImpl::forward (policy.hpp)
-// with the critic head removed -- same ops/shapes, so a BC checkpoint reproduces identical
-// logits (verified by ow_test_model).
+// PolicyNet (v4, continuous): a per-planet trunk + a separate board-globals embedding feeding two
+// Gaussian heads. Layout (docs/rl_math.pdf sec:policy):
+//   tok = proj(x);  tok += GLU(tok) [if use_glu];  tok += resblock_i(tok) x n_res
+//   g'  = relu(g_embed(globals));   h = [tok ; g'_broadcast]   (dim d + d_g)
+//   mean = mu_head(h);   logstd = logstd_head(h)  OR  shared learnable vector  -> both (B,E,2K)
+// No mask is applied (the actor learns the legal action space from the invalid-dispatch penalty);
+// no value head (GRPO has no critic).
 #include "rl/model/policy_net.hpp"
 
 #include <cmath>
+#include <string>
 
 namespace ow {
 
-namespace { constexpr double NEG_INF = -1e9; }  // masked-class logit (kept local to this TU)
-
-PolicyNetImpl::PolicyNetImpl(const ModelConfig& c) : cfg(c), A(c.actions_per_entity()) {
-    int F = c.n_entity_features, G = c.n_global_features, h = c.hidden;
-    int nf = (int)c.fractions.size();
-    ent0 = register_module("ent0", torch::nn::Linear(F, h));
-    ent2 = register_module("ent2", torch::nn::Linear(h, h));
-    ctx0 = register_module("ctx0", torch::nn::Linear(h + G, h));
-    ctx2 = register_module("ctx2", torch::nn::Linear(h, h));
-    ent_glu_gate = register_module("ent_glu_gate", torch::nn::Linear(h, h));
-    ent_glu_val = register_module("ent_glu_val", torch::nn::Linear(h, h));
-    ent_glu_out = register_module("ent_glu_out", torch::nn::Linear(h, h));
-    ctx_glu_gate = register_module("ctx_glu_gate", torch::nn::Linear(h, h));
-    ctx_glu_val = register_module("ctx_glu_val", torch::nn::Linear(h, h));
-    ctx_glu_out = register_module("ctx_glu_out", torch::nn::Linear(h, h));
-    if (c.target_mode) {
-        aq = register_module("aq", torch::nn::Linear(h + h, nf * h));
-        ak = register_module("ak", torch::nn::Linear(h, h));
-        anoop = register_module("anoop", torch::nn::Linear(h + h, 1));
+PolicyNetImpl::PolicyNetImpl(const ModelConfig& c) : cfg(c), twoK(2 * c.fleets_per_planet) {
+    int F = c.n_entity_features, h = c.hidden, G = c.n_global_features, dg = c.d_g;
+    proj = register_module("proj", torch::nn::Linear(F, h));
+    if (c.use_glu) {
+        glu_gate = register_module("glu_gate", torch::nn::Linear(h, h));
+        glu_val = register_module("glu_val", torch::nn::Linear(h, h));
+        glu_out = register_module("glu_out", torch::nn::Linear(h, h));
+    }
+    for (int i = 0; i < c.n_res_blocks; ++i) {
+        res_a.push_back(register_module("res" + std::to_string(i) + "a", torch::nn::Linear(h, h)));
+        res_b.push_back(register_module("res" + std::to_string(i) + "b", torch::nn::Linear(h, h)));
+    }
+    g_embed = register_module("g_embed", torch::nn::Linear(G, dg));
+    mu_head = register_module("mu_head", torch::nn::Linear(h + dg, twoK));
+    {
+        // Prior: start with the fraction (phi) means low so almost nothing is "committed" at init
+        // (sigmoid(-3) ~ 0.047 < tau_act); the policy then LEARNS to raise phi on owned planets to
+        // launch, instead of spamming ~E*K invalid dispatches and slowly suppressing them. phi are
+        // the odd components of each (alpha, phi) pair.
+        torch::NoGradGuard ng;
+        mu_head->bias.zero_();
+        for (int k = 0; k < c.fleets_per_planet; ++k) mu_head->bias[2 * k + 1].fill_(-3.0);
+    }
+    if (c.std_state_dependent) {
+        logstd_head = register_module("logstd_head", torch::nn::Linear(h + dg, twoK));
     } else {
-        act0 = register_module("act0", torch::nn::Linear(h + h, h));
-        act2 = register_module("act2", torch::nn::Linear(h, A));
+        // one shared learnable log-std vector (state-independent exploration); init sigma ~ 1.
+        logstd_param = register_parameter("logstd_param", torch::zeros({twoK}));
     }
 }
 
-torch::Tensor PolicyNetImpl::forward(const torch::Tensor& entities,
-                                     const torch::Tensor& entity_mask,
-                                     const torch::Tensor& action_mask,
-                                     const torch::Tensor& globals) {
-    auto tok = torch::relu(ent0->forward(entities));
-    tok = ent2->forward(tok);                                  // (B,E,h)
-    tok = tok + ent_glu_out->forward(ent_glu_val->forward(tok) *
-                                     torch::sigmoid(ent_glu_gate->forward(tok)));  // residual GLU
-    auto m = entity_mask.unsqueeze(-1);                        // (B,E,1)
-    auto pooled = (tok * m).sum(1) / m.sum(1).clamp_min(1.0);  // (B,h)
-    auto core = torch::relu(ctx0->forward(torch::cat({pooled, globals}, -1)));
-    core = ctx2->forward(core);                                // (B,h)
-    core = core + ctx_glu_out->forward(ctx_glu_val->forward(core) *
-                                       torch::sigmoid(ctx_glu_gate->forward(core)));  // residual GLU
-    auto core_b = core.unsqueeze(1).expand({-1, tok.size(1), -1});  // (B,E,h)
-    int nf = (int)cfg.fractions.size();
-
-    torch::Tensor logits;
-    if (cfg.target_mode) {
-        long B = tok.size(0), E = tok.size(1);
-        auto q = aq->forward(torch::cat({tok, core_b}, -1)).reshape({B, E, nf, cfg.hidden});
-        auto k = ak->forward(tok);                             // (B,E,h)
-        auto score = torch::einsum("brfh,bth->brtf", {q, k}) / std::sqrt((double)cfg.hidden);
-        auto noop = anoop->forward(torch::cat({tok, core_b}, -1));   // (B,E,1)
-        logits = torch::cat({noop, score.reshape({B, E, E * nf})}, -1);  // (B,E,A)
-    } else {
-        auto hh = torch::relu(act0->forward(torch::cat({tok, core_b}, -1)));
-        logits = act2->forward(hh);
+std::pair<torch::Tensor, torch::Tensor> PolicyNetImpl::forward(const torch::Tensor& entities,
+                                                              const torch::Tensor& entity_mask,
+                                                              const torch::Tensor& action_mask,
+                                                              const torch::Tensor& globals) {
+    (void)entity_mask;   // not masked: log-prob/entropy sum over ALL slots (penalty teaches legality)
+    (void)action_mask;
+    auto tok = proj->forward(entities);  // (B,E,d)
+    if (cfg.use_glu) {
+        tok = tok +
+              glu_out->forward(glu_val->forward(tok) * torch::sigmoid(glu_gate->forward(tok)));
     }
+    for (size_t i = 0; i < res_a.size(); ++i)                  // n_res_blocks residual MLP blocks
+        tok = tok + res_b[i]->forward(torch::relu(res_a[i]->forward(tok)));
 
-    if (cfg.target_mode) {
-        long B = logits.size(0), E = logits.size(1);
-        long nfl = (A - 1) / E;
-        auto noop = logits.narrow(-1, 0, 1);
-        auto launch = logits.narrow(-1, 1, A - 1).reshape({B, E, E, nfl});  // (B,r,t,f)
-        auto launcher_ok = (action_mask > 0.5f).view({B, E, 1, 1});
-        auto tgt_real = (entity_mask > 0.5f).view({B, 1, E, 1});
-        auto eye = torch::eye(E, logits.options()).view({1, E, E, 1});
-        auto allowed = launcher_ok & tgt_real & (eye < 0.5);
-        launch = torch::where(allowed, launch, torch::full_like(launch, NEG_INF));
-        logits = torch::cat({noop, launch.reshape({B, E, A - 1})}, -1);
+    long B = tok.size(0), E = tok.size(1);
+    auto gp = torch::relu(g_embed->forward(globals));            // (B,d_g)
+    auto gpb = gp.unsqueeze(1).expand({B, E, cfg.d_g});          // broadcast to every planet
+    auto h = torch::cat({tok, gpb}, -1);                         // (B,E,d+d_g)
+
+    auto mean = mu_head->forward(h);                             // (B,E,2K)
+    torch::Tensor logstd;
+    if (cfg.std_state_dependent) {
+        logstd = logstd_head->forward(h);                       // (B,E,2K)
     } else {
-        auto non_actionable = (action_mask < 0.5).unsqueeze(-1);
-        auto cls_index = torch::arange(A, logits.options()).view({1, 1, A});
-        auto blocked = (cls_index > 0) & non_actionable;
-        logits = torch::where(blocked, torch::full_like(logits, NEG_INF), logits);
+        logstd = logstd_param.view({1, 1, twoK}).expand({B, E, twoK});
     }
-    return logits;
+    logstd = logstd.clamp(cfg.logstd_min, cfg.logstd_max);
+    return {mean, logstd};
 }
 
 }  // namespace ow

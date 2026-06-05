@@ -14,14 +14,23 @@ namespace ow {
 struct ModelConfig {
     int n_entity_features = 15;   // overwritten from encode.hpp at build time
     int n_global_features = 10;
-    int hidden = 128;
-    int max_entities = 64;
-    int angle_bins = 16;          // angle-mode action choices (ignored when target_mode)
-    bool target_mode = true;      // pointer actor: per-planet action = (target entity, fraction)
-    std::vector<double> fractions = {0.25, 0.5, 0.75, 1.0};
+    int hidden = 128;             // d: trunk width
+    int max_entities = 40;        // E: planet slots (docs/rl_math.pdf)
 
-    int n_choices() const { return target_mode ? max_entities : angle_bins; }
-    int actions_per_entity() const { return 1 + n_choices() * (int)fractions.size(); }
+    // --- v4 CONTINUOUS actor (squashed diagonal Gaussian over E x 2K controls) ----------------
+    // Each planet emits K fleet pairs (alpha=heading, phi=fraction), so 2K params/planet. The
+    // trunk is per-planet (proj -> [GLU] -> 2 residual MLP); the G board globals enter through a
+    // SEPARATE embedding g'=relu(W_g g) broadcast to the mean/log-std heads (NOT merged per row).
+    int fleets_per_planet = 5;    // K: max fleets launched per planet per step -> 2K action params
+    int d_g = 32;                 // board-globals embedding dim (separate broadcast path)
+    bool use_glu = true;          // trunk A/B: GLU block on (true) vs plain stacked-MLP (false)
+    int n_res_blocks = 2;         // residual MLP blocks after the (optional) GLU
+    bool std_state_dependent = true;  // exploration A/B: log-std from a head (true) vs a shared
+                                      // learnable vector (false, "stable" global exploration)
+    double act_threshold = 0.05;  // tau_act: a fleet is "committed" when phi >= this
+    double logstd_min = -5.0, logstd_max = 2.0;  // [varsigma_min, varsigma_max] clip on log-std
+
+    int n_action_params() const { return 2 * fleets_per_planet; }  // 2K continuous controls/planet
 };
 
 // --- optimizer -------------------------------------------------------------
@@ -59,18 +68,38 @@ struct RolloutConfig {
     double prod_weight = 20.0;    // production-margin weight in the potential
     double terminal_bonus = 1.0;  // magnitude of the +/- terminal win signal
     // Curriculum stage: 1 = solo expansion (passive opponent), 2 = 1v1 vs starter,
-    // 3 = mixed/self-play opponents. Stage only sets the opponent; the reward below is shared.
+    // 3 = mixed opponents. Stage only sets the opponent; the reward below is shared.
     int stage = 2;
-    // Reward = production-only dense + launch quality, with a loss forfeiting everything:
+    // 3-stage curriculum auto-ramp WITHIN one run, by training-progress fraction:
+    //   step/total < stage1_frac -> stage 1 (passive);  < stage2_frac -> stage 2 (starter);
+    //   otherwise -> stage 3 (mix). curriculum=false pins the fixed `stage` for the whole run.
+    bool curriculum = true;
+    double stage1_frac = 0.40;
+    double stage2_frac = 0.75;
+    // Reward = production-only dense + an ILLEGAL-dispatch penalty, with a loss forfeiting all:
     //   r_t = prod_reward_weight * d(own production)
-    //       + launch_hit_reward * #launches-reaching-a-planet  -  launch_miss_penalty * #wasted
+    //       - illegal_launch_penalty * #launches-chosen-from-a-planet-not-owned-(or with 0 ships)
     //   R   = (win ? D : -D) + outcome_weight * o,   D = sum_t gamma^t r_t.
-    // Rationale: reward growing production efficiently, but losing negates the accumulated
-    // reward, so "maximize production yet lose" is strongly penalized (it must actually win).
-    double prod_reward_weight = 10.0;   // dense weight on the per-step gain in own production
-    double launch_hit_reward = 0.5;     // + for each launch that will reach a planet
-    double launch_miss_penalty = 1.0;   // - for each launch that lands nowhere (wasted fleet)
-    bool loss_forfeit = true;           // on a loss, negate the accumulated dense return (R = -D)
+    // The action head is NOT ownership-masked: the policy may try to launch from any planet, and
+    // learns the legal "dynamic action space" from the penalty (no reward/penalty for *where* a
+    // legal launch goes -- we let the net be creative with the heuristic destination launches).
+    // SMOOTH, BOUNDED per-game reward (each channel is accumulated over the episode, then capped):
+    //   R = outcome + P(prod, +/-cap) + V(valid, 0..cap) - I(invalid, uncapped) + S(suppression)
+    // outcome is applied ONLY at stage >= 2 (stage 1 is pure "valid dispatch + better production").
+    double prod_reward_weight = 2.5;      // w_prod: rate of production gain into P
+    double prod_reward_cap = 200.0;       // per-game cap on the production reward |P|
+    double valid_launch_reward = 0.02;    // w_valid: rate of valid (landing) launches into V
+    double valid_reward_cap = 30.0;       // per-game cap on the valid-launch reward V
+    double illegal_launch_penalty = 0.005;// w_inv: rate of invalid dispatches into I (uncapped:
+                                          // a hard cap would remove the gradient while invalid is high)
+    double win_bonus = 300.0;             // outcome (stage>=2): + on a win
+    double loss_penalty = 100.0;          // outcome (stage>=2): - on a loss (draw = 0)
+    bool loss_forfeit = false;            // legacy/unused in the bounded scheme (outcome is explicit)
+    // Enemy-suppression (stage>=2, after warmup): reward bending the enemy's production growth down.
+    //   g_t = d(enemy production); gbar EMA(beta); y_t = g_t - gbar_{t-1}; term = -w_e*y_t.
+    double enemy_growth_weight = 0.5;     // w_e
+    int enemy_growth_warmup = 50;         // x_0: steps before the suppression term switches on
+    double enemy_growth_ema = 0.1;        // beta: EMA window (1.0 -> one-step second difference)
 };
 
 // --- self-play league ------------------------------------------------------

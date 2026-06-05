@@ -14,24 +14,26 @@ namespace ow {
 GroupedRollout::GroupedRollout(const TrainConfig& cfg, torch::Device device)
     : cfg_(cfg), device_(device), rng_(cfg.seed * 2654435761ull + 12345ull) {}
 
+// One GRPO iteration with the CONTINUOUS actor (docs/rl_math.pdf sec:reward):
+//   per-step dense  r_t = clip( ( w_Pi*dProd0 - rho*x_t - w_e*y_t*1[t>=x0] ) / sigma, -kappa, kappa )
+//     dProd0 = gain in ego production; x_t = committed fleets that failed to execute (invalid);
+//     y_t = enemy_growth_t - EMA(enemy_growth) -> penalize the enemy ACCELERATING.
+//   return  R = 2 w_o + w_d D (win) | 1 w_o (draw) | -w_d D (loss),   D = sum_t gamma^t r_t.
 TrajectoryBatch GroupedRollout::collect(Agent& policy, RolloutStats& stats) {
     const int G = cfg_.grpo.group_size, N = cfg_.grpo.num_groups, B = N * G;
     const int E = cfg_.model.max_entities, F = N_ENTITY_FEATURES, Gl = N_GLOBAL_FEATURES;
-    const int T = cfg_.rollout.episode_steps, nf = (int)cfg_.model.fractions.size();
-    const double pw = cfg_.rollout.prod_weight, rscale = cfg_.rollout.reward_scale,
-                 rclip = cfg_.rollout.reward_clip, gamma = cfg_.grpo.gamma;
+    const int K = cfg_.model.fleets_per_planet, twoK = 2 * K;
+    const int T = cfg_.rollout.episode_steps;
+    const double gamma = cfg_.grpo.gamma;
+    const double w_prod = cfg_.rollout.prod_reward_weight, prod_cap = cfg_.rollout.prod_reward_cap,
+                 w_valid = cfg_.rollout.valid_launch_reward, valid_cap = cfg_.rollout.valid_reward_cap,
+                 w_inv = cfg_.rollout.illegal_launch_penalty,
+                 w_e = cfg_.rollout.enemy_growth_weight, beta = cfg_.rollout.enemy_growth_ema,
+                 win_bonus = cfg_.rollout.win_bonus, loss_penalty = cfg_.rollout.loss_penalty;
+    const int x0 = cfg_.rollout.enemy_growth_warmup;
+    const double act_thr = cfg_.model.act_threshold;
+    const int stage = cur_stage_ ? cur_stage_ : cfg_.rollout.stage;  // curriculum override
     Config econf{cfg_.rollout.episode_steps, 6.0, 4.0};
-
-    // Reward = production-only dense + launch quality; a loss forfeits the accumulated reward.
-    //   per step  r = w_prod * d(own production) + hit_r * #launches-hit - miss_p * #launches-miss
-    //   return    R = (win ? D : -D) + w_o * o,  D = sum_t gamma^t r_t.
-    // The opponent is stage-driven (passive / starter / mix), but the reward is shared: grow
-    // production efficiently with non-wasted launches, and WIN -- losing negates everything.
-    const int stage = cfg_.rollout.stage;
-    const double w_prod = cfg_.rollout.prod_reward_weight, hit_r = cfg_.rollout.launch_hit_reward,
-                 miss_p = cfg_.rollout.launch_miss_penalty;
-    const bool forfeit = cfg_.rollout.loss_forfeit;
-    (void)pw;
 
     // --- assign one (world, opponent) per group; all G envs in a group share them ---
     std::vector<GameState> st(B);
@@ -42,8 +44,6 @@ TrajectoryBatch GroupedRollout::collect(Agent& policy, RolloutStats& stats) {
         std::uniform_real_distribution<double> u(0.0, wr + ws);
         for (int j = 0; j < N; ++j) {
             const GameState& world = world_pool_[cursor_++ % world_pool_.size()];
-            // Stage 1: passive opponent (learn aiming + expansion unpunished). Stage 2: starter.
-            // Stage 3: random/starter mix (self-play pool is a follow-up).
             int o = (stage == 1) ? 2 : (stage == 2) ? 1 : ((u(rng_) < wr) ? 0 : 1);
             for (int g = 0; g < G; ++g) {
                 int i = j * G + g;
@@ -55,17 +55,21 @@ TrajectoryBatch GroupedRollout::collect(Agent& policy, RolloutStats& stats) {
     }
 
     std::vector<char> active(B, 1);
-    std::vector<double> dense_ret(B, 0.0), gpow(B, 1.0), prev_prod(B), outcome(B, 0.0);
+    // Per-game reward channels (accumulated over the episode, capped at the end). prodR/validR get
+    // capped; invR (invalid penalty) is uncapped; suppR (enemy suppression) only fills at stage>=2;
+    // the win/draw/loss outcome is added only at stage>=2 (stage 1 = pure dispatch+production).
+    std::vector<double> prodR(B, 0.0), validR(B, 0.0), invR(B, 0.0), suppR(B, 0.0), gpow(B, 1.0),
+        prev_p0(B), prev_p1(B), gbar(B, 0.0), outcome(B, 0.0);
+    std::vector<long> inv_acc(B, 0), lnch_acc(B, 0), valid_acc(B, 0), step_acc(B, 0);
     std::vector<int> ep_len(B, T);
-    for (int i = 0; i < B; ++i) prev_prod[i] = my_production(st[i], 0);
+    for (int i = 0; i < B; ++i) { prev_p0[i] = my_production(st[i], 0); prev_p1[i] = my_production(st[i], 1); }
 
     auto fo = torch::TensorOptions().dtype(torch::kFloat32);
-    auto lo = torch::TensorOptions().dtype(torch::kLong);
     auto ent_buf = torch::zeros({T, B, E, F}, fo);
     auto em_buf = torch::zeros({T, B, E}, fo);
     auto am_buf = torch::zeros({T, B, E}, fo);
     auto gl_buf = torch::zeros({T, B, Gl}, fo);
-    auto act_buf = torch::zeros({T, B, E}, lo);
+    auto act_buf = torch::zeros({T, B, E, twoK}, fo);
     auto oldlogp_buf = torch::zeros({T, B}, fo);
     auto valid_buf = torch::zeros({T, B}, fo);
 
@@ -92,43 +96,34 @@ TrajectoryBatch GroupedRollout::collect(Agent& policy, RolloutStats& stats) {
         am_buf[t] = t_am;
         gl_buf[t] = t_gl;
 
-        auto ent_d = t_ent.to(device_), em_d = t_em.to(device_), am_d = t_am.to(device_),
-             gl_d = t_gl.to(device_);
-        auto dec = policy.act(ent_d, em_d, am_d, gl_d, false);
-        act_buf[t] = dec.action.to(torch::kCPU);
+        auto dec = policy.act(t_ent.to(device_), t_em.to(device_), t_am.to(device_),
+                              t_gl.to(device_), false);
+        auto a_cpu = dec.action.to(torch::kCPU).contiguous();  // (B,E,2K) float
+        act_buf[t] = a_cpu;
         oldlogp_buf[t] = dec.log_prob.to(torch::kCPU);
+        const float* ad = a_cpu.data_ptr<float>();
 
-        auto act_t = act_buf[t];  // named lvalue; accessor can't bind to a temporary
-        auto a0 = act_t.accessor<int64_t, 2>();
         std::vector<float> validv(B, 0.f);
         std::for_each(std::execution::par, idx.begin(), idx.end(), [&](int i) {
             if (!active[i]) return;
             validv[i] = 1.f;
-            std::vector<long> cls0(E);
             std::vector<float> am0(E);
-            for (int r = 0; r < E; ++r) {
-                cls0[r] = a0[i][r];
-                am0[r] = am[(size_t)i * E + r];
-            }
-            Action move0 =
-                cfg_.model.target_mode
-                    ? decode_action_target(st[i], cls0.data(), am0.data(), rid[i].data(),
-                                           rsh[i].data(), E, nf, cfg_.model.fractions)
-                    : decode_action(cls0.data(), am0.data(), rid[i].data(), rsh[i].data(), E,
-                                    cfg_.model.angle_bins, cfg_.model.fractions);
-            // Launch quality: project each of this turn's launches; reward those that will reach
-            // a planet, penalize those that land nowhere (wasted cruise ship). Measured on the
-            // pre-step board (where the launch is fired from), same projection as the obs.
-            int hits = 0, misses = 0;
+            for (int r = 0; r < E; ++r) am0[r] = am[(size_t)i * E + r];
+            int invalid = 0;
+            Action move0 = decode_action_continuous(ad + (size_t)i * E * twoK, am0.data(),
+                                                    rid[i].data(), rsh[i].data(), E, K, act_thr,
+                                                    &invalid);
+            // VALID launches: legal+committed fleets whose heading actually lands on a planet
+            // (closed-form ray-vs-disk + sun occlusion). This is the aiming reward signal.
+            int valid = 0;
             for (const auto& mv : move0) {
-                const Planet* fp = nullptr;
-                for (const auto& p : st[i].planets)
-                    if (p.id == mv.from_id) { fp = &p; break; }
-                if (!fp) continue;
-                Fleet tf{0, 0, fp->x + std::cos(mv.angle) * (fp->radius + 0.1),
-                         fp->y + std::sin(mv.angle) * (fp->radius + 0.1), mv.angle, mv.from_id,
-                         mv.ships};
-                if (fleet_target(tf, st[i].planets).first < 0) ++misses; else ++hits;
+                const Planet* lp = nullptr;
+                for (const auto& p : st[i].planets) if (p.id == mv.from_id) { lp = &p; break; }
+                if (!lp) continue;
+                double cx = std::cos(mv.angle), cy = std::sin(mv.angle);
+                Fleet f{0, 0, lp->x + cx * (lp->radius + 0.1), lp->y + cy * (lp->radius + 0.1),
+                        mv.angle, mv.from_id, mv.ships};
+                if (fleet_target(f, st[i].planets).first >= 0) ++valid;
             }
             Action move1;  // opp 2 (noop) leaves it empty -> the passive stage-1 opponent
             if (opp[i] == 0) move1 = random_agent(st[i], 1, erng[i]);
@@ -136,12 +131,24 @@ TrajectoryBatch GroupedRollout::collect(Agent& policy, RolloutStats& stats) {
             std::vector<Action> acts = {move0, move1};
             ow::step(st[i], acts, econf);
             st[i].step += 1;
-            double prod = my_production(st[i], 0);
-            double r = w_prod * (prod - prev_prod[i]) + hit_r * hits - miss_p * misses;
-            double dense = std::max(-rclip, std::min(rclip, r / rscale));
-            dense_ret[i] += gpow[i] * dense;
+
+            double p0 = my_production(st[i], 0), p1 = my_production(st[i], 1);
+            double dprod = p0 - prev_p0[i];
+            double g_t = p1 - prev_p1[i];                 // enemy production growth this step
+            double y_t = g_t - gbar[i];                   // vs the enemy's own recent average
+            gbar[i] = (1.0 - beta) * gbar[i] + beta * g_t;
+            prodR[i] += gpow[i] * w_prod * dprod;               // production gain (capped per game)
+            validR[i] += gpow[i] * w_valid * (double)valid;     // valid landing launches (capped)
+            invR[i] += gpow[i] * w_inv * (double)invalid;       // invalid dispatches (uncapped penalty)
+            if (stage >= 2 && t >= x0) suppR[i] += gpow[i] * (-w_e * y_t);  // bend enemy growth down
             gpow[i] *= gamma;
-            prev_prod[i] = prod;
+            prev_p0[i] = p0;
+            prev_p1[i] = p1;
+
+            inv_acc[i] += invalid;
+            lnch_acc[i] += (long)move0.size();
+            valid_acc[i] += valid;
+            step_acc[i] += 1;
             if (is_terminal(st[i], cfg_.rollout.episode_steps)) {
                 active[i] = 0;
                 outcome[i] = outcome_sign(st[i]);
@@ -154,18 +161,20 @@ TrajectoryBatch GroupedRollout::collect(Agent& policy, RolloutStats& stats) {
     for (int i = 0; i < B; ++i)
         if (active[i]) outcome[i] = outcome_sign(st[i]);  // hit the step cap
 
-    // --- per-episode return (loss forfeits the accumulated reward) + group-relative advantage ---
+    // --- per-episode return on the non-negative outcome ladder (loss forfeits the dense return) ---
     std::vector<float> Rv(B);
     for (int i = 0; i < B; ++i) {
-        double D = cfg_.grpo.dense_weight * dense_ret[i];
+        double P = std::max(-prod_cap, std::min(prod_cap, prodR[i]));  // production reward, capped +/-
+        double V = std::max(0.0, std::min(valid_cap, validR[i]));      // valid-launch reward, capped
         double o = outcome[i];
-        double R = ((forfeit && o < 0.0) ? -D : D) + cfg_.grpo.outcome_weight * o;
-        Rv[i] = (float)R;
+        // outcome only at stage >= 2; stage 1 is pure dispatch + production (no win/draw/loss reward)
+        double O = (stage >= 2) ? (o > 0.0 ? win_bonus : (o < 0.0 ? -loss_penalty : 0.0)) : 0.0;
+        Rv[i] = (float)(O + P + V - invR[i] + suppR[i]);
     }
     auto R = torch::from_blob(Rv.data(), {B}, fo).clone();
     std::vector<int64_t> gidv(B);
     for (int i = 0; i < B; ++i) gidv[i] = i / G;
-    auto gid = torch::from_blob(gidv.data(), {B}, lo).clone();
+    auto gid = torch::from_blob(gidv.data(), {B}, torch::TensorOptions().dtype(torch::kLong)).clone();
     auto adv_env = group_advantage(R, gid, N, cfg_.grpo.adv_eps, cfg_.grpo.whiten_advantage);
 
     // --- flatten valid transitions ---
@@ -179,20 +188,28 @@ TrajectoryBatch GroupedRollout::collect(Agent& policy, RolloutStats& stats) {
     tb.entity_mask = sel(em_buf.narrow(0, 0, Tu).reshape({(long)Tu * B, E}));
     tb.action_mask = sel(am_buf.narrow(0, 0, Tu).reshape({(long)Tu * B, E}));
     tb.globals = sel(gl_buf.narrow(0, 0, Tu).reshape({(long)Tu * B, Gl}));
-    tb.action = sel(act_buf.narrow(0, 0, Tu).reshape({(long)Tu * B, E}));
+    tb.action = sel(act_buf.narrow(0, 0, Tu).reshape({(long)Tu * B, E, twoK}));
     tb.old_logp = sel(oldlogp_buf.narrow(0, 0, Tu).reshape({(long)Tu * B}));
     tb.advantage = adv_full.index_select(0, keep);  // ref_logp computed in the update
     tb.n_transitions = keep.size(0);
 
     double sumR = 0, sumlen = 0, wins = 0;
+    long inv_sum = 0, lnch_sum = 0, valid_sum = 0, step_sum = 0;
     for (int i = 0; i < B; ++i) {
         sumR += Rv[i];
         sumlen += ep_len[i];
         wins += outcome[i] > 0 ? 1.0 : 0.0;
+        inv_sum += inv_acc[i];
+        lnch_sum += lnch_acc[i];
+        valid_sum += valid_acc[i];
+        step_sum += step_acc[i];
     }
     stats.mean_return = sumR / B;
     stats.mean_len = sumlen / B;
     stats.win_rate = wins / B;
+    stats.mean_invalid = step_sum ? (double)inv_sum / step_sum : 0.0;
+    stats.mean_launches = step_sum ? (double)lnch_sum / step_sum : 0.0;
+    stats.mean_valid = step_sum ? (double)valid_sum / step_sum : 0.0;
     stats.episodes = B;
     stats.transitions = tb.n_transitions;
     return tb;

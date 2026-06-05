@@ -1,9 +1,11 @@
-// Agent implementation: forward+sample (rollout/opponent), re-score (update), frozen clone
-// (opponent pool / KL reference), and checkpoint I/O. Weight keys mirror the Python
-// EntityPolicy; "critic.*" tensors in a BC checkpoint are ignored (GRPO has no critic).
+// Agent implementation (v4, continuous): forward+sample (rollout/opponent), re-score (update),
+// frozen clone (KL reference), and checkpoint I/O. The policy is a squashed diagonal Gaussian; an
+// action is the (E x 2K) matrix of squashed controls. Checkpoint keys mirror the module names so
+// the pure-Python serving twin can load them. No critic (GRPO).
 #include "rl/model/agent.hpp"
 
 #include <sstream>
+#include <string>
 
 #include "rl/model/distribution.hpp"
 
@@ -17,8 +19,8 @@ Agent::Agent(const ModelConfig& cfg, torch::Device dev) : device(dev) {
 Agent::Decision Agent::act(const torch::Tensor& ent, const torch::Tensor& em,
                            const torch::Tensor& am, const torch::Tensor& gl, bool greedy) {
     torch::NoGradGuard ng;
-    auto logits = net->forward(ent, em, am, gl);
-    MaskedPerEntityCategorical dist(logits, em);
+    auto [mean, logstd] = net->forward(ent, em, am, gl);
+    SquashedGaussian dist(mean, logstd);
     auto action = greedy ? dist.greedy() : dist.sample();
     return {action, dist.log_prob(action)};
 }
@@ -26,16 +28,16 @@ Agent::Decision Agent::act(const torch::Tensor& ent, const torch::Tensor& em,
 Agent::Score Agent::evaluate(const torch::Tensor& ent, const torch::Tensor& em,
                              const torch::Tensor& am, const torch::Tensor& gl,
                              const torch::Tensor& action) {
-    auto logits = net->forward(ent, em, am, gl);
-    MaskedPerEntityCategorical dist(logits, em);
-    return {dist.log_prob(action), dist.entropy(), logits};
+    auto [mean, logstd] = net->forward(ent, em, am, gl);
+    SquashedGaussian dist(mean, logstd);
+    return {dist.log_prob(action), dist.entropy()};
 }
 
 Agent Agent::clone_frozen() const {
     Agent c;
     c.device = device;
     c.net = PolicyNet(net->cfg);
-    std::stringstream ss;          // serialize -> deserialize is the proven deep-copy path
+    std::stringstream ss;  // serialize -> deserialize is the proven deep-copy path
     torch::save(net, ss);
     torch::load(c.net, ss);
     c.net->to(device);
@@ -45,56 +47,60 @@ Agent Agent::clone_frozen() const {
 
 void Agent::load_state_dict(const std::map<std::string, torch::Tensor>& sd) {
     auto load = [&](const std::string& key, torch::nn::Linear& lin) {
+        if (!lin) return;
         auto wi = sd.find(key + ".weight");
         auto bi = sd.find(key + ".bias");
-        if (wi == sd.end() || bi == sd.end()) return;  // tolerate missing (e.g. critic.*)
+        if (wi == sd.end() || bi == sd.end()) return;  // tolerate missing
         torch::NoGradGuard ng;
         lin->weight.copy_(wi->second.reshape(lin->weight.sizes()).to(device));
         lin->bias.copy_(bi->second.reshape(lin->bias.sizes()).to(device));
     };
-    load("entity_encoder.0", net->ent0);
-    load("entity_encoder.2", net->ent2);
-    load("context_encoder.0", net->ctx0);
-    load("context_encoder.2", net->ctx2);
-    load("ent_glu_gate", net->ent_glu_gate);
-    load("ent_glu_val", net->ent_glu_val);
-    load("ent_glu_out", net->ent_glu_out);
-    load("ctx_glu_gate", net->ctx_glu_gate);
-    load("ctx_glu_val", net->ctx_glu_val);
-    load("ctx_glu_out", net->ctx_glu_out);
-    if (net->cfg.target_mode) {
-        load("actor_q", net->aq);
-        load("actor_k", net->ak);
-        load("actor_noop", net->anoop);
+    load("proj", net->proj);
+    if (net->cfg.use_glu) {
+        load("glu_gate", net->glu_gate);
+        load("glu_val", net->glu_val);
+        load("glu_out", net->glu_out);
+    }
+    for (size_t i = 0; i < net->res_a.size(); ++i) {
+        load("res" + std::to_string(i) + "a", net->res_a[i]);
+        load("res" + std::to_string(i) + "b", net->res_b[i]);
+    }
+    load("g_embed", net->g_embed);
+    load("mu_head", net->mu_head);
+    if (net->cfg.std_state_dependent) {
+        load("logstd_head", net->logstd_head);
     } else {
-        load("actor.0", net->act0);
-        load("actor.2", net->act2);
+        auto it = sd.find("logstd_param");
+        if (it != sd.end() && net->logstd_param.defined()) {
+            torch::NoGradGuard ng;
+            net->logstd_param.copy_(it->second.reshape(net->logstd_param.sizes()).to(device));
+        }
     }
 }
 
 std::map<std::string, torch::Tensor> Agent::state_dict() const {
     std::map<std::string, torch::Tensor> w;
     auto put = [&](const std::string& k, const torch::nn::Linear& lin) {
+        if (!lin) return;
         w[k + ".weight"] = lin->weight.detach().to(torch::kCPU).contiguous();
         w[k + ".bias"] = lin->bias.detach().to(torch::kCPU).contiguous();
     };
-    put("entity_encoder.0", net->ent0);
-    put("entity_encoder.2", net->ent2);
-    put("context_encoder.0", net->ctx0);
-    put("context_encoder.2", net->ctx2);
-    put("ent_glu_gate", net->ent_glu_gate);
-    put("ent_glu_val", net->ent_glu_val);
-    put("ent_glu_out", net->ent_glu_out);
-    put("ctx_glu_gate", net->ctx_glu_gate);
-    put("ctx_glu_val", net->ctx_glu_val);
-    put("ctx_glu_out", net->ctx_glu_out);
-    if (net->cfg.target_mode) {
-        put("actor_q", net->aq);
-        put("actor_k", net->ak);
-        put("actor_noop", net->anoop);
-    } else {
-        put("actor.0", net->act0);
-        put("actor.2", net->act2);
+    put("proj", net->proj);
+    if (net->cfg.use_glu) {
+        put("glu_gate", net->glu_gate);
+        put("glu_val", net->glu_val);
+        put("glu_out", net->glu_out);
+    }
+    for (size_t i = 0; i < net->res_a.size(); ++i) {
+        put("res" + std::to_string(i) + "a", net->res_a[i]);
+        put("res" + std::to_string(i) + "b", net->res_b[i]);
+    }
+    put("g_embed", net->g_embed);
+    put("mu_head", net->mu_head);
+    if (net->cfg.std_state_dependent) {
+        put("logstd_head", net->logstd_head);
+    } else if (net->logstd_param.defined()) {
+        w["logstd_param"] = net->logstd_param.detach().to(torch::kCPU).contiguous();
     }
     return w;
 }
