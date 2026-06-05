@@ -82,7 +82,8 @@ void Agent::load_state_dict(const std::map<std::string, torch::Tensor>& sd) {
         load("res" + std::to_string(i) + "b", net->res_b[i]);
     }
     load("g_embed", net->g_embed);
-    load("mu_head", net->mu_head);
+    load("mu_h1", net->mu_h1);
+    load("mu_h2", net->mu_h2);
     if (net->cfg.std_state_dependent) {
         load("logstd_head", net->logstd_head);
     } else {
@@ -124,7 +125,8 @@ std::map<std::string, torch::Tensor> Agent::state_dict() const {
         put("res" + std::to_string(i) + "b", net->res_b[i]);
     }
     put("g_embed", net->g_embed);
-    put("mu_head", net->mu_head);
+    put("mu_h1", net->mu_h1);
+    put("mu_h2", net->mu_h2);
     if (net->cfg.std_state_dependent) {
         put("logstd_head", net->logstd_head);
     } else if (net->logstd_param.defined()) {

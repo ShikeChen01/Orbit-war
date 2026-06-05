@@ -44,7 +44,9 @@ struct PolicyNetImpl : torch::nn::Module {
     std::vector<torch::nn::LayerNorm> ln_res;
     // separate board-globals path + heads (operate on [tok; g'], dim d + d_g)
     torch::nn::Linear g_embed{nullptr};                                       // G -> d_g
-    torch::nn::Linear mu_head{nullptr};                                       // d+d_g -> 2K
+    torch::nn::Linear mu_h1{nullptr}, mu_h2{nullptr};  // MLP mean head: nonlinear so it can turn the
+                                                       // relative positions (from attention) into an
+                                                       // angle (atan2) -- a linear head cannot.
     torch::nn::Linear logstd_head{nullptr};                                   // d+d_g -> 2K (state-dep)
     torch::Tensor logstd_param;                                               // 2K vector (state-indep)
 };

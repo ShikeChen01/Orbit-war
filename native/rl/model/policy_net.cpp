@@ -33,7 +33,8 @@ PolicyNetImpl::PolicyNetImpl(const ModelConfig& c) : cfg(c), twoK(2 * c.fleets_p
                                          torch::nn::LayerNorm(torch::nn::LayerNormOptions({h}))));
     }
     g_embed = register_module("g_embed", torch::nn::Linear(G, dg));
-    mu_head = register_module("mu_head", torch::nn::Linear(h + dg, twoK));
+    mu_h1 = register_module("mu_h1", torch::nn::Linear(h + dg, h));
+    mu_h2 = register_module("mu_h2", torch::nn::Linear(h, twoK));
     {
         // Prior: start the policy nearly INERT so it learns to act, instead of spamming ~E*K illegal
         // dispatches and slowly suppressing them. Small final-layer weights make every head output
@@ -42,9 +43,9 @@ PolicyNetImpl::PolicyNetImpl(const ModelConfig& c) : cfg(c), twoK(2 * c.fleets_p
         // strongly negative phi bias (sigmoid(-5)=0.0067 << tau_act) keeps almost nothing committed
         // at init; the policy then LEARNS to raise phi on owned planets. phi = odd (alpha,phi) comps.
         torch::NoGradGuard ng;
-        mu_head->weight.mul_(c.init_mu_scale);
-        mu_head->bias.zero_();
-        for (int k = 0; k < c.fleets_per_planet; ++k) mu_head->bias[2 * k + 1].fill_(c.init_phi_bias);
+        mu_h2->weight.mul_(c.init_mu_scale);
+        mu_h2->bias.zero_();
+        for (int k = 0; k < c.fleets_per_planet; ++k) mu_h2->bias[2 * k + 1].fill_(c.init_phi_bias);
     }
     if (c.std_state_dependent) {
         logstd_head = register_module("logstd_head", torch::nn::Linear(h + dg, twoK));
@@ -85,7 +86,7 @@ std::pair<torch::Tensor, torch::Tensor> PolicyNetImpl::forward(const torch::Tens
     auto gpb = gp.unsqueeze(1).expand({B, E, cfg.d_g});          // broadcast to every planet
     auto h = torch::cat({tok, gpb}, -1);                         // (B,E,d+d_g)
 
-    auto mean = mu_head->forward(h);                             // (B,E,2K)
+    auto mean = mu_h2->forward(torch::relu(mu_h1->forward(h)));  // (B,E,2K) nonlinear mean head
     torch::Tensor logstd;
     if (cfg.std_state_dependent) {
         logstd = logstd_head->forward(h);                       // (B,E,2K)
