@@ -53,3 +53,9 @@ add_executable(ow_parity_gpu apps/parity_gpu.cpp rl/gpu_env.cpp)
 target_include_directories(ow_parity_gpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(ow_parity_gpu PRIVATE torch_local)
 target_compile_options(ow_parity_gpu PRIVATE /EHsc /bigobj /Zc:__cplusplus)
+
+# --- BC pre-trainer: clone the starter into the continuous PolicyNet -> bc.owc (GRPO warm start) -
+add_executable(ow_bc apps/bc_pretrain.cpp ${OW_RL_SRC})
+target_include_directories(ow_bc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(ow_bc PRIVATE torch_local)
+target_compile_options(ow_bc PRIVATE /EHsc /bigobj /Zc:__cplusplus)

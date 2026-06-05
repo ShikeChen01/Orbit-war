@@ -56,6 +56,10 @@ void Agent::load_state_dict(const std::map<std::string, torch::Tensor>& sd) {
         lin->bias.copy_(bi->second.reshape(lin->bias.sizes()).to(device));
     };
     load("proj", net->proj);
+    load("attn_q", net->attn_q);
+    load("attn_k", net->attn_k);
+    load("attn_v", net->attn_v);
+    load("attn_o", net->attn_o);
     if (net->cfg.use_glu) {
         load("glu_gate", net->glu_gate);
         load("glu_val", net->glu_val);
@@ -86,6 +90,10 @@ std::map<std::string, torch::Tensor> Agent::state_dict() const {
         w[k + ".bias"] = lin->bias.detach().to(torch::kCPU).contiguous();
     };
     put("proj", net->proj);
+    put("attn_q", net->attn_q);
+    put("attn_k", net->attn_k);
+    put("attn_v", net->attn_v);
+    put("attn_o", net->attn_o);
     if (net->cfg.use_glu) {
         put("glu_gate", net->glu_gate);
         put("glu_val", net->glu_val);

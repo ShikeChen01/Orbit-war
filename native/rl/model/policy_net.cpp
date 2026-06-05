@@ -15,6 +15,10 @@ namespace ow {
 PolicyNetImpl::PolicyNetImpl(const ModelConfig& c) : cfg(c), twoK(2 * c.fleets_per_planet) {
     int F = c.n_entity_features, h = c.hidden, G = c.n_global_features, dg = c.d_g;
     proj = register_module("proj", torch::nn::Linear(F, h));
+    attn_q = register_module("attn_q", torch::nn::Linear(h, h));
+    attn_k = register_module("attn_k", torch::nn::Linear(h, h));
+    attn_v = register_module("attn_v", torch::nn::Linear(h, h));
+    attn_o = register_module("attn_o", torch::nn::Linear(h, h));
     if (c.use_glu) {
         glu_gate = register_module("glu_gate", torch::nn::Linear(h, h));
         glu_val = register_module("glu_val", torch::nn::Linear(h, h));
@@ -50,9 +54,19 @@ std::pair<torch::Tensor, torch::Tensor> PolicyNetImpl::forward(const torch::Tens
                                                               const torch::Tensor& entity_mask,
                                                               const torch::Tensor& action_mask,
                                                               const torch::Tensor& globals) {
-    (void)entity_mask;   // not masked: log-prob/entropy sum over ALL slots (penalty teaches legality)
     (void)action_mask;
     auto tok = proj->forward(entities);  // (B,E,d)
+    {
+        // masked single-head self-attention over planets: each planet attends to all LIVE planets,
+        // so it can read their positions and aim a launch at a specific target (impossible for the
+        // per-planet trunk alone). entity_mask (B,E): 1 live / 0 padding -> dead keys are masked out.
+        auto Q = attn_q->forward(tok), Kt = attn_k->forward(tok), Vt = attn_v->forward(tok);
+        auto scores = torch::matmul(Q, Kt.transpose(1, 2)) / std::sqrt((double)cfg.hidden);  // (B,E,E)
+        auto dead_key = (entity_mask < 0.5).unsqueeze(1);  // (B,1,E)
+        scores = scores.masked_fill(dead_key, -1e9);
+        auto attn = torch::matmul(torch::softmax(scores, -1), Vt);  // (B,E,d)
+        tok = tok + attn_o->forward(attn);
+    }
     if (cfg.use_glu) {
         tok = tok +
               glu_out->forward(glu_val->forward(tok) * torch::sigmoid(glu_gate->forward(tok)));

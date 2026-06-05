@@ -32,6 +32,10 @@ struct PolicyNetImpl : torch::nn::Module {
 
     // per-planet trunk
     torch::nn::Linear proj{nullptr};                                          // F -> d
+    // one self-attention block over the E planet tokens: lets each planet SEE the others' features
+    // (positions) so it can aim a launch AT a specific target planet -- the per-planet+global trunk
+    // alone cannot represent targeted headings (cross-planet info is absent). Masked by entity_mask.
+    torch::nn::Linear attn_q{nullptr}, attn_k{nullptr}, attn_v{nullptr}, attn_o{nullptr};
     torch::nn::Linear glu_gate{nullptr}, glu_val{nullptr}, glu_out{nullptr};  // one GLU block (opt)
     std::vector<torch::nn::Linear> res_a, res_b;                              // n_res_blocks res MLPs
     // separate board-globals path + heads (operate on [tok; g'], dim d + d_g)
