@@ -27,13 +27,16 @@ PolicyNetImpl::PolicyNetImpl(const ModelConfig& c) : cfg(c), twoK(2 * c.fleets_p
     g_embed = register_module("g_embed", torch::nn::Linear(G, dg));
     mu_head = register_module("mu_head", torch::nn::Linear(h + dg, twoK));
     {
-        // Prior: start with the fraction (phi) means low so almost nothing is "committed" at init
-        // (sigmoid(-3) ~ 0.047 < tau_act); the policy then LEARNS to raise phi on owned planets to
-        // launch, instead of spamming ~E*K invalid dispatches and slowly suppressing them. phi are
-        // the odd components of each (alpha, phi) pair.
+        // Prior: start the policy nearly INERT so it learns to act, instead of spamming ~E*K illegal
+        // dispatches and slowly suppressing them. Small final-layer weights make every head output
+        // start ~= its bias regardless of the deep random trunk (without this, a deep scratch trunk
+        // emits large, varied means -> ~half of all E*K slots commit illegally from step 1). A
+        // strongly negative phi bias (sigmoid(-5)=0.0067 << tau_act) keeps almost nothing committed
+        // at init; the policy then LEARNS to raise phi on owned planets. phi = odd (alpha,phi) comps.
         torch::NoGradGuard ng;
+        mu_head->weight.mul_(0.01);
         mu_head->bias.zero_();
-        for (int k = 0; k < c.fleets_per_planet; ++k) mu_head->bias[2 * k + 1].fill_(-3.0);
+        for (int k = 0; k < c.fleets_per_planet; ++k) mu_head->bias[2 * k + 1].fill_(-5.0);
     }
     if (c.std_state_dependent) {
         logstd_head = register_module("logstd_head", torch::nn::Linear(h + dg, twoK));
