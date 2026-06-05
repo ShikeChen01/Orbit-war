@@ -130,6 +130,7 @@ void GpuEnv::reset(const std::vector<GameState>& worlds) {
     t_.f_y = torch::zeros({B, cfg_.fleet_cap}, fo).to(dev_);
     t_.f_angle = torch::zeros({B, cfg_.fleet_cap}, fo).to(dev_);
     t_.f_ships = torch::zeros({B, cfg_.fleet_cap}, fo).to(dev_);
+    t_.f_seq = torch::zeros({B, cfg_.fleet_cap}, fo).to(dev_);
 
     t_.c_spawn_step = mki(c_spawn, {B, Ev});
     t_.c_ships = mk(c_ships, {B, Ev});
@@ -193,7 +194,7 @@ static std::pair<Tensor, Tensor> fleet_target_batch(const EnvTensors& t, const T
 // into the fleet pool, placing each into a distinct free slot. Ship deduction happens in step().
 // ---------------------------------------------------------------------------------------------
 void GpuEnv::launch_fleets(const Tensor& owner, const Tensor& from_slot, const Tensor& angle,
-                           const Tensor& ships, const Tensor& commit) {
+                           const Tensor& ships, const Tensor& commit, const Tensor& seq) {
     const int B = B_, Fc = cfg_.fleet_cap;
     const long L = from_slot.size(1);
     auto fo = torch::TensorOptions().dtype(torch::kFloat32).device(dev_);
@@ -238,6 +239,7 @@ void GpuEnv::launch_fleets(const Tensor& owner, const Tensor& from_slot, const T
     t_.f_y = scatter_into(t_.f_y, sy);
     t_.f_angle = scatter_into(t_.f_angle, angle);
     t_.f_ships = scatter_into(t_.f_ships, ships);
+    t_.f_seq = scatter_into(t_.f_seq, seq);
 }
 
 void GpuEnv::opponent_action(int opponent, Tensor& angle, Tensor& ships, Tensor& commit) {
@@ -250,9 +252,108 @@ void GpuEnv::opponent_action(int opponent, Tensor& angle, Tensor& ships, Tensor&
     TORCH_CHECK(false, "scripted opponent ", opponent, " not vectorized yet (next pass)");
 }
 
+// Batched mirror of encode.hpp::encode_obs for `ego`. Planets stay in fixed slots (no
+// entity_order) -- the per-planet actor is permutation-equivariant, so row order is irrelevant.
 GpuEnv::Obs GpuEnv::encode(int ego) {
-    TORCH_CHECK(false, "GpuEnv::encode not implemented yet (next pass)");
-    return {};
+    const int B = B_, Ec = cfg_.planet_cap, Fc = cfg_.fleet_cap;
+    const int enemy = 1 - ego, na = 2;
+    const double vmax = cfg_.ship_speed;
+    auto fo = torch::TensorOptions().dtype(torch::kFloat32).device(dev_);
+
+    Tensor alive = t_.p_alive > 0.5;                                   // (B,Ec)
+    Tensor av = t_.p_alive;                                            // float 0/1
+    Tensor owner = t_.p_owner;
+    Tensor dxc = t_.p_x - CENTER, dyc = t_.p_y - CENTER;
+    Tensor dist = torch::sqrt(dxc * dxc + dyc * dyc);                  // (B,Ec)
+    Tensor comet = t_.p_is_comet > 0.5;
+    Tensor rotating = (~comet) & ((dist + t_.p_radius) < ROTATION_RADIUS_LIMIT);
+    Tensor angv = t_.ang_vel.unsqueeze(1);                             // (B,1)
+    Tensor vmag = torch::where(rotating, angv.abs() * dist, torch::zeros_like(dist));
+    Tensor cw = torch::where(rotating, torch::where(angv >= 0.0, torch::ones_like(dist),
+                                                    -torch::ones_like(dist)),
+                             torch::zeros_like(dist));
+    // ego-relative ownership code: 0 neutral, 1 ego, 2..na enemy seats
+    Tensor m = owner - (double)ego + (double)na;
+    m = m - (double)na * torch::floor(m / (double)na);
+    Tensor own_code = torch::where(owner < 0.0, torch::zeros_like(owner), 1.0 + m);
+
+    Tensor b0 = t_.p_x / BOARD_SIZE;
+    Tensor b1 = t_.p_y / BOARD_SIZE;
+    Tensor b2 = vmag / THREAT_MAX_SPEED;
+    Tensor b3 = cw;
+    Tensor b4 = t_.p_radius / 3.0;
+    Tensor b5 = t_.p_prod / 5.0;
+    Tensor b6 = ship_log_t(t_.p_ships);
+    Tensor b7 = own_code;
+    Tensor b8 = dist / DIAG_HALF;
+    Tensor b9 = comet.to(torch::kFloat32);
+    Tensor actable = (owner == (double)ego) & alive & (t_.p_ships > 0.0);  // (B,Ec)
+    Tensor b10 = actable.to(torch::kFloat32);
+    Tensor body = torch::stack({b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10}, 2);  // (B,Ec,11)
+
+    // --- threat: per planet, N_SOON soonest + N_BIG largest inbound fleets, 3 feats each ---
+    auto te = fleet_target_batch(t_, t_.f_x, t_.f_y, t_.f_angle, t_.f_ships, vmax);
+    Tensor ftgt = te.first;   // (B,Fc) planet slot or -1
+    Tensor feta = te.second;  // (B,Fc)
+    Tensor falive = t_.f_alive > 0.5;
+    Tensor fsign = torch::where(t_.f_owner == (double)ego, torch::ones_like(t_.f_ships),
+                                -torch::ones_like(t_.f_ships));   // (B,Fc) +mine / -enemy
+    Tensor fslog = ship_log_t(t_.f_ships.abs());                  // |ships| log
+
+    Tensor slot = torch::arange(Ec, fo).view({1, Ec, 1});                              // (1,Ec,1)
+    Tensor tgtf = ftgt.to(torch::kFloat32).unsqueeze(1);                               // (B,1,Fc)
+    Tensor targeting = (tgtf == slot) & (ftgt >= 0).unsqueeze(1) & falive.unsqueeze(1);  // (B,Ec,Fc)
+    // Soonest group: plain eta (continuous, ties negligible). Largest group: composite float64 key
+    // |ships|*W - seq so equal-ship ties break by ascending launch order (f_seq), matching the
+    // reference stable_sort over s.fleets. W > max seq keeps |ships| dominant.
+    auto f64 = torch::TensorOptions().dtype(torch::kFloat64).device(dev_);
+    const double W = 1e6;
+    Tensor eta_mat = torch::where(targeting, feta.unsqueeze(1), torch::full({1}, kBIG, fo));
+    Tensor abs64 = t_.f_ships.abs().to(torch::kFloat64).unsqueeze(1);                  // (B,1,Fc)
+    Tensor seq64 = t_.f_seq.to(torch::kFloat64).unsqueeze(1);
+    Tensor key_big = torch::where(targeting, abs64 * W - seq64, torch::full({1}, -kBIG, f64));
+    auto eta_top = torch::topk(eta_mat, N_SOON, 2, /*largest=*/false);
+    auto big_top = torch::topk(key_big, N_BIG, 2, /*largest=*/true);
+    Tensor idx = torch::cat({std::get<1>(eta_top), std::get<1>(big_top)}, 2);          // (B,Ec,7)
+    Tensor valid = torch::cat({std::get<0>(eta_top) < kBIG * 0.5,
+                               std::get<0>(big_top) > -kBIG * 0.5}, 2);                // (B,Ec,7)
+
+    auto pick = [&](const Tensor& src) {  // src (B,Fc) -> (B,Ec,7) gather by idx
+        return src.unsqueeze(1).expand({B, Ec, Fc}).gather(2, idx);
+    };
+    Tensor z = torch::zeros({B, Ec, N_THREAT_FLEETS}, fo);
+    Tensor sgn = torch::where(valid, pick(fsign), z);
+    Tensor etf = torch::where(valid, pick(feta) / THREAT_ETA_SCALE, z);
+    Tensor slg = torch::where(valid, pick(fslog), z);
+    Tensor threat = torch::stack({sgn, etf, slg}, 3).reshape({B, Ec, 3 * N_THREAT_FLEETS});  // (B,Ec,21)
+
+    Tensor entities = torch::cat({body, threat}, 2) * av.unsqueeze(2);  // zero dead slots
+    Tensor entity_mask = av;
+    Tensor action_mask = b10;
+
+    // --- globals (B,10) ---
+    auto psum = [&](const Tensor& mask) { return (t_.p_ships * mask.to(torch::kFloat32)).sum(1); };
+    Tensor mine = (owner == (double)ego) & alive, en = (owner == (double)enemy) & alive,
+           neu = (owner < 0.0) & alive;
+    Tensor my_ships = psum(mine), en_ships = psum(en);
+    Tensor my_pl = mine.to(torch::kFloat32).sum(1), en_pl = en.to(torch::kFloat32).sum(1),
+           neu_pl = neu.to(torch::kFloat32).sum(1);
+    Tensor np = av.sum(1);
+    Tensor total = np.clamp_min(1.0);
+    Tensor my_fleet = (t_.f_ships * (t_.f_owner == (double)ego).to(torch::kFloat32) *
+                       falive.to(torch::kFloat32)).sum(1);
+    Tensor en_fleet = (t_.f_ships * (t_.f_owner == (double)enemy).to(torch::kFloat32) *
+                       falive.to(torch::kFloat32)).sum(1);
+    double ME = 40.0;  // reference EntityObservation max_entities (obs fill-fraction normalizer)
+    Tensor g0 = t_.step.to(torch::kFloat32) / std::max(1, cfg_.episode_steps);
+    Tensor g1 = t_.ang_vel * 10.0;
+    Tensor g2 = ship_log_t(my_ships), g3 = ship_log_t(en_ships);
+    Tensor g4 = my_pl / total, g5 = en_pl / total, g6 = neu_pl / total;
+    Tensor g7 = ship_log_t(my_fleet), g8 = ship_log_t(en_fleet);
+    Tensor g9 = torch::minimum(np, torch::full_like(np, ME)) / ME;
+    Tensor globals = torch::stack({g0, g1, g2, g3, g4, g5, g6, g7, g8, g9}, 1);  // (B,10)
+
+    return {entities, entity_mask, action_mask, globals};
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -360,29 +461,25 @@ GpuEnv::StepOut GpuEnv::step(const Tensor& ego_action, int opponent, double act_
     ded = ded + o_shp;                                   // opponent deductions
     t_.p_ships = t_.p_ships - ded;
 
-    // --- place fleets: concat ego (Ec*K) + opponent (Ec) launches, scatter into free slots ---
+    // --- place fleets: ego launches in PLANET-major (planet e, fleet k) order then opponent, so
+    //     the launch-sequence stamp mirrors ow::step's ascending fleet-id order; scatter into free
+    //     slots. ---
     {
-        std::vector<Tensor> ow_, sl_, an_, sh_, cm_;
-        Tensor slot_idx = torch::arange(Ec, torch::TensorOptions().dtype(torch::kLong).device(dev_))
-                              .unsqueeze(0).expand({B, Ec});
-        for (int k = 0; k < K; ++k) {
-            ow_.push_back(torch::full({B, Ec}, (double)ego, fo));
-            sl_.push_back(slot_idx);
-            an_.push_back(e_ang[k]);
-            sh_.push_back(e_shp[k]);
-            cm_.push_back(e_can[k]);
-        }
-        ow_.push_back(torch::full({B, Ec}, (double)enemy, fo));
-        sl_.push_back(slot_idx);
-        an_.push_back(o_ang);
-        sh_.push_back(o_shp);
-        cm_.push_back(o_can);
-        Tensor owner = torch::cat(ow_, 1);
-        Tensor from_slot = torch::cat(sl_, 1);
-        Tensor angle = torch::cat(an_, 1);
-        Tensor ships = torch::cat(sh_, 1);
-        Tensor commit = torch::cat(cm_, 1);
-        launch_fleets(owner, from_slot, angle, ships, commit);
+        const long L = (long)Ec * K + Ec;
+        Tensor slot_idx = torch::arange(Ec, lo).unsqueeze(0).expand({B, Ec});  // (B,Ec)
+        Tensor e_ang_t = torch::stack(e_ang, 2).reshape({B, (long)Ec * K});    // (B,Ec*K) planet-major
+        Tensor e_shp_t = torch::stack(e_shp, 2).reshape({B, (long)Ec * K});
+        Tensor e_can_t = torch::stack(e_can, 2).reshape({B, (long)Ec * K});
+        Tensor e_slot = slot_idx.unsqueeze(2).expand({B, Ec, K}).reshape({B, (long)Ec * K});
+        Tensor owner = torch::cat({torch::full({B, (long)Ec * K}, (double)ego, fo),
+                                   torch::full({B, Ec}, (double)enemy, fo)}, 1);
+        Tensor from_slot = torch::cat({e_slot, slot_idx}, 1);
+        Tensor angle = torch::cat({e_ang_t, o_ang}, 1);
+        Tensor ships = torch::cat({e_shp_t, o_shp}, 1);
+        Tensor commit = torch::cat({e_can_t, o_can}, 1);
+        Tensor seq = (t_.step.to(torch::kFloat32) * (float)(L + 1)).unsqueeze(1) +
+                     torch::arange(L, fo).unsqueeze(0);  // (B,L) globally ascending launch order
+        launch_fleets(owner, from_slot, angle, ships, commit, seq);
     }
 
     // --- production (owned planets gain production) ---

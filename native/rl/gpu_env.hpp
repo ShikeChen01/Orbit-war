@@ -58,6 +58,7 @@ struct EnvTensors {
     torch::Tensor f_x, f_y;
     torch::Tensor f_angle;
     torch::Tensor f_ships;     // integer-valued
+    torch::Tensor f_seq;       // monotonic launch-order stamp (mirrors ref next_fleet_id ordering)
 
     // --- comet schedule, baked per env ---
     torch::Tensor c_spawn_step;  // (B, Ev) int32, -1 padded
@@ -121,7 +122,7 @@ class GpuEnv {
     // into the fleet pool, deducting ships from the origin planet. Used for both ego and opponent.
     void launch_fleets(const torch::Tensor& owner, const torch::Tensor& from_slot,
                        const torch::Tensor& angle, const torch::Tensor& ships,
-                       const torch::Tensor& commit);
+                       const torch::Tensor& commit, const torch::Tensor& seq);
     // scripted opponent launches as tensors (per env, per planet slot): {angle, ships, commit}.
     void opponent_action(int opponent, torch::Tensor& angle, torch::Tensor& ships,
                          torch::Tensor& commit);

@@ -45,6 +45,7 @@ int main(int argc, char** argv) try {
     int Ec = a.i("planet-cap", 40);
     double thr = a.f("act-threshold", 0.05);
     int dumpN = a.i("dump-steps", -1);  // dump env 0 detail for steps 0..dumpN (-1 = off)
+    int encStep = a.i("encode-step", -1);  // compare GpuEnv::encode vs encode_obs at this step
     uint64_t seed = (uint64_t)a.l("seed", 0);
 
     torch::Device dev(torch::kCUDA);
@@ -69,6 +70,62 @@ int main(int argc, char** argv) try {
 
     int first_div = -1;
     for (int t = 0; t < T; ++t) {
+        // --- optional encode parity: compare GpuEnv::encode vs encode_obs on the matched state ---
+        if (t == encStep) {
+            const int F = N_ENTITY_FEATURES, Gl = N_GLOBAL_FEATURES;
+            auto obs = env.encode(0);
+            auto ent = obs.entities.to(torch::kCPU), glb = obs.globals.to(torch::kCPU);
+            auto entA = ent.accessor<float, 3>();
+            auto glbA = glb.accessor<float, 2>();
+            double maxfeat = 0, maxglob = 0;
+            long nbad = 0;
+            double maxf[64] = {0}, maxg[16] = {0};
+            const int ME = 40;  // canonical obs cap = GpuEnv g9 normalizer = submission max_entities
+            for (int b = 0; b < B; ++b) {
+                std::vector<float> rent((size_t)ME * F), rem(ME), ram(ME), rgl(Gl);
+                std::vector<long> rid(ME), rsh(ME);
+                encode_obs(cpu[b], 0, ME, rent.data(), rem.data(), ram.data(), rgl.data(),
+                           rid.data(), rsh.data(), cfg.episode_steps);
+                // GpuEnv fixed slot -> planet id (same comet-aware mapping as decode)
+                std::vector<long> slotPid(Ec, -1);
+                int nc = 0, cm = 0;
+                for (auto& p : cpu[b].planets) {
+                    bool isc = std::find(cpu[b].comet_planet_ids.begin(),
+                                         cpu[b].comet_planet_ids.end(),
+                                         p.id) != cpu[b].comet_planet_ids.end();
+                    int slot = isc ? (Ec - cfg.comet_slots + cm++) : (nc++);
+                    if (slot >= 0 && slot < Ec) slotPid[slot] = p.id;
+                }
+                for (int e = 0; e < Ec; ++e) {
+                    if (slotPid[e] < 0) continue;
+                    int r = -1;
+                    for (int rr = 0; rr < ME; ++rr)
+                        if (rid[rr] == slotPid[e]) { r = rr; break; }
+                    if (r < 0) continue;  // dropped by the reference top-N cap
+                    for (int f = 0; f < F; ++f) {
+                        double d = std::abs((double)entA[b][e][f] - (double)rent[(size_t)r * F + f]);
+                        if (d > maxfeat) maxfeat = d;
+                        if (d > maxf[f]) maxf[f] = d;
+                        if (d > 2e-3) ++nbad;
+                    }
+                }
+                for (int k = 0; k < Gl; ++k) {
+                    double d = std::abs((double)glbA[b][k] - (double)rgl[k]);
+                    maxglob = std::max(maxglob, d);
+                    if (d > maxg[k]) maxg[k] = d;
+                }
+            }
+            printf("ENCODE @ step %d: max |feature diff|=%.2e, max |global diff|=%.2e, elems>2e-3=%ld\n",
+                   t, maxfeat, maxglob, nbad);
+            printf("  per-feature max diff:");
+            for (int f = 0; f < F; ++f)
+                if (maxf[f] > 2e-3) printf(" f%d=%.2e", f, maxf[f]);
+            printf("\n  per-global  max diff:");
+            for (int k = 0; k < Gl; ++k)
+                if (maxg[k] > 2e-3) printf(" g%d=%.2e", k, maxg[k]);
+            printf("\n");
+        }
+
         std::vector<float> act((size_t)B * Ec * twoK);
         for (auto& v : act) v = (float)U(rng);
         auto act_t = torch::from_blob(act.data(), {B, Ec, twoK}, f32).clone().to(dev);
