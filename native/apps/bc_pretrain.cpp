@@ -153,7 +153,12 @@ int main(int argc, char** argv) try {
             auto a_alpha = act.index({Slice(), Slice(), Slice(0, None, 2)});  // (B,E,K)
             auto a_phi = act.index({Slice(), Slice(), Slice(1, None, 2)});    // (B,E,K)
 
-            auto phi_loss = torch::mse_loss(a_phi, tp_b);  // push committed->target, rest->0
+            // phi: BALANCED by the commit mask. ~3 of ~200 slots/sample are launches (target ~0.5)
+            // vs ~197 zeros; a plain mean(mse) is dominated by the zeros so the policy outputs phi~0
+            // everywhere (inert!). Average the committed and non-committed terms separately.
+            auto phi_commit = (cm_b * (a_phi - tp_b).pow(2)).sum() / (cm_b.sum() + 1e-6);
+            auto phi_zero = ((1.0 - cm_b) * a_phi.pow(2)).sum() / ((1.0 - cm_b).sum() + 1e-6);
+            auto phi_loss = phi_commit + 0.2 * phi_zero;
             auto ang_pred = a_alpha * TWO_PI, ang_tgt = ta_b * TWO_PI;
             auto dcos = torch::cos(ang_pred) - torch::cos(ang_tgt);
             auto dsin = torch::sin(ang_pred) - torch::sin(ang_tgt);
