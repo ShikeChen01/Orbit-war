@@ -242,14 +242,46 @@ void GpuEnv::launch_fleets(const Tensor& owner, const Tensor& from_slot, const T
     t_.f_seq = scatter_into(t_.f_seq, seq);
 }
 
+// Scripted opponent (player 1) as one launch per owned planet: half the garrison (floor), only if
+// >= min_ships(20). 0=random heading, 1=starter (nearest static non-owned planet), 2=noop. Mirrors
+// agents.hpp logic (random uses GPU RNG, so it is NOT bit-parity with the C++ RandomAgent; starter
+// is deterministic and parity-exact).
 void GpuEnv::opponent_action(int opponent, Tensor& angle, Tensor& ships, Tensor& commit) {
     const int B = B_, Ec = cfg_.planet_cap;
+    const double min_ships = 20.0;
     auto fo = torch::TensorOptions().dtype(torch::kFloat32).device(dev_);
     angle = torch::zeros({B, Ec}, fo);
     ships = torch::zeros({B, Ec}, fo);
     commit = torch::zeros({B, Ec}, fo);
     if (opponent == 2) return;  // noop / passive
-    TORCH_CHECK(false, "scripted opponent ", opponent, " not vectorized yet (next pass)");
+
+    Tensor half = torch::floor(t_.p_ships / 2.0);                                   // (B,Ec)
+    Tensor base = (t_.p_owner == 1.0) & (t_.p_alive > 0.5) & (half >= min_ships);   // (B,Ec)
+
+    if (opponent == 0) {  // random heading
+        angle = torch::rand({B, Ec}, fo) * (2.0 * kPI);
+        ships = torch::where(base, half, torch::zeros_like(half));
+        commit = base.to(torch::kFloat32);
+        return;
+    }
+    // opponent == 1: starter -- each owned planet fires at the nearest STATIC non-owned planet.
+    Tensor distc = torch::sqrt((t_.p_x - CENTER) * (t_.p_x - CENTER) +
+                               (t_.p_y - CENTER) * (t_.p_y - CENTER));              // (B,Ec)
+    Tensor is_static = (distc + t_.p_radius) >= ROTATION_RADIUS_LIMIT;
+    Tensor valid_tgt = is_static & (t_.p_alive > 0.5) & (t_.p_owner != 1.0);        // (B,Ec)
+    Tensor sx = t_.p_x.unsqueeze(2), sy = t_.p_y.unsqueeze(2);                      // (B,Ec,1) source
+    Tensor tx = t_.p_x.unsqueeze(1), ty = t_.p_y.unsqueeze(1);                      // (B,1,Ec) target
+    Tensor d = torch::sqrt((sx - tx) * (sx - tx) + (sy - ty) * (sy - ty));         // (B,Ec,Ec)
+    Tensor dmask = torch::where(valid_tgt.unsqueeze(1), d, torch::full_like(d, kBIG));
+    auto mn = dmask.min(2);
+    Tensor bestd = std::get<0>(mn);                 // (B,Ec)
+    Tensor bestidx = std::get<1>(mn);               // (B,Ec) nearest target slot
+    Tensor has_tgt = bestd < kBIG * 0.5;
+    Tensor btx = t_.p_x.gather(1, bestidx), bty = t_.p_y.gather(1, bestidx);
+    angle = torch::atan2(bty - t_.p_y, btx - t_.p_x);
+    Tensor go = base & has_tgt;
+    ships = torch::where(go, half, torch::zeros_like(half));
+    commit = go.to(torch::kFloat32);
 }
 
 // Batched mirror of encode.hpp::encode_obs for `ego`. Planets stay in fixed slots (no

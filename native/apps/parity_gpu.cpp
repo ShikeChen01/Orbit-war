@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "apps/cli.hpp"
+#include "core/agents.hpp"  // starter_agent
 #include "core/encode.hpp"  // decode_action_continuous
 #include "core/sim.hpp"
 #include "core/state.hpp"
@@ -46,6 +47,7 @@ int main(int argc, char** argv) try {
     double thr = a.f("act-threshold", 0.05);
     int dumpN = a.i("dump-steps", -1);  // dump env 0 detail for steps 0..dumpN (-1 = off)
     int encStep = a.i("encode-step", -1);  // compare GpuEnv::encode vs encode_obs at this step
+    int opp = a.i("opponent", 2);  // 1=starter (deterministic, parity-exact), 2=noop. (0=random N/A)
     uint64_t seed = (uint64_t)a.l("seed", 0);
 
     torch::Device dev(torch::kCUDA);
@@ -129,7 +131,7 @@ int main(int argc, char** argv) try {
         std::vector<float> act((size_t)B * Ec * twoK);
         for (auto& v : act) v = (float)U(rng);
         auto act_t = torch::from_blob(act.data(), {B, Ec, twoK}, f32).clone().to(dev);
-        env.step(act_t, /*opponent=*/2, thr);
+        env.step(act_t, opp, thr);
 
         for (int b = 0; b < B; ++b) {
             GameState& s = cpu[b];
@@ -150,7 +152,8 @@ int main(int argc, char** argv) try {
             int inv = 0;
             Action move0 = decode_action_continuous(act.data() + (size_t)b * Ec * twoK, am.data(),
                                                     rid.data(), rsh.data(), Ec, K, thr, &inv);
-            std::vector<Action> acts = {move0};  // opponent absent -> player 1 noop
+            std::vector<Action> acts = {move0};  // opp==2 noop: player 1 absent
+            if (opp == 1) acts.push_back(starter_agent(s, 1));  // deterministic, parity-exact
             ow::step(s, acts, econf);
             s.step += 1;
         }
