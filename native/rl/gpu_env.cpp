@@ -335,15 +335,17 @@ GpuEnv::Obs GpuEnv::encode(int ego) {
     Tensor slot = torch::arange(Ec, fo).view({1, Ec, 1});                              // (1,Ec,1)
     Tensor tgtf = ftgt.to(torch::kFloat32).unsqueeze(1);                               // (B,1,Fc)
     Tensor targeting = (tgtf == slot) & (ftgt >= 0).unsqueeze(1) & falive.unsqueeze(1);  // (B,Ec,Fc)
-    // Soonest group: plain eta (continuous, ties negligible). Largest group: composite float64 key
-    // |ships|*W - seq so equal-ship ties break by ascending launch order (f_seq), matching the
-    // reference stable_sort over s.fleets. W > max seq keeps |ships| dominant.
-    auto f64 = torch::TensorOptions().dtype(torch::kFloat64).device(dev_);
-    const double W = 1e6;
+    // Soonest group: plain eta. Largest group: float32 composite |ships|*W - seq (W=2^20 > max seq)
+    // so |ships| dominates and equal-ship ties favor earlier launch. NB: this is float32 on purpose
+    // -- the float64 version is parity-exact but FP64 is ~1/64 throughput on a consumer GPU and this
+    // is a (B,E,fleet_cap) key computed every step, so it dominated rollout time. In float32 the
+    // ships ordering stays exact; only the seq tie-break among equal-ship fleets loses resolution
+    // (perturbs which equal-ship fleet's ETA is shown -- negligible for training).
+    const double W = 1 << 20;
     Tensor eta_mat = torch::where(targeting, feta.unsqueeze(1), torch::full({1}, kBIG, fo));
-    Tensor abs64 = t_.f_ships.abs().to(torch::kFloat64).unsqueeze(1);                  // (B,1,Fc)
-    Tensor seq64 = t_.f_seq.to(torch::kFloat64).unsqueeze(1);
-    Tensor key_big = torch::where(targeting, abs64 * W - seq64, torch::full({1}, -kBIG, f64));
+    Tensor absf = t_.f_ships.abs().unsqueeze(1);                                       // (B,1,Fc)
+    Tensor seqf = t_.f_seq.unsqueeze(1);
+    Tensor key_big = torch::where(targeting, absf * W - seqf, torch::full({1}, -kBIG, fo));
     auto eta_top = torch::topk(eta_mat, N_SOON, 2, /*largest=*/false);
     auto big_top = torch::topk(key_big, N_BIG, 2, /*largest=*/true);
     Tensor idx = torch::cat({std::get<1>(eta_top), std::get<1>(big_top)}, 2);          // (B,Ec,7)

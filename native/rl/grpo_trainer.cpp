@@ -78,10 +78,15 @@ GrpoTrainer::UpdateStats GrpoTrainer::update(const TrajectoryBatch& tb) {
             auto adv = tb.advantage.index_select(0, mi).to(device_);
 
             auto sc = policy_.evaluate(ent, em, am, gl, act);
-            torch::Tensor reflp;  // reference log-prob of the (fixed) taken action -- no grad
-            { torch::NoGradGuard ng; reflp = reference_.evaluate(ent, em, am, gl, act).log_prob; }
             auto pol = policy_surrogate(sc.log_prob, oldlp, adv, cfg_.grpo.clip);
-            auto kl = kl_penalty(sc.log_prob, reflp);
+            // Skip the reference forward entirely when there is no KL anchor (kl_beta==0, e.g. from
+            // scratch) -- it was a full extra net forward per minibatch computed only to be * 0.
+            torch::Tensor kl = torch::zeros({}, sc.log_prob.options());
+            if (cfg_.grpo.kl_beta > 0.0) {
+                torch::NoGradGuard ng;
+                auto reflp = reference_.evaluate(ent, em, am, gl, act).log_prob;
+                kl = kl_penalty(sc.log_prob, reflp);
+            }
             // per-component entropy (scale-invariant in E,K) so ent_coef behaves like standard PPO
             // -- the raw sum over 400 components would otherwise swamp the policy gradient.
             auto ent_b = sc.entropy.mean() / (double)(E * twoK);
