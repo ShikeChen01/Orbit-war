@@ -14,7 +14,19 @@
 #include "rl/config.hpp"
 #include "rl/grpo_trainer.hpp"
 
-int main(int argc, char** argv) {
+#ifdef _WIN32
+// Force-load torch_cuda.dll so its static initializers register the CUDA backend (MSVC drops it
+// otherwise -- see native-cpp-build-toolchain memory). Without this .to(kCUDA) silently fails and
+// the trainer falls back to CPU. torch\lib must be on PATH (native\run.cmd does this).
+extern "C" __declspec(dllimport) void* __stdcall LoadLibraryA(const char*);
+#endif
+
+int main(int argc, char** argv) try {
+    setvbuf(stdout, nullptr, _IONBF, 0);  // unbuffered so output survives an abort
+#ifdef _WIN32
+    LoadLibraryA("c10_cuda.dll");
+    LoadLibraryA("torch_cuda.dll");
+#endif
     ow::Args a(argc, argv);
     std::string worlds = a.s("worlds", "runs/native/train.owp");
     std::string evalw = a.s("eval-worlds", "runs/native/eval.owp");
@@ -60,6 +72,10 @@ int main(int argc, char** argv) {
     cfg.rollout.enemy_growth_weight = a.f("enemy-growth-weight", 0.5);
     cfg.rollout.enemy_growth_warmup = a.i("enemy-growth-warmup", 50);
     cfg.rollout.enemy_growth_ema = a.f("enemy-growth-ema", 0.1);
+    // --- GPU-batched on-device rollout (the whole loop stays on the GPU) ---
+    cfg.rollout.gpu_env = a.i("gpu-env", 0) != 0;
+    cfg.rollout.planet_cap = a.i("planet-cap", 48);  // obs/action dim E (>= max planets + 4 comets)
+    cfg.rollout.fleet_cap = a.i("fleet-cap", 1024);
     cfg.total_steps = a.l("total-steps", 30'000'000);
     cfg.grpo.group_size = a.i("group-size", 8);
     cfg.grpo.num_groups = a.i("num-groups", 64);
@@ -82,4 +98,7 @@ int main(int argc, char** argv) {
     if (scratch) trainer.init_scratch(); else trainer.load_init(sd);
     trainer.train();
     return 0;
+} catch (const std::exception& e) {
+    fprintf(stderr, "EXCEPTION: %s\n", e.what());
+    return 2;
 }

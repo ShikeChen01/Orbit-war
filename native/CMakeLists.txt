@@ -43,7 +43,7 @@ set(OW_RL_SRC
 
 # GRPO trainer (grouped episodic rollout + group-relative update). The Python-free dev loop:
 #   edit -> native\build.cmd -> native\run.cmd ow_train_grpo --init-from scratch ...
-add_executable(ow_train_grpo apps/train_grpo.cpp ${OW_RL_SRC} rl/rollout.cpp rl/grpo_trainer.cpp)
+add_executable(ow_train_grpo apps/train_grpo.cpp ${OW_RL_SRC} rl/rollout.cpp rl/grpo_trainer.cpp rl/gpu_env.cpp)
 target_include_directories(ow_train_grpo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(ow_train_grpo PRIVATE torch_local)
 target_compile_options(ow_train_grpo PRIVATE /EHsc /bigobj /Zc:__cplusplus)

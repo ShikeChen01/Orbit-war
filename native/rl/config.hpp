@@ -63,6 +63,12 @@ struct GrpoConfig {
 // --- rollout / environment shaping reward ----------------------------------
 struct RolloutConfig {
     int episode_steps = 500;
+    // --- GPU-batched env (on-device rollout). gpu_env=true routes collect() through GpuEnv so the
+    // whole loop (encode->forward->step) stays on the GPU; the trajectory is offloaded to host. The
+    // obs/action dim E = planet_cap (>= max planets + 4 comet slots); fleet_cap bounds in-flight fleets.
+    bool gpu_env = false;
+    int planet_cap = 48;
+    int fleet_cap = 1024;
     double reward_scale = 50.0;   // divides the raw production-margin delta
     double reward_clip = 5.0;     // clamp on the per-step shaped reward
     double prod_weight = 20.0;    // production-margin weight in the potential

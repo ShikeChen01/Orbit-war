@@ -62,7 +62,7 @@ GrpoTrainer::UpdateStats GrpoTrainer::update(const TrajectoryBatch& tb) {
     if (mbsize == 0) return s;
     s.adv_mean = tb.advantage.mean().item<float>();
     s.adv_std = tb.advantage.std().item<float>();
-    const int E = cfg_.model.max_entities, twoK = cfg_.model.n_action_params();
+    const int E = (int)tb.entities.size(1), twoK = cfg_.model.n_action_params();  // E = actual obs dim
     const double kHalfLog2PiE = 1.4189385332046727;  // entropy const per component
     int nsteps = 0;
     for (int e = 0; e < cfg_.grpo.update_epochs; ++e) {
@@ -221,7 +221,8 @@ void GrpoTrainer::train() {
         }
         rollout_.set_stage(cur_stage_);
         RolloutStats rs;
-        auto tb = rollout_.collect(policy_, rs);
+        auto tb = cfg_.rollout.gpu_env ? rollout_.collect_gpu(policy_, rs)
+                                       : rollout_.collect(policy_, rs);
         auto us = update(tb);
         global_step_ += rs.transitions;
         iter_++;

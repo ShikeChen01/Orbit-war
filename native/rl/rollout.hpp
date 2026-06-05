@@ -5,6 +5,7 @@
 // advantage, and returns a flat TrajectoryBatch. (v1 opponents: random/starter. Self-play
 // policy opponents are a follow-up.)
 #pragma once
+#include <memory>
 #include <random>
 #include <vector>
 
@@ -12,6 +13,7 @@
 
 #include "core/state.hpp"
 #include "rl/config.hpp"
+#include "rl/gpu_env.hpp"
 #include "rl/model/agent.hpp"
 #include "rl/trajectory.hpp"
 
@@ -37,6 +39,10 @@ public:
     // on the fixed taken action, so deferring it avoids a per-step reference forward.)
     TrajectoryBatch collect(Agent& policy, RolloutStats& stats);
 
+    // GPU-batched variant: the entire encode->act->step loop runs on-device via GpuEnv; the
+    // trajectory is offloaded to host. Same TrajectoryBatch / reward scheme as collect().
+    TrajectoryBatch collect_gpu(Agent& policy, RolloutStats& stats);
+
     // Curriculum: the trainer sets the active stage each iteration (1 passive / 2 starter / 3 mix).
     // 0 means "use the static cfg.rollout.stage".
     void set_stage(int s) { cur_stage_ = s; }
@@ -48,6 +54,7 @@ private:
     std::vector<GameState> world_pool_;
     size_t cursor_ = 0;
     std::mt19937_64 rng_;
+    std::unique_ptr<GpuEnv> gpu_;  // lazily built on first collect_gpu (sized to B, planet_cap)
 };
 
 }  // namespace ow
