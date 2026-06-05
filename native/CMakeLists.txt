@@ -47,3 +47,9 @@ add_executable(ow_train_grpo apps/train_grpo.cpp ${OW_RL_SRC} rl/rollout.cpp rl/
 target_include_directories(ow_train_grpo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(ow_train_grpo PRIVATE torch_local)
 target_compile_options(ow_train_grpo PRIVATE /EHsc /bigobj /Zc:__cplusplus)
+
+# --- GPU-batched simulator (gpu_env) + its parity oracle vs the reference C++ ow::step ---------
+add_executable(ow_parity_gpu apps/parity_gpu.cpp rl/gpu_env.cpp)
+target_include_directories(ow_parity_gpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(ow_parity_gpu PRIVATE torch_local)
+target_compile_options(ow_parity_gpu PRIVATE /EHsc /bigobj /Zc:__cplusplus)
