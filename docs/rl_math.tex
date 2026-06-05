@@ -610,6 +610,64 @@ win rate $\geq$ \texttt{promote\_winrate}, so the policy never trains against a 
 itself.
 
 %==============================================================
+\section{Batched GPU simulator}\label{sec:gpuenv}
+The naive rollout is \emph{latency-bound}: each of the $T{\approx}500$ ticks is a strict chain
+\textsf{encode (CPU)} $\to$ \textsf{forward (GPU)} $\to$ \textsf{decode$+$step (CPU)} with a host
+$\leftrightarrow$ device transfer on either side of the forward, so the GPU sits idle ${\sim}70\%$
+of the time waiting on the CPU simulation. \texttt{GpuEnv} (\texttt{native/rl/gpu\_env.\{hpp,cpp\}},
+enabled by \texttt{RolloutConfig::gpu\_env}) instead runs the \emph{entire} game as batched
+LibTorch tensor ops on the GPU, so the whole loop --- encode, sample, decode, step, scripted
+opponent --- stays on-device. The deep-policy forward and the swept fleet/planet collision then
+dominate, making the loop \textbf{GPU-compute-bound} (observed $100\%$ SM utilization), not
+CPU- or transfer-bound. It uses \emph{pure} tensor ops (no custom CUDA kernel / toolkit).
+
+\paragraph{Layout (Structure-of-Arrays, leading batch $B$).} Planets live in $E_c=$
+\texttt{planet\_cap} \emph{fixed} slots (the last $4$ reserved for the at-most-one live comet
+group); fleets in a fixed pool of \texttt{fleet\_cap} slots with an \emph{alive} mask. Because the
+per-planet actor is permutation-equivariant (Section~\ref{sec:policy}), \textbf{no
+\textsf{entity\_order} sort is needed} --- row order is irrelevant, which removes the one operation
+that does not vectorize cleanly. So here $E=E_c$ (the obs/action dim), independent of the
+serving-time top-$40$ cap. Integer quantities (ships, production, owner, step) are kept in
+\texttt{float32} (exact $<2^{24}$).
+
+\paragraph{Vectorized dynamics.} The per-tick update mirrors the reference engine
+(\texttt{core/sim.hpp}) branch-free: orbital motion and production are elementwise; launches scatter
+into free fleet slots; the swept ray/disk collision is the $B\times\texttt{fleet\_cap}\times E_c$
+pairwise test (the heavy on-device compute). \emph{Combat needs no sort}: with exactly two players,
+arriving ships scatter-add per owner into $(B,E_c)$, then top/second/survivor are elementwise
+(the reference's stable-sort/first-seen order only matters for ${>}2$ owners). Comets are a baked
+per-env schedule (spawn step, ships, precomputed path positions) overlaid each tick. The threat
+encoder (Section~\ref{sec:threat}) breaks equal-ship ties by a per-fleet \emph{launch-order} stamp
+to match the reference's \texttt{stable\_sort} over the fleet list.
+
+\paragraph{Parity.} \texttt{GpuEnv} is a third engine and must implement the same rules as the
+C++ \texttt{ow::step} that is also the Kaggle submission engine. \texttt{apps/parity\_gpu} drives
+both from identical states/actions and compares per-env aggregates: the deterministic core is
+\textbf{bit-exact} ($64$ envs $\times$ many ticks), the observation encoder is parity-exact (max
+feature diff ${\sim}10^{-6}$), the \texttt{starter} opponent is bit-exact, and full episodes with
+comets stay $\ge 90\%$ exact, the residual being benign \texttt{float32}-vs-\texttt{float64}
+boundary flips in marginal collisions (a training-time fidelity choice, not a logic error).
+
+\paragraph{On-device rollout, host-offloaded trajectory.} \texttt{GroupedRollout::collect\_gpu}
+keeps the loop on-device but copies each step's $(\,$obs, action, log-prob$\,)$ to \emph{pinned} host
+buffers with non-blocking transfers, so VRAM holds only the model, the current step's working set,
+and the collision intermediate --- bounded in $T$ and $B$, i.e.\ \textbf{not memory-bound}. The
+reward channels (Section~\ref{sec:reward}, bounded variant), terminal test, and group advantage are
+computed on-device; valid transitions then flatten into the same host \texttt{TrajectoryBatch} the
+CPU path produces, so the GRPO update (Section~\ref{sec:grpo}) is unchanged and streams minibatches
+back to the GPU. Within a group all envs share one $(\text{world},\text{opponent})$ so the group
+baseline stays valid; the opponent is uniform across the batch per iteration.
+
+\paragraph{Deep-net numerical stability.} Summing the squashed-Gaussian log-prob over $E\cdot 2K$
+components makes a deep, from-scratch policy prone to blow-ups: an extreme $\mu$ with a saturated
+sample (latent $z$ far from $\mu$) over a tiny $\sigma^2$ produces a huge \texttt{logN}, hence an
+exploding step and $\exp(\text{logp}-\text{old})\to\infty$. The trainer guards this with a tight
+log-std range $[\varsigma_{\min},\varsigma_{\max}]=[-2,1]$, a clamp on $\mu$ inside the density (the
+saturated region is unchanged), a clamp on the log-ratio before $\exp$, a $[-10,10]$ clamp on the
+whitened advantage (a near-degenerate group otherwise explodes it), and skipping any optimizer step
+whose gradient norm is non-finite.
+
+%==============================================================
 \section{Symbols $\leftrightarrow$ \texttt{config.hpp}}
 \begin{center}\small
 \begin{tabular}{@{}lll@{}}
@@ -621,7 +679,7 @@ $E$ & \texttt{ModelConfig::max\_entities} & $40$ \\
 $K$ & \texttt{ModelConfig::fleets\_per\_planet} & $5$ \\
 $\tau_{\mathrm{act}}$ & \texttt{ModelConfig::act\_threshold} (fleet-commit) & $0.05$ \\
 \texttt{use\_glu} & \texttt{ModelConfig::use\_glu} (trunk A/B), $n_{\mathrm{res}}$ & true,\ $2$ \\
-$[\varsigma_{\min},\varsigma_{\max}]$ & \texttt{ModelConfig} log-std clip & $[-5,\ 2]$ \\
+$[\varsigma_{\min},\varsigma_{\max}]$ & \texttt{ModelConfig} log-std clip & $[-2,\ 1]$ \\
 \texttt{std\_state\_dependent} & \texttt{ModelConfig} (\(\varsigma\) head vs vector) & true \\
 $G,\,N$ & \texttt{GrpoConfig::group\_size}, \texttt{num\_groups} & $8,\ 64$ \\
 $\epsilon$ & \texttt{GrpoConfig::clip} & $0.2$ \\
@@ -630,13 +688,15 @@ $c_{\mathcal H}$ & \texttt{GrpoConfig::ent\_coef} & $0.01$ \\
 $\varepsilon$ & \texttt{GrpoConfig::adv\_eps} & $10^{-4}$ \\
 $w_{\mathrm d},\,w_{\mathrm o}$ & \texttt{GrpoConfig::dense\_weight}, \texttt{outcome\_weight} & $1,\ 1$ \\
 $\gamma$ & \texttt{GrpoConfig::gamma} & $1.0$ \\
-$w_{\Pi}$ & \texttt{RolloutConfig::prod\_reward\_weight} & $10$ \\
-$\rho$ & \texttt{RolloutConfig::illegal\_launch\_penalty} & $1.0$ \\
-$w_{\mathrm e}$ & \texttt{RolloutConfig::enemy\_growth\_weight} & $5.0$ \\
-$x_0,\,\beta$ & \texttt{RolloutConfig::enemy\_growth\_warmup}, \texttt{\_ema} & $50,\ 0.1$ \\
-\texttt{loss\_forfeit} & \texttt{RolloutConfig::loss\_forfeit} & true \\
-$\sigma,\,\kappa$ & \texttt{RolloutConfig::reward\_scale}, \texttt{reward\_clip} & $50,\ 5$ \\
+$w_{\Pi},\,P_{\max}$ & \texttt{prod\_reward\_weight}, \texttt{prod\_reward\_cap} & $2.5,\ 200$ \\
+$w_{\mathrm v},\,V_{\max}$ & \texttt{valid\_launch\_reward}, \texttt{valid\_reward\_cap} & $0.02,\ 30$ \\
+$\rho$ & \texttt{illegal\_launch\_penalty} (uncapped $I$) & $0.005$ \\
+win/loss & \texttt{win\_bonus}, \texttt{loss\_penalty} (stage\,$\ge$\,2) & $300,\ 100$ \\
+$w_{\mathrm e}$ & \texttt{enemy\_growth\_weight} & $0.5$ \\
+$x_0,\,\beta$ & \texttt{enemy\_growth\_warmup}, \texttt{enemy\_growth\_ema} & $50,\ 0.1$ \\
 stage & \texttt{RolloutConfig::stage} & $2$ \\
+\texttt{gpu\_env} & \texttt{RolloutConfig} (on-device rollout, Section~\ref{sec:gpuenv}) & false \\
+$E_c$ & \texttt{RolloutConfig::planet\_cap}, \texttt{fleet\_cap} & $48,\ 1024$ \\
 \texttt{N\_SOON}, \texttt{N\_BIG} & per-planet inbound fleets: soonest / largest (\texttt{encode.hpp}) & $2,\ 5$ \\
 $d_g$ & board-globals embedding dim (\texttt{ModelConfig}) & $32$ \\
 $\eta$ & \texttt{OptimConfig::lr} & $3\!\times\!10^{-4}$ \\

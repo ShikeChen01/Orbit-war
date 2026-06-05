@@ -17,18 +17,25 @@
 \contentsline {paragraph}{Production-only dense reward $+$ invalid-dispatch penalty.}{7}{section*.13}%
 \contentsline {paragraph}{Enemy-suppression term (relative to the enemy's own recent growth).}{8}{section*.14}%
 \contentsline {paragraph}{Outcome, the draw anchor, and the loss forfeit.}{8}{section*.15}%
-\contentsline {paragraph}{Note --- 2p vs.\ 4p objective.}{8}{section*.16}%
-\contentsline {section}{\numberline {6}Curriculum}{8}{section.6}%
-\contentsline {paragraph}{Stage 1 --- solo expansion (passive opponent).}{9}{section*.17}%
-\contentsline {paragraph}{Stage 2 --- $1$v$1$ vs.\ starter.}{9}{section*.18}%
-\contentsline {paragraph}{Stage 3 --- mixed opponents.}{9}{section*.19}%
+\contentsline {paragraph}{Implemented bounded variant (current default).}{8}{section*.16}%
+\contentsline {paragraph}{Note --- 2p vs.\ 4p objective.}{9}{section*.17}%
+\contentsline {section}{\numberline {6}Curriculum}{9}{section.6}%
+\contentsline {paragraph}{Stage 1 --- solo expansion (passive opponent).}{9}{section*.18}%
+\contentsline {paragraph}{Stage 2 --- $1$v$1$ vs.\ starter.}{9}{section*.19}%
+\contentsline {paragraph}{Stage 3 --- mixed opponents.}{9}{section*.20}%
 \contentsline {section}{\numberline {7}GRPO update}{9}{section.7}%
-\contentsline {subsection}{\numberline {7.1}Grouped sampling}{9}{subsection.7.1}%
-\contentsline {subsection}{\numberline {7.2}Group-relative advantage (no critic)}{9}{subsection.7.2}%
+\contentsline {subsection}{\numberline {7.1}Grouped sampling}{10}{subsection.7.1}%
+\contentsline {subsection}{\numberline {7.2}Group-relative advantage (no critic)}{10}{subsection.7.2}%
 \contentsline {subsection}{\numberline {7.3}Clipped policy surrogate}{10}{subsection.7.3}%
 \contentsline {subsection}{\numberline {7.4}KL anchor to a reference policy}{10}{subsection.7.4}%
-\contentsline {subsection}{\numberline {7.5}Total objective}{10}{subsection.7.5}%
-\contentsline {subsection}{\numberline {7.6}Optimization}{10}{subsection.7.6}%
-\contentsline {section}{\numberline {8}Self-play league}{10}{section.8}%
-\contentsline {section}{\numberline {9}Symbols $\leftrightarrow $ \texttt {config.hpp}}{11}{section.9}%
-\contentsline {section}{\numberline {A}Appendix: the PPO/GAE method being replaced}{11}{appendix.A}%
+\contentsline {subsection}{\numberline {7.5}Total objective}{11}{subsection.7.5}%
+\contentsline {subsection}{\numberline {7.6}Optimization}{11}{subsection.7.6}%
+\contentsline {section}{\numberline {8}Self-play league}{11}{section.8}%
+\contentsline {section}{\numberline {9}Batched GPU simulator}{11}{section.9}%
+\contentsline {paragraph}{Layout (Structure-of-Arrays, leading batch $B$).}{11}{section*.21}%
+\contentsline {paragraph}{Vectorized dynamics.}{11}{section*.22}%
+\contentsline {paragraph}{Parity.}{12}{section*.23}%
+\contentsline {paragraph}{On-device rollout, host-offloaded trajectory.}{12}{section*.24}%
+\contentsline {paragraph}{Deep-net numerical stability.}{12}{section*.25}%
+\contentsline {section}{\numberline {10}Symbols $\leftrightarrow $ \texttt {config.hpp}}{13}{section.10}%
+\contentsline {section}{\numberline {A}Appendix: the PPO/GAE method being replaced}{13}{appendix.A}%
