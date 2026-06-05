@@ -34,9 +34,9 @@ PolicyNetImpl::PolicyNetImpl(const ModelConfig& c) : cfg(c), twoK(2 * c.fleets_p
         // strongly negative phi bias (sigmoid(-5)=0.0067 << tau_act) keeps almost nothing committed
         // at init; the policy then LEARNS to raise phi on owned planets. phi = odd (alpha,phi) comps.
         torch::NoGradGuard ng;
-        mu_head->weight.mul_(0.01);
+        mu_head->weight.mul_(c.init_mu_scale);
         mu_head->bias.zero_();
-        for (int k = 0; k < c.fleets_per_planet; ++k) mu_head->bias[2 * k + 1].fill_(-5.0);
+        for (int k = 0; k < c.fleets_per_planet; ++k) mu_head->bias[2 * k + 1].fill_(c.init_phi_bias);
     }
     if (c.std_state_dependent) {
         logstd_head = register_module("logstd_head", torch::nn::Linear(h + dg, twoK));

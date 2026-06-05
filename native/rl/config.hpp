@@ -30,6 +30,11 @@ struct ModelConfig {
     double act_threshold = 0.05;  // tau_act: a fleet is "committed" when phi >= this
     double logstd_min = -2.0, logstd_max = 1.0;  // [varsigma_min, varsigma_max] clip on log-std
                                                  // (tight range keeps deep-net log-prob stable)
+    // Calm init: scale the final (mu) layer so outputs start ~= bias regardless of the deep trunk,
+    // and bias phi negative so few slots commit at init. LESS calm (smaller |bias|, larger scale)
+    // = more initial commits = more mistakes to learn from; TOO calm = inert, learns nothing.
+    double init_mu_scale = 0.02;   // mu_head weight multiplier at init
+    double init_phi_bias = -4.0;   // mu_head phi-bias at init (sigmoid(-4)=0.018; w/ sigma=1 ~14% commit)
 
     int n_action_params() const { return 2 * fleets_per_planet; }  // 2K continuous controls/planet
 };

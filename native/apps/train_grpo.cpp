@@ -56,6 +56,8 @@ int main(int argc, char** argv) try {
     cfg.model.act_threshold = a.f("act-threshold", 0.05);                 // tau_act
     cfg.model.logstd_min = a.f("logstd-min", -2.0);
     cfg.model.logstd_max = a.f("logstd-max", 1.0);
+    cfg.model.init_mu_scale = a.f("init-mu-scale", 0.02);  // policy "calmness" at init (tunable)
+    cfg.model.init_phi_bias = a.f("init-phi-bias", -4.0);  // less negative = less calm = more commits
     // --- reward ---
     cfg.rollout.stage = a.i("stage", 2);  // fixed stage when curriculum is off
     // 3-stage curriculum auto-ramp within the run (on by default): passive -> starter -> mix
