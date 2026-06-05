@@ -446,6 +446,34 @@ trajectory built without converting it to a win, the worse it scores --- directl
 ``maximize my own production yet lose,'' which earlier shaped rewards failed to discourage. Setting
 \texttt{loss\_forfeit}=false recovers a plain additive $R_i=w_{\mathrm o}(o_i+1)+w_{\mathrm d}D_i$.
 
+\paragraph{Implemented bounded variant (current default).} The shipped reward
+(\texttt{RolloutConfig}, used identically by the CPU and the GPU rollouts of
+Section~\ref{sec:gpuenv}) replaces the loss-forfeit return above with a \emph{smooth, bounded}
+per-game form: each channel is accumulated with the discount over the episode and then capped, and
+the outcome is an \emph{explicit fixed bonus} rather than a forfeit, so a single decisive game can no
+longer swing the return arbitrarily far. With per-game channels
+\begin{align*}
+P &= \clip\!\Big(\textstyle\sum_t \gamma^t\,w_{\Pi}\,\Delta\Pi_0(t),\ -P_{\max},\,P_{\max}\Big),
+  &P_{\max}&=\texttt{prod\_reward\_cap}=200,\\
+V &= \clip\!\Big(\textstyle\sum_t \gamma^t\,w_{\mathrm v}\,v_t,\ 0,\ V_{\max}\Big),
+  &V_{\max}&=\texttt{valid\_reward\_cap}=30,\\
+I &= \textstyle\sum_t \gamma^t\,\rho\,x_t\ \ (\text{uncapped}), \qquad
+S = -\textstyle\sum_{t\ge x_0}\gamma^t\,w_{\mathrm e}\,y_t\ \ (\text{stage}\ge 2),
+\end{align*}
+the return is
+\begin{equation}
+R_i = O_i + P_i + V_i - I_i + S_i,\qquad
+O_i=\begin{cases}+\,\texttt{win\_bonus}\,(300), & \text{win},\\ -\,\texttt{loss\_penalty}\,(100), & \text{loss},\\ 0,&\text{draw},\end{cases}
+\end{equation}
+where $O_i$ is applied \textbf{only at stage}\,$\ge 2$ (Stage~1 is pure $P+V-I+S$, no win/loss
+signal). Here $v_t$ is the number of \emph{committed} ego launches whose straight-line heading
+actually \emph{lands on a planet} --- the same closed-form ray-vs-disk projection (with sun
+occlusion) used for the threat features in Section~\ref{sec:threat}, evaluated at the launch point
+$p+\hat{\mathbf d}(r_p+0.1)$. This $V$ term is a deliberate, bounded \emph{gradient on aiming} and so
+\emph{supersedes} the ``no shaping on where a launch is aimed'' statement above: in practice it was
+needed to escape the passive basin (the policy must discover that raising $\phi$ on owned planets
+toward a real target is rewarded, not merely penalized for illegality).
+
 \paragraph{Note --- 2p vs.\ 4p objective.} The margin potential $\Phi$ and the outcome $o_i$ are
 the two-player ($N=2$) zero-sum forms. In $N=4$ free-for-all the objective is \emph{ordinal} ---
 be the maximum of four --- which is not zero-sum: e.g.\ $\Phi$ would become

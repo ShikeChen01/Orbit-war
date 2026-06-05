@@ -89,8 +89,9 @@ GrpoTrainer::UpdateStats GrpoTrainer::update(const TrajectoryBatch& tb) {
 
             opt_->zero_grad();
             loss.backward();
-            torch::nn::utils::clip_grad_norm_(policy_.net->parameters(), cfg_.optim.max_grad_norm);
-            opt_->step();
+            double gnorm = torch::nn::utils::clip_grad_norm_(policy_.net->parameters(),
+                                                             cfg_.optim.max_grad_norm);
+            if (std::isfinite(gnorm)) opt_->step();  // skip a poisoned (non-finite) gradient step
 
             torch::NoGradGuard ng;
             auto ratio = torch::exp(sc.log_prob - oldlp);

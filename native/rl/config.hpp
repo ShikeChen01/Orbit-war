@@ -28,7 +28,8 @@ struct ModelConfig {
     bool std_state_dependent = true;  // exploration A/B: log-std from a head (true) vs a shared
                                       // learnable vector (false, "stable" global exploration)
     double act_threshold = 0.05;  // tau_act: a fleet is "committed" when phi >= this
-    double logstd_min = -5.0, logstd_max = 2.0;  // [varsigma_min, varsigma_max] clip on log-std
+    double logstd_min = -2.0, logstd_max = 1.0;  // [varsigma_min, varsigma_max] clip on log-std
+                                                 // (tight range keeps deep-net log-prob stable)
 
     int n_action_params() const { return 2 * fleets_per_planet; }  // 2K continuous controls/planet
 };

@@ -257,7 +257,9 @@ TrajectoryBatch GroupedRollout::collect_gpu(Agent& policy, RolloutStats& stats) 
     gpu_->reset(st);
 
     auto fo = torch::TensorOptions().dtype(kF).device(device_);
-    auto cpuf = torch::TensorOptions().dtype(kF);
+    // Pinned host buffers so the per-step D2H offload is async (non_blocking) and does not stall the
+    // CPU from enqueuing the next step's kernels -- keeps the GPU fed (compute-bound, not transfer).
+    auto cpuf = torch::TensorOptions().dtype(kF).pinned_memory(device_.is_cuda());
     auto ent_buf = torch::zeros({T, B, Ec, F}, cpuf), em_buf = torch::zeros({T, B, Ec}, cpuf),
          am_buf = torch::zeros({T, B, Ec}, cpuf), gl_buf = torch::zeros({T, B, Gl}, cpuf),
          act_buf = torch::zeros({T, B, Ec, twoK}, cpuf), oldlogp_buf = torch::zeros({T, B}, cpuf),
@@ -286,13 +288,13 @@ TrajectoryBatch GroupedRollout::collect_gpu(Agent& policy, RolloutStats& stats) 
         last_t = t;
         auto obs = gpu_->encode(0);
         auto dec = policy.act(obs.entities, obs.entity_mask, obs.action_mask, obs.globals, false);
-        ent_buf[t].copy_(obs.entities);
-        em_buf[t].copy_(obs.entity_mask);
-        am_buf[t].copy_(obs.action_mask);
-        gl_buf[t].copy_(obs.globals);
-        act_buf[t].copy_(dec.action);
-        oldlogp_buf[t].copy_(dec.log_prob);
-        valid_buf[t].copy_(active);  // keep this transition iff the env was active before stepping
+        ent_buf[t].copy_(obs.entities, /*non_blocking=*/true);
+        em_buf[t].copy_(obs.entity_mask, true);
+        am_buf[t].copy_(obs.action_mask, true);
+        gl_buf[t].copy_(obs.globals, true);
+        act_buf[t].copy_(dec.action, true);
+        oldlogp_buf[t].copy_(dec.log_prob, true);
+        valid_buf[t].copy_(active, true);  // keep this transition iff the env was active before stepping
 
         auto out = gpu_->step(dec.action, opp, act_thr);
         Tensor a = active;
@@ -332,6 +334,7 @@ TrajectoryBatch GroupedRollout::collect_gpu(Agent& policy, RolloutStats& stats) 
                      .floor_divide(G);  // int64 group id (plain / would true-divide to float)
     Tensor adv_env = group_advantage(R, gid, N, cfg_.grpo.adv_eps, cfg_.grpo.whiten_advantage);
 
+    if (device_.is_cuda()) torch::cuda::synchronize();  // ensure all async D2H offloads landed
     int Tu = last_t + 1;
     Tensor keep = valid_buf.narrow(0, 0, Tu).reshape({-1}).nonzero().squeeze(-1);
     Tensor adv_full = adv_env.to(torch::kCPU).unsqueeze(0).expand({Tu, B}).reshape({-1});

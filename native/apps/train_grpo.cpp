@@ -54,8 +54,8 @@ int main(int argc, char** argv) try {
     cfg.model.use_glu = a.i("use-glu", 1) != 0;                           // trunk A/B
     cfg.model.std_state_dependent = a.i("std-state-dependent", 1) != 0;   // exploration A/B
     cfg.model.act_threshold = a.f("act-threshold", 0.05);                 // tau_act
-    cfg.model.logstd_min = a.f("logstd-min", -5.0);
-    cfg.model.logstd_max = a.f("logstd-max", 2.0);
+    cfg.model.logstd_min = a.f("logstd-min", -2.0);
+    cfg.model.logstd_max = a.f("logstd-max", 1.0);
     // --- reward ---
     cfg.rollout.stage = a.i("stage", 2);  // fixed stage when curriculum is off
     // 3-stage curriculum auto-ramp within the run (on by default): passive -> starter -> mix

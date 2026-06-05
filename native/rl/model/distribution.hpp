@@ -28,7 +28,11 @@ public:
     torch::Tensor log_prob(const torch::Tensor& a) const {
         auto ac = a.clamp(1e-6, 1.0 - 1e-6);
         auto z = torch::log(ac) - torch::log1p(-ac);            // logit(a) recovers the latent z
-        auto logN = -0.5 * (z - mean_).pow(2) / (std_ * std_)   // log N(z; mu, sigma^2)
+        // clamp mean in the density: |mean|>15 already saturates sigmoid(mean) to ~0/1, so this
+        // leaves the action distribution effectively unchanged but bounds (z-mean)^2 (and its
+        // gradient) when a deep net momentarily emits an extreme mean -- keeps log-prob finite.
+        auto mu = mean_.clamp(-15.0, 15.0);
+        auto logN = -0.5 * (z - mu).pow(2) / (std_ * std_)      // log N(z; mu, sigma^2)
                     - logstd_ - 0.5 * kLog2Pi;
         auto logjac = torch::log(ac) + torch::log1p(-ac);       // log|da/dz| = log(a(1-a))
         return (logN - logjac).sum(2).sum(1);
