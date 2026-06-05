@@ -262,15 +262,58 @@ GpuEnv::Obs GpuEnv::encode(int ego) {
 GpuEnv::StepOut GpuEnv::step(const Tensor& ego_action, int opponent, double act_threshold) {
     const int B = B_, Ec = cfg_.planet_cap, Fc = cfg_.fleet_cap;
     const int K = (int)(ego_action.size(2) / 2);
+    const int Cs = cfg_.comet_slots, Ev = (int)t_.c_path.size(1), Lmax = (int)t_.c_path.size(3);
     const double vmax = cfg_.ship_speed;
     auto fo = torch::TensorOptions().dtype(torch::kFloat32).device(dev_);
+    auto lo = torch::TensorOptions().dtype(torch::kLong).device(dev_);
     const int ego = 0, enemy = 1;
+    const auto cslice = Slice(Ec - Cs, Ec);  // reserved comet planet slots
 
     Tensor prod_ego0 = (t_.p_prod * (t_.p_owner == (double)ego) * (t_.p_alive > 0.5)).sum(1);
     Tensor prod_enemy0 = (t_.p_prod * (t_.p_owner == (double)enemy) * (t_.p_alive > 0.5)).sum(1);
 
-    // (comet expiration + spawn + path movement are added in the next pass; pre-comet steps,
-    //  where both engines must agree bit-for-bit, are validated first.)
+    // --- comet TOP-expiration (ow::step lines 409-429): remove comets whose path index (from the
+    //     previous tick) has run off the end. For the symmetric equal-length paths here this is
+    //     usually a no-op (the post-move expiry below already removed them), kept for fidelity. ---
+    {
+        Tensor active = t_.c_active >= 0;                                          // (B,)
+        Tensor ev = t_.c_active.clamp_min(0).to(torch::kLong);                     // (B,)
+        Tensor cplen = t_.c_path_len.gather(1, ev.view({B, 1, 1}).expand({B, 1, Cs})).squeeze(1);
+        Tensor expired = active.unsqueeze(1) & (t_.c_index.unsqueeze(1) >= cplen);  // (B,Cs)
+        Tensor cs_alive = t_.p_alive.index({Slice(), cslice});
+        cs_alive = torch::where(expired, torch::zeros_like(cs_alive), cs_alive);
+        t_.p_alive.index_put_({Slice(), cslice}, cs_alive);
+        Tensor still = (cs_alive > 0.5).any(1);  // (B,)
+        t_.c_active = torch::where(active & (~still), torch::full_like(t_.c_active, -1), t_.c_active);
+    }
+
+    // --- comet spawn (ow::step lines 431-474): when step+1 hits the next scheduled spawn, write the
+    //     4 reserved slots as neutral comets at the off-board placeholder (-99,-99); the movement
+    //     block advances them onto path[0] this same tick. ---
+    {
+        Tensor nev = t_.c_next_ev.clamp(0, Ev - 1).to(torch::kLong);              // (B,)
+        Tensor spawn_step = t_.c_spawn_step.gather(1, nev.unsqueeze(1)).squeeze(1);
+        Tensor ev_ships = t_.c_ships.gather(1, nev.unsqueeze(1)).squeeze(1);
+        Tensor fire = (t_.c_next_ev < Ev) & ((t_.step + 1) == spawn_step);        // (B,)
+        Tensor fb = fire.unsqueeze(1);                                            // (B,1)
+        auto put = [&](torch::Tensor& field, const Tensor& val) {
+            field.index_put_({Slice(), cslice},
+                             torch::where(fb, val, field.index({Slice(), cslice})));
+        };
+        Tensor ones_cs = torch::ones({B, Cs}, fo), zeros_cs = torch::zeros({B, Cs}, fo);
+        put(t_.p_alive, ones_cs);
+        put(t_.p_owner, torch::full({B, Cs}, -1.0, fo));
+        put(t_.p_ships, ev_ships.unsqueeze(1).expand({B, Cs}));
+        put(t_.p_prod, torch::full({B, Cs}, (double)COMET_PRODUCTION, fo));
+        put(t_.p_radius, torch::full({B, Cs}, COMET_RADIUS, fo));
+        put(t_.p_is_comet, ones_cs);
+        put(t_.p_x, torch::full({B, Cs}, -99.0, fo));
+        put(t_.p_y, torch::full({B, Cs}, -99.0, fo));
+        put(t_.p_rotates, zeros_cs);
+        t_.c_active = torch::where(fire, t_.c_next_ev, t_.c_active);
+        t_.c_index = torch::where(fire, torch::full_like(t_.c_index, -1), t_.c_index);
+        t_.c_next_ev = torch::where(fire, t_.c_next_ev + 1, t_.c_next_ev);
+    }
 
     // --- decode ego action (mirror decode_action_continuous), sequential per-planet budget ---
     Tensor legal = (t_.p_owner == (double)ego) & (t_.p_alive > 0.5) & (t_.p_ships > 0.0);  // (B,Ec)
@@ -356,6 +399,27 @@ GpuEnv::StepOut GpuEnv::step(const Tensor& ego_action, int opponent, double act_
     Tensor ny = torch::where(rot, CENTER + r * torch::sin(ca), t_.p_y);
     Tensor old_px = t_.p_x, old_py = t_.p_y;  // swept-collision uses old->new planet path
 
+    // comet path movement (ow::step lines 519-566): advance the live group's path index and place
+    // each comet at path[idx]; an index past the path end keeps the old pos (stationary) and is
+    // flagged expired -> removed AFTER collision (so it still collides this tick, like the ref).
+    Tensor comet_expired = torch::zeros({B, Cs}, torch::TensorOptions().dtype(torch::kBool).device(dev_));
+    {
+        Tensor active = t_.c_active >= 0;                       // (B,)
+        Tensor ev = t_.c_active.clamp_min(0).to(torch::kLong);  // (B,)
+        Tensor idx_new = t_.c_index + 1;                        // (B,) int32
+        Tensor evx = ev.view({B, 1, 1, 1, 1}).expand({B, 1, Cs, Lmax, 2});
+        Tensor cp_ev = t_.c_path.gather(1, evx).squeeze(1);    // (B,Cs,Lmax,2)
+        Tensor idxc = idx_new.clamp(0, Lmax - 1).to(torch::kLong).view({B, 1, 1, 1}).expand({B, Cs, 1, 2});
+        Tensor cpos = cp_ev.gather(2, idxc).squeeze(2);        // (B,Cs,2)
+        Tensor cplen = t_.c_path_len.gather(1, ev.view({B, 1, 1}).expand({B, 1, Cs})).squeeze(1);
+        Tensor within = active.unsqueeze(1) & (idx_new.unsqueeze(1) < cplen);  // (B,Cs)
+        Tensor curx = nx.index({Slice(), cslice}), cury = ny.index({Slice(), cslice});
+        nx.index_put_({Slice(), cslice}, torch::where(within, cpos.index({Slice(), Slice(), 0}), curx));
+        ny.index_put_({Slice(), cslice}, torch::where(within, cpos.index({Slice(), Slice(), 1}), cury));
+        t_.c_index = torch::where(active, idx_new, t_.c_index);
+        comet_expired = active.unsqueeze(1) & (idx_new.unsqueeze(1) >= cplen);  // (B,Cs) removed below
+    }
+
     // --- fleet movement + swept collision against planet paths (the big GPU compute) ---
     Tensor falive = t_.f_alive > 0.5;                       // (B,Fc)
     Tensor speed = fleet_speed_t(t_.f_ships, vmax);         // (B,Fc)
@@ -382,7 +446,9 @@ GpuEnv::StepOut GpuEnv::step(const Tensor& ego_action, int opponent, double act_
     Tensor hit_quad = (disc >= 0.0) & (t2 >= 0.0) & (t1 <= 1.0);
     Tensor hit_lin = (a < 1e-12) & (c <= 0.0);
     Tensor hit = torch::where(a < 1e-12, hit_lin, hit_quad);   // (B,Fc,Ec)
-    hit = hit & palive & falive.unsqueeze(2);
+    // ow::step `check` flag: a comet on its first (off-board, x=-99) placement does not collide.
+    Tensor pcheck = (t_.p_is_comet.unsqueeze(1) < 0.5) | (old_px.unsqueeze(1) >= 0.0);  // (B,1,Ec)
+    hit = hit & palive & pcheck & falive.unsqueeze(2);
 
     // first hit = smallest planet slot index that is hit (matches sim.hpp planet-order break).
     Tensor slotf = torch::arange(Ec, fo).view({1, 1, Ec});
@@ -406,6 +472,17 @@ GpuEnv::StepOut GpuEnv::step(const Tensor& ego_action, int opponent, double act_
     Tensor remove_fleet = falive & (has_hit | oob | sun_hit);
     // a fleet that hits is the only one contributing to combat; OOB/sun ones just vanish.
     Tensor contributes = falive & has_hit;
+
+    // --- remove comets that ran off their path this tick (ow::step lines 617-631), BEFORE combat
+    //     so a just-expired comet takes no combat (its slot is no longer alive). ---
+    {
+        Tensor cs_alive = t_.p_alive.index({Slice(), cslice});
+        cs_alive = torch::where(comet_expired, torch::zeros_like(cs_alive), cs_alive);
+        t_.p_alive.index_put_({Slice(), cslice}, cs_alive);
+        Tensor active = t_.c_active >= 0;
+        Tensor still = (cs_alive > 0.5).any(1);
+        t_.c_active = torch::where(active & (~still), torch::full_like(t_.c_active, -1), t_.c_active);
+    }
 
     // --- combat: scatter arriving ships per owner into (B,Ec), then elementwise resolve ---
     Tensor arr0 = torch::zeros({B, Ec}, fo);

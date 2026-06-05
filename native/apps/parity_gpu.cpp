@@ -76,13 +76,19 @@ int main(int argc, char** argv) try {
 
         for (int b = 0; b < B; ++b) {
             GameState& s = cpu[b];
+            // Map planets to GpuEnv's FIXED slots: non-comets fill [0..), comets fill the reserved
+            // tail [Ec-Cs, Ec) -- so the same action column drives the same planet on both engines.
             std::vector<long> rid(Ec, -1), rsh(Ec, 0);
             std::vector<float> am(Ec, 0.f);
-            int n = std::min((int)s.planets.size(), Ec);
-            for (int e = 0; e < n; ++e) {
-                rid[e] = s.planets[e].id;
-                rsh[e] = s.planets[e].ships;
-                am[e] = (s.planets[e].owner == 0 && s.planets[e].ships > 0) ? 1.f : 0.f;
+            int Cs = cfg.comet_slots, noncomet = 0, comet = 0;
+            for (auto& p : s.planets) {
+                bool isc = std::find(s.comet_planet_ids.begin(), s.comet_planet_ids.end(), p.id) !=
+                           s.comet_planet_ids.end();
+                int slot = isc ? (Ec - Cs + comet++) : (noncomet++);
+                if (slot < 0 || slot >= Ec) continue;
+                rid[slot] = p.id;
+                rsh[slot] = p.ships;
+                am[slot] = (p.owner == 0 && p.ships > 0) ? 1.f : 0.f;
             }
             int inv = 0;
             Action move0 = decode_action_continuous(act.data() + (size_t)b * Ec * twoK, am.data(),
