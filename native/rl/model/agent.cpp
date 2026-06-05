@@ -55,11 +55,23 @@ void Agent::load_state_dict(const std::map<std::string, torch::Tensor>& sd) {
         lin->weight.copy_(wi->second.reshape(lin->weight.sizes()).to(device));
         lin->bias.copy_(bi->second.reshape(lin->bias.sizes()).to(device));
     };
+    auto load_ln = [&](const std::string& key, torch::nn::LayerNorm& ln) {
+        if (!ln) return;
+        auto wi = sd.find(key + ".weight");
+        auto bi = sd.find(key + ".bias");
+        if (wi == sd.end() || bi == sd.end()) return;
+        torch::NoGradGuard ng;
+        ln->weight.copy_(wi->second.reshape(ln->weight.sizes()).to(device));
+        ln->bias.copy_(bi->second.reshape(ln->bias.sizes()).to(device));
+    };
     load("proj", net->proj);
     load("attn_q", net->attn_q);
     load("attn_k", net->attn_k);
     load("attn_v", net->attn_v);
     load("attn_o", net->attn_o);
+    load_ln("ln_attn", net->ln_attn);
+    load_ln("ln_out", net->ln_out);
+    for (size_t i = 0; i < net->ln_res.size(); ++i) load_ln("ln_res" + std::to_string(i), net->ln_res[i]);
     if (net->cfg.use_glu) {
         load("glu_gate", net->glu_gate);
         load("glu_val", net->glu_val);
@@ -89,11 +101,19 @@ std::map<std::string, torch::Tensor> Agent::state_dict() const {
         w[k + ".weight"] = lin->weight.detach().to(torch::kCPU).contiguous();
         w[k + ".bias"] = lin->bias.detach().to(torch::kCPU).contiguous();
     };
+    auto put_ln = [&](const std::string& k, const torch::nn::LayerNorm& ln) {
+        if (!ln) return;
+        w[k + ".weight"] = ln->weight.detach().to(torch::kCPU).contiguous();
+        w[k + ".bias"] = ln->bias.detach().to(torch::kCPU).contiguous();
+    };
     put("proj", net->proj);
     put("attn_q", net->attn_q);
     put("attn_k", net->attn_k);
     put("attn_v", net->attn_v);
     put("attn_o", net->attn_o);
+    put_ln("ln_attn", net->ln_attn);
+    put_ln("ln_out", net->ln_out);
+    for (size_t i = 0; i < net->ln_res.size(); ++i) put_ln("ln_res" + std::to_string(i), net->ln_res[i]);
     if (net->cfg.use_glu) {
         put("glu_gate", net->glu_gate);
         put("glu_val", net->glu_val);

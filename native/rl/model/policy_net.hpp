@@ -38,6 +38,10 @@ struct PolicyNetImpl : torch::nn::Module {
     torch::nn::Linear attn_q{nullptr}, attn_k{nullptr}, attn_v{nullptr}, attn_o{nullptr};
     torch::nn::Linear glu_gate{nullptr}, glu_val{nullptr}, glu_out{nullptr};  // one GLU block (opt)
     std::vector<torch::nn::Linear> res_a, res_b;                              // n_res_blocks res MLPs
+    // pre-LayerNorm keeps the deep trunk's activations bounded so the head means do not saturate
+    // sigmoid (which was zeroing the aiming gradient -> headings never learned). Standard pre-norm.
+    torch::nn::LayerNorm ln_attn{nullptr}, ln_out{nullptr};
+    std::vector<torch::nn::LayerNorm> ln_res;
     // separate board-globals path + heads (operate on [tok; g'], dim d + d_g)
     torch::nn::Linear g_embed{nullptr};                                       // G -> d_g
     torch::nn::Linear mu_head{nullptr};                                       // d+d_g -> 2K

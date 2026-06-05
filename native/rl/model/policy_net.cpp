@@ -19,6 +19,8 @@ PolicyNetImpl::PolicyNetImpl(const ModelConfig& c) : cfg(c), twoK(2 * c.fleets_p
     attn_k = register_module("attn_k", torch::nn::Linear(h, h));
     attn_v = register_module("attn_v", torch::nn::Linear(h, h));
     attn_o = register_module("attn_o", torch::nn::Linear(h, h));
+    ln_attn = register_module("ln_attn", torch::nn::LayerNorm(torch::nn::LayerNormOptions({h})));
+    ln_out = register_module("ln_out", torch::nn::LayerNorm(torch::nn::LayerNormOptions({h})));
     if (c.use_glu) {
         glu_gate = register_module("glu_gate", torch::nn::Linear(h, h));
         glu_val = register_module("glu_val", torch::nn::Linear(h, h));
@@ -27,6 +29,8 @@ PolicyNetImpl::PolicyNetImpl(const ModelConfig& c) : cfg(c), twoK(2 * c.fleets_p
     for (int i = 0; i < c.n_res_blocks; ++i) {
         res_a.push_back(register_module("res" + std::to_string(i) + "a", torch::nn::Linear(h, h)));
         res_b.push_back(register_module("res" + std::to_string(i) + "b", torch::nn::Linear(h, h)));
+        ln_res.push_back(register_module("ln_res" + std::to_string(i),
+                                         torch::nn::LayerNorm(torch::nn::LayerNormOptions({h}))));
     }
     g_embed = register_module("g_embed", torch::nn::Linear(G, dg));
     mu_head = register_module("mu_head", torch::nn::Linear(h + dg, twoK));
@@ -60,7 +64,8 @@ std::pair<torch::Tensor, torch::Tensor> PolicyNetImpl::forward(const torch::Tens
         // masked single-head self-attention over planets: each planet attends to all LIVE planets,
         // so it can read their positions and aim a launch at a specific target (impossible for the
         // per-planet trunk alone). entity_mask (B,E): 1 live / 0 padding -> dead keys are masked out.
-        auto Q = attn_q->forward(tok), Kt = attn_k->forward(tok), Vt = attn_v->forward(tok);
+        auto xn = ln_attn->forward(tok);
+        auto Q = attn_q->forward(xn), Kt = attn_k->forward(xn), Vt = attn_v->forward(xn);
         auto scores = torch::matmul(Q, Kt.transpose(1, 2)) / std::sqrt((double)cfg.hidden);  // (B,E,E)
         auto dead_key = (entity_mask < 0.5).unsqueeze(1);  // (B,1,E)
         scores = scores.masked_fill(dead_key, -1e9);
@@ -71,8 +76,9 @@ std::pair<torch::Tensor, torch::Tensor> PolicyNetImpl::forward(const torch::Tens
         tok = tok +
               glu_out->forward(glu_val->forward(tok) * torch::sigmoid(glu_gate->forward(tok)));
     }
-    for (size_t i = 0; i < res_a.size(); ++i)                  // n_res_blocks residual MLP blocks
-        tok = tok + res_b[i]->forward(torch::relu(res_a[i]->forward(tok)));
+    for (size_t i = 0; i < res_a.size(); ++i)  // n_res_blocks pre-norm residual MLP blocks
+        tok = tok + res_b[i]->forward(torch::relu(res_a[i]->forward(ln_res[i]->forward(tok))));
+    tok = ln_out->forward(tok);  // final norm so the head means stay in sigmoid's gradient range
 
     long B = tok.size(0), E = tok.size(1);
     auto gp = torch::relu(g_embed->forward(globals));            // (B,d_g)
