@@ -27,6 +27,7 @@ public:
     struct Decision {
         torch::Tensor action;    // (B,E,2K) float squashed-Gaussian action in (0,1)
         torch::Tensor log_prob;  // (B,) behavior log-prob of the joint action
+        torch::Tensor value;     // (B,) critic V(s) (PPO); undefined when no value head
     };
     Decision act(const torch::Tensor& entities, const torch::Tensor& entity_mask,
                  const torch::Tensor& action_mask, const torch::Tensor& globals,
@@ -36,6 +37,7 @@ public:
     struct Score {
         torch::Tensor log_prob;  // (B,) current log-prob of the stored action
         torch::Tensor entropy;   // (B,) policy entropy (for the bonus)
+        torch::Tensor value;     // (B,) critic V(s) WITH grad (PPO value loss); undefined for GRPO
     };
     Score evaluate(const torch::Tensor& entities, const torch::Tensor& entity_mask,
                    const torch::Tensor& action_mask, const torch::Tensor& globals,

@@ -246,4 +246,42 @@ inline Action decode_action_continuous(const float* actions, const float* action
     return moves;
 }
 
+// v5 TARGET actor decode (CPU, for the eval arena): action is (dest_row, phi) per planet -- one
+// launch per planet. The destination row is an obs-slot index; the heading aims directly at that
+// planet (atan2 of dest-minus-self, the "shortest path"). `s` supplies planet positions; row ->
+// planet id via row_planet_id (the obs may be reordered, so we resolve positions by id).
+inline Action decode_action_target(const float* actions, const float* action_mask,
+                                   const long* row_planet_id, const long* row_planet_ships,
+                                   const GameState& s, int max_entities, double act_threshold,
+                                   int* out_invalid = nullptr) {
+    Action moves;
+    int invalid = 0;
+    for (int row = 0; row < max_entities; ++row) {
+        const float* a = actions + (size_t)row * 2;  // [dest_row, phi]
+        bool legal = (action_mask[row] >= 0.5f) && (row_planet_id[row] >= 0);
+        long pid = row_planet_id[row];
+        long S = row_planet_ships[row];
+        double phi = (double)a[1];
+        if (phi < act_threshold) continue;            // not committed -> genuine no-op
+        if (!legal) { ++invalid; continue; }
+        long n = (long)std::floor(phi * (double)S);
+        if (n < 1) { ++invalid; continue; }
+        int dest_row = (int)std::lround((double)a[0]);
+        if (dest_row < 0) dest_row = 0;
+        if (dest_row >= max_entities) dest_row = max_entities - 1;
+        long dest_pid = row_planet_id[dest_row];
+        if (dest_pid < 0) { ++invalid; continue; }    // destination is an empty obs slot
+        double sx = 0, sy = 0, dx = 0, dy = 0;
+        bool sf = false, df = false;
+        for (const auto& p : s.planets) {
+            if (p.id == pid) { sx = p.x; sy = p.y; sf = true; }
+            if (p.id == dest_pid) { dx = p.x; dy = p.y; df = true; }
+        }
+        if (!sf || !df) { ++invalid; continue; }
+        moves.push_back(Move{pid, std::atan2(dy - sy, dx - sx), n});
+    }
+    if (out_invalid) *out_invalid = invalid;
+    return moves;
+}
+
 }  // namespace ow

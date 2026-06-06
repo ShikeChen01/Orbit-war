@@ -35,6 +35,8 @@ struct GpuEnvConfig {
     double ship_speed = 6.0;
     double comet_speed = 4.0;
     int episode_steps = 500;
+    bool target_actor = false;  // v5: ego/opp action is (dest_slot, phi) per planet (one launch),
+                                // heading = atan2 toward the chosen destination. false = (dx,dy,phi)x K.
 };
 
 // All tensors on `device`. Integer-valued quantities (ships, production, owner, step) are kept in
@@ -99,9 +101,11 @@ class GpuEnv {
     };
     Obs encode(int ego = 0);
 
-    // Decode the ego action (B, Ec, 2K) of squashed controls into launches, generate the scripted
-    // opponent's launches (0 random / 1 starter / 2 noop), apply both, and advance one tick.
-    // Returns the per-env reward ingredients so the trainer can build the reward on-device.
+    // Decode the ego action (B, Ec, 2K) of squashed controls into launches, generate the opponent's
+    // launches, apply both, and advance one tick. The opponent is either a scripted one (`opponent`:
+    // 0 random / 1 starter / 2 noop) OR -- when `opp_action` is non-null (self-play) -- a player-1
+    // neural action (B, Ec, 3K) decoded exactly like the ego action. Returns the per-env reward
+    // ingredients so the trainer can build the reward on-device.
     struct StepOut {
         torch::Tensor invalid;       // (B,) committed-but-failed ego dispatches (x_t)
         torch::Tensor valid;         // (B,) ego launches whose heading lands on a planet
@@ -109,8 +113,13 @@ class GpuEnv {
         torch::Tensor dprod_ego;     // (B,) ego production delta this tick
         torch::Tensor dprod_enemy;   // (B,) enemy production delta this tick
         torch::Tensor newly_done;    // (B,) 1.0 if this tick made the env terminal
+        torch::Tensor captured;      // (B,) planets the ego GAINED this tick (owner flip to ego)
+        torch::Tensor lost;          // (B,) planets the ego LOST this tick (owner flip away from ego)
+        torch::Tensor fleet_hits;    // (B,) ego fleets that hit a planet this tick (any owner planet)
+        torch::Tensor fleet_hit_ships;  // (B,) total ships on those hitting ego fleets
     };
-    StepOut step(const torch::Tensor& ego_action, int opponent, double act_threshold);
+    StepOut step(const torch::Tensor& ego_action, int opponent, double act_threshold,
+                 const torch::Tensor* opp_action = nullptr);
 
    private:
     GpuEnvConfig cfg_;

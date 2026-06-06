@@ -48,6 +48,7 @@ int main(int argc, char** argv) try {
     std::string ckpt = a.s("ckpt", "");                // required iff ego==policy
     std::string worlds = a.s("worlds", "runs/native/eval.owp");
     std::string out = a.s("out", "runs/reward_trace.csv");
+    std::string record_json = a.s("record-json", "");  // if set, dump per-tick board geometry for render
     int world_idx = a.i("world", 0);
     int stage = a.i("stage", 2);                        // outcome O + suppression S apply at stage>=2
     bool greedy = a.i("greedy", 1) != 0;
@@ -120,7 +121,37 @@ int main(int argc, char** argv) try {
     double P = 0, V = 0, I = 0, M = 0, S = 0, gpow = 1.0, ppow = 1.0, gbar = 0.0;
     double prev0 = my_production(s, 0), prev1 = my_production(s, 1);
     double outcome = 0.0;
+
+    // Optional per-tick board-geometry capture for the behavior visualizations. Each frame is one
+    // JSON object: planets [id,owner,x,y,radius,ships,prod], fleets [owner,x,y,angle,ships], comet ids.
+    std::vector<std::string> frames;
+    auto capture = [&](const GameState& g) {
+        if (record_json.empty()) return;
+        char b[64];
+        std::string j = "{\"t\":" + std::to_string(g.step) + ",\"planets\":[";
+        for (size_t i = 0; i < g.planets.size(); ++i) {
+            const auto& p = g.planets[i];
+            snprintf(b, sizeof(b), "[%ld,%d,%.3f,%.3f,%.3f,%ld,%d]", p.id, p.owner, p.x, p.y,
+                     p.radius, p.ships, p.production);
+            j += b; if (i + 1 < g.planets.size()) j += ',';
+        }
+        j += "],\"fleets\":[";
+        for (size_t i = 0; i < g.fleets.size(); ++i) {
+            const auto& f = g.fleets[i];
+            snprintf(b, sizeof(b), "[%d,%.3f,%.3f,%.4f,%ld]", f.owner, f.x, f.y, f.angle, f.ships);
+            j += b; if (i + 1 < g.fleets.size()) j += ',';
+        }
+        j += "],\"comets\":[";
+        for (size_t i = 0; i < g.comet_planet_ids.size(); ++i) {
+            j += std::to_string(g.comet_planet_ids[i]);
+            if (i + 1 < g.comet_planet_ids.size()) j += ',';
+        }
+        j += "]}";
+        frames.push_back(std::move(j));
+    };
+
     for (int t = 0; t < T; ++t) {
+        capture(s);  // board state the policy sees this tick
         // --- ego action ---
         Action move0;
         long invalid = 0;
@@ -188,6 +219,18 @@ int main(int argc, char** argv) try {
     }
     if (rows.empty()) { printf("no steps?\n"); return 1; }
     if (outcome == 0.0) outcome = outcome_sign(s);  // hit the cap
+
+    if (!record_json.empty()) {  // write the captured frames (+ a final frame) as one JSON document
+        capture(s);
+        std::ofstream jf(record_json);
+        jf << "{\"board_size\":" << BOARD_SIZE << ",\"center\":" << CENTER
+           << ",\"sun_radius\":" << SUN_RADIUS << ",\"ego\":\"" << ego << "\",\"opp\":\"" << opps
+           << "\",\"outcome\":" << outcome << ",\"ticks\":[\n";
+        for (size_t i = 0; i < frames.size(); ++i) { jf << frames[i]; if (i + 1 < frames.size()) jf << ",\n"; }
+        jf << "\n]}\n";
+        jf.close();
+        printf("wrote %s  (%zu frames)\n", record_json.c_str(), frames.size());
+    }
 
     // capped channels + final return (mirrors collect())
     double Pc = std::max(-rc.prod_reward_cap, std::min(rc.prod_reward_cap, P));

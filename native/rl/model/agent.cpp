@@ -1,7 +1,9 @@
 // Agent implementation (v4, continuous): forward+sample (rollout/opponent), re-score (update),
 // frozen clone (KL reference), and checkpoint I/O. The policy is a squashed diagonal Gaussian; an
 // action is the (E x 2K) matrix of squashed controls. Checkpoint keys mirror the module names so
-// the pure-Python serving twin can load them. No critic (GRPO).
+// the pure-Python serving twin can load them. The value head (PPO) is emitted under value.* keys
+// (and tolerated-missing on load), so an actor-only BC checkpoint warm-starts the trunk and leaves
+// the critic fresh-init; the Python serving twin (greedy actor) simply ignores value.*.
 #include "rl/model/agent.hpp"
 
 #include <sstream>
@@ -19,18 +21,29 @@ Agent::Agent(const ModelConfig& cfg, torch::Device dev) : device(dev) {
 Agent::Decision Agent::act(const torch::Tensor& ent, const torch::Tensor& em,
                            const torch::Tensor& am, const torch::Tensor& gl, bool greedy) {
     torch::NoGradGuard ng;
-    auto [mean, logstd] = net->forward(ent, em, am, gl);
-    SquashedGaussian dist(mean, logstd);
+    auto out = net->forward(ent, em, am, gl);
+    if (net->cfg.target_actor) {  // v5: destination categorical (owned src, alive dest) x phi Gaussian
+        TargetActorDist dist(out.dest_logits, out.mean, out.logstd, am, em);
+        auto action = greedy ? dist.greedy() : dist.sample();
+        return {action, dist.log_prob(action), out.value};
+    }
+    auto mask = net->cfg.action_mask_policy ? am : torch::Tensor();  // (B,E) legal-slot mask, opt-in
+    SquashedGaussian dist(out.mean, out.logstd, mask);
     auto action = greedy ? dist.greedy() : dist.sample();
-    return {action, dist.log_prob(action)};
+    return {action, dist.log_prob(action), out.value};
 }
 
 Agent::Score Agent::evaluate(const torch::Tensor& ent, const torch::Tensor& em,
                              const torch::Tensor& am, const torch::Tensor& gl,
                              const torch::Tensor& action) {
-    auto [mean, logstd] = net->forward(ent, em, am, gl);
-    SquashedGaussian dist(mean, logstd);
-    return {dist.log_prob(action), dist.entropy()};
+    auto out = net->forward(ent, em, am, gl);
+    if (net->cfg.target_actor) {
+        TargetActorDist dist(out.dest_logits, out.mean, out.logstd, am, em);
+        return {dist.log_prob(action), dist.entropy(), out.value};
+    }
+    auto mask = net->cfg.action_mask_policy ? am : torch::Tensor();  // same legal-slot mask as rollout
+    SquashedGaussian dist(out.mean, out.logstd, mask);
+    return {dist.log_prob(action), dist.entropy(), out.value};
 }
 
 Agent Agent::clone_frozen() const {
@@ -84,6 +97,23 @@ void Agent::load_state_dict(const std::map<std::string, torch::Tensor>& sd) {
     load("g_embed", net->g_embed);
     load("mu_h1", net->mu_h1);
     load("mu_h2", net->mu_h2);
+    if (net->cfg.target_actor) {  // v5 target-actor heads (mu_h1/mu_h2 are null in this mode -> no-op)
+        load("dest_head", net->dest_head);
+        load("phi_mu", net->phi_mu);
+        if (net->cfg.std_state_dependent) {
+            load("phi_logstd", net->phi_logstd);
+        } else {
+            auto it = sd.find("phi_logstd_param");
+            if (it != sd.end() && net->phi_logstd_param.defined()) {
+                torch::NoGradGuard ng;
+                net->phi_logstd_param.copy_(it->second.reshape(net->phi_logstd_param.sizes()).to(device));
+            }
+        }
+    }
+    if (net->cfg.use_value_head) {  // namespaced value.* so a stray Python critic.* never collides;
+        load("value.val_h1", net->val_h1);  // absent in an actor-only BC ckpt -> head stays fresh-init
+        load("value.val_h2", net->val_h2);
+    }
     if (net->cfg.std_state_dependent) {
         load("logstd_head", net->logstd_head);
     } else {
@@ -127,6 +157,17 @@ std::map<std::string, torch::Tensor> Agent::state_dict() const {
     put("g_embed", net->g_embed);
     put("mu_h1", net->mu_h1);
     put("mu_h2", net->mu_h2);
+    if (net->cfg.target_actor) {  // v5 target-actor heads
+        put("dest_head", net->dest_head);
+        put("phi_mu", net->phi_mu);
+        if (net->cfg.std_state_dependent) put("phi_logstd", net->phi_logstd);
+        else if (net->phi_logstd_param.defined())
+            w["phi_logstd_param"] = net->phi_logstd_param.detach().to(torch::kCPU).contiguous();
+    }
+    if (net->cfg.use_value_head) {
+        put("value.val_h1", net->val_h1);
+        put("value.val_h2", net->val_h2);
+    }
     if (net->cfg.std_state_dependent) {
         put("logstd_head", net->logstd_head);
     } else if (net->logstd_param.defined()) {

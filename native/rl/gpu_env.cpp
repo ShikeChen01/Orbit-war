@@ -394,9 +394,11 @@ GpuEnv::Obs GpuEnv::encode(int ego) {
 // step: one tick. Order mirrors ow::step exactly (comet expire -> spawn -> launch -> production
 // -> compute planet new pos -> fleet move+collision -> apply pos / remove -> combat).
 // ---------------------------------------------------------------------------------------------
-GpuEnv::StepOut GpuEnv::step(const Tensor& ego_action, int opponent, double act_threshold) {
+GpuEnv::StepOut GpuEnv::step(const Tensor& ego_action, int opponent, double act_threshold,
+                             const Tensor* opp_action) {
     const int B = B_, Ec = cfg_.planet_cap, Fc = cfg_.fleet_cap;
-    const int K = (int)(ego_action.size(2) / 3);  // action layout is 3K: (dx,dy,phi) per fleet
+    const bool target = cfg_.target_actor;        // v5: action is (dest_slot, phi) per planet, one launch
+    const int K = target ? 1 : (int)(ego_action.size(2) / 3);  // else 3K: (dx,dy,phi) per fleet
     const int Cs = cfg_.comet_slots, Ev = (int)t_.c_path.size(1), Lmax = (int)t_.c_path.size(3);
     const double vmax = cfg_.ship_speed;
     auto fo = torch::TensorOptions().dtype(torch::kFloat32).device(dev_);
@@ -406,6 +408,10 @@ GpuEnv::StepOut GpuEnv::step(const Tensor& ego_action, int opponent, double act_
 
     Tensor prod_ego0 = (t_.p_prod * (t_.p_owner == (double)ego) * (t_.p_alive > 0.5)).sum(1);
     Tensor prod_enemy0 = (t_.p_prod * (t_.p_owner == (double)enemy) * (t_.p_alive > 0.5)).sum(1);
+    // Ego planet ownership BEFORE this tick (for the capture/loss reward). Owner only changes in
+    // combat below; alive changes via comet spawn/expire (a captured comet counts as a gain, an
+    // ego comet that expires as a loss -- both rare and acceptable).
+    Tensor ego_owned0 = (t_.p_owner == (double)ego) & (t_.p_alive > 0.5);  // (B,Ec)
 
     // --- comet TOP-expiration (ow::step lines 409-429): remove comets whose path index (from the
     //     previous tick) has run off the end. For the symmetric equal-length paths here this is
@@ -458,11 +464,21 @@ GpuEnv::StepOut GpuEnv::step(const Tensor& ego_action, int opponent, double act_
     Tensor invalid = torch::zeros({B}, fo);
     Tensor launches = torch::zeros({B}, fo);
     for (int k = 0; k < K; ++k) {
-        // per-fleet layout (dx,dy,phi); aim via atan2 of the recentred [-1,1] direction vector
-        // (mirrors decode_action_continuous) -- linear aiming, attention-computable.
-        Tensor dx = ego_action.index({Slice(), Slice(), 3 * k}) * 2.0 - 1.0;
-        Tensor dy = ego_action.index({Slice(), Slice(), 3 * k + 1}) * 2.0 - 1.0;
-        Tensor phi = ego_action.index({Slice(), Slice(), 3 * k + 2});
+        // TARGET actor: action is (dest_slot, phi); heading aims directly at the destination planet
+        // (atan2 of dest-minus-self -- the "shortest path" heuristic). Else (dx,dy,phi): aim via the
+        // recentred [-1,1] direction vector (mirrors decode_action_continuous).
+        Tensor phi, angle;
+        if (target) {
+            phi = ego_action.index({Slice(), Slice(), 1});
+            Tensor dest = ego_action.index({Slice(), Slice(), 0}).round().clamp(0.0, (double)(Ec - 1))
+                              .to(torch::kLong);                    // (B,Ec) chosen destination slot
+            angle = torch::atan2(t_.p_y.gather(1, dest) - t_.p_y, t_.p_x.gather(1, dest) - t_.p_x);
+        } else {
+            Tensor dx = ego_action.index({Slice(), Slice(), 3 * k}) * 2.0 - 1.0;
+            Tensor dy = ego_action.index({Slice(), Slice(), 3 * k + 1}) * 2.0 - 1.0;
+            phi = ego_action.index({Slice(), Slice(), 3 * k + 2});
+            angle = torch::atan2(dy, dx);
+        }
         Tensor commit = phi >= act_threshold;                       // (B,Ec) bool
         Tensor n = torch::floor(phi * S);                           // ships to send
         Tensor ok = commit & legal & (n >= 1.0) & (remaining >= n);  // launches this k
@@ -471,7 +487,6 @@ GpuEnv::StepOut GpuEnv::step(const Tensor& ego_action, int opponent, double act_
         remaining = remaining - torch::where(ok, n, torch::zeros_like(n));
         invalid = invalid + (inv_k.to(torch::kFloat32)).sum(1);
         launches = launches + (ok.to(torch::kFloat32)).sum(1);
-        Tensor angle = torch::atan2(dy, dx);
         e_ang.push_back(angle);
         e_shp.push_back(torch::where(ok, n, torch::zeros_like(n)));
         e_can.push_back(ok.to(torch::kFloat32));
@@ -488,32 +503,70 @@ GpuEnv::StepOut GpuEnv::step(const Tensor& ego_action, int opponent, double act_
         valid = valid + lands.to(torch::kFloat32).sum(1);
     }
 
-    // --- opponent launches (noop for now) ---
-    Tensor o_ang, o_shp, o_can;
-    opponent_action(opponent, o_ang, o_shp, o_can);
+    // --- opponent launches: either scripted (one/planet) OR a player-1 NEURAL action (K/planet,
+    //     self-play). Both end as flat (B,Lo) launch tensors {angle,ships,commit,from_slot} +
+    //     per-planet ship deduction. ---
+    Tensor slot_idx = torch::arange(Ec, lo).unsqueeze(0).expand({B, Ec});  // (B,Ec)
+    Tensor o_ang_t, o_shp_t, o_can_t, o_slot_t;  // (B,Lo)
+    Tensor o_ded = torch::zeros({B, Ec}, fo);    // opponent ship deduction per planet slot
+    if (opp_action == nullptr) {
+        Tensor o_ang, o_shp, o_can;
+        opponent_action(opponent, o_ang, o_shp, o_can);  // each (B,Ec): one launch per owned planet
+        o_ang_t = o_ang; o_shp_t = o_shp; o_can_t = o_can; o_slot_t = slot_idx;
+        o_ded = o_shp;
+    } else {  // self-play: decode player 1's (B,Ec,3K) action exactly like the ego decode above
+        Tensor legal1 = (t_.p_owner == (double)enemy) & (t_.p_alive > 0.5) & (t_.p_ships > 0.0);
+        Tensor S1 = t_.p_ships, rem1 = t_.p_ships.clone();
+        std::vector<Tensor> o_ang_k, o_shp_k, o_can_k;
+        for (int k = 0; k < K; ++k) {
+            Tensor phi, angle;
+            if (target) {
+                phi = opp_action->index({Slice(), Slice(), 1});
+                Tensor dest = opp_action->index({Slice(), Slice(), 0}).round()
+                                  .clamp(0.0, (double)(Ec - 1)).to(torch::kLong);
+                angle = torch::atan2(t_.p_y.gather(1, dest) - t_.p_y, t_.p_x.gather(1, dest) - t_.p_x);
+            } else {
+                Tensor dx = opp_action->index({Slice(), Slice(), 3 * k}) * 2.0 - 1.0;
+                Tensor dy = opp_action->index({Slice(), Slice(), 3 * k + 1}) * 2.0 - 1.0;
+                phi = opp_action->index({Slice(), Slice(), 3 * k + 2});
+                angle = torch::atan2(dy, dx);
+            }
+            Tensor commit = phi >= act_threshold;
+            Tensor n = torch::floor(phi * S1);
+            Tensor ok = commit & legal1 & (n >= 1.0) & (rem1 >= n);
+            rem1 = rem1 - torch::where(ok, n, torch::zeros_like(n));
+            o_ang_k.push_back(angle);
+            o_shp_k.push_back(torch::where(ok, n, torch::zeros_like(n)));
+            o_can_k.push_back(ok.to(torch::kFloat32));
+            o_ded = o_ded + o_shp_k.back();
+        }
+        o_ang_t = torch::stack(o_ang_k, 2).reshape({B, (long)Ec * K});  // (B,Ec*K) planet-major
+        o_shp_t = torch::stack(o_shp_k, 2).reshape({B, (long)Ec * K});
+        o_can_t = torch::stack(o_can_k, 2).reshape({B, (long)Ec * K});
+        o_slot_t = slot_idx.unsqueeze(2).expand({B, Ec, K}).reshape({B, (long)Ec * K});
+    }
 
     // --- deduct ships from origin planets for all committed launches (ego per-k + opponent) ---
     Tensor ded = torch::zeros({B, Ec}, fo);
     for (int k = 0; k < K; ++k) ded = ded + e_shp[k];   // e_shp already 0 where !ok
-    ded = ded + o_shp;                                   // opponent deductions
+    ded = ded + o_ded;                                  // opponent deductions
     t_.p_ships = t_.p_ships - ded;
 
     // --- place fleets: ego launches in PLANET-major (planet e, fleet k) order then opponent, so
     //     the launch-sequence stamp mirrors ow::step's ascending fleet-id order; scatter into free
     //     slots. ---
     {
-        const long L = (long)Ec * K + Ec;
-        Tensor slot_idx = torch::arange(Ec, lo).unsqueeze(0).expand({B, Ec});  // (B,Ec)
         Tensor e_ang_t = torch::stack(e_ang, 2).reshape({B, (long)Ec * K});    // (B,Ec*K) planet-major
         Tensor e_shp_t = torch::stack(e_shp, 2).reshape({B, (long)Ec * K});
         Tensor e_can_t = torch::stack(e_can, 2).reshape({B, (long)Ec * K});
         Tensor e_slot = slot_idx.unsqueeze(2).expand({B, Ec, K}).reshape({B, (long)Ec * K});
-        Tensor owner = torch::cat({torch::full({B, (long)Ec * K}, (double)ego, fo),
-                                   torch::full({B, Ec}, (double)enemy, fo)}, 1);
-        Tensor from_slot = torch::cat({e_slot, slot_idx}, 1);
-        Tensor angle = torch::cat({e_ang_t, o_ang}, 1);
-        Tensor ships = torch::cat({e_shp_t, o_shp}, 1);
-        Tensor commit = torch::cat({e_can_t, o_can}, 1);
+        const long Le = (long)Ec * K, Lo = o_ang_t.size(1), L = Le + Lo;
+        Tensor owner = torch::cat({torch::full({B, Le}, (double)ego, fo),
+                                   torch::full({B, Lo}, (double)enemy, fo)}, 1);
+        Tensor from_slot = torch::cat({e_slot, o_slot_t}, 1);
+        Tensor angle = torch::cat({e_ang_t, o_ang_t}, 1);
+        Tensor ships = torch::cat({e_shp_t, o_shp_t}, 1);
+        Tensor commit = torch::cat({e_can_t, o_can_t}, 1);
         Tensor seq = (t_.step.to(torch::kFloat32) * (float)(L + 1)).unsqueeze(1) +
                      torch::arange(L, fo).unsqueeze(0);  // (B,L) globally ascending launch order
         launch_fleets(owner, from_slot, angle, ships, commit, seq);
@@ -606,6 +659,11 @@ GpuEnv::StepOut GpuEnv::step(const Tensor& ego_action, int opponent, double act_
     Tensor remove_fleet = falive & (has_hit | oob | sun_hit);
     // a fleet that hits is the only one contributing to combat; OOB/sun ones just vanish.
     Tensor contributes = falive & has_hit;
+    // EGO fleets that hit a planet this tick (docs/set-ups/1.md reward = base + w*ships per hit).
+    // f_ships is still the pre-combat ship count here (the fleet pool is cleared further below).
+    Tensor ego_hit = contributes & (t_.f_owner == (double)ego);                 // (B,Fc)
+    Tensor fleet_hits = ego_hit.to(torch::kFloat32).sum(1);                     // (B,)
+    Tensor fleet_hit_ships = (t_.f_ships * ego_hit.to(torch::kFloat32)).sum(1); // (B,)
 
     // --- remove comets that ran off their path this tick (ow::step lines 617-631), BEFORE combat
     //     so a just-expired comet takes no combat (its slot is no longer alive). ---
@@ -671,6 +729,9 @@ GpuEnv::StepOut GpuEnv::step(const Tensor& ego_action, int opponent, double act_
     Tensor prod_ego1 = (t_.p_prod * (t_.p_owner == (double)ego) * (t_.p_alive > 0.5)).sum(1);
     Tensor prod_enemy1 = (t_.p_prod * (t_.p_owner == (double)enemy) * (t_.p_alive > 0.5)).sum(1);
 
+    // capture/loss: ego planet ownership change across the tick (combat flips + comet alive change).
+    Tensor ego_owned1 = (t_.p_owner == (double)ego) & (t_.p_alive > 0.5);  // (B,Ec)
+
     StepOut out;
     out.invalid = invalid;
     out.valid = valid;
@@ -678,6 +739,10 @@ GpuEnv::StepOut GpuEnv::step(const Tensor& ego_action, int opponent, double act_
     out.dprod_ego = prod_ego1 - prod_ego0;
     out.dprod_enemy = prod_enemy1 - prod_enemy0;
     out.newly_done = torch::zeros({B}, fo);  // terminal handling added with rollout integration
+    out.captured = (ego_owned1 & (~ego_owned0)).to(torch::kFloat32).sum(1);  // (B,) gained this tick
+    out.lost = (ego_owned0 & (~ego_owned1)).to(torch::kFloat32).sum(1);      // (B,) lost this tick
+    out.fleet_hits = fleet_hits;
+    out.fleet_hit_ships = fleet_hit_ships;
     return out;
 }
 

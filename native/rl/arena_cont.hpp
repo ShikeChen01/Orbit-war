@@ -41,7 +41,9 @@ public:
         ArenaContResult R;
         int B = (int)worlds.size();
         if (B == 0) return R;
-        const int F = N_ENTITY_FEATURES, G = N_GLOBAL_FEATURES, nap = 3 * K_;  // (dx,dy,phi) per fleet
+        const int F = N_ENTITY_FEATURES, G = N_GLOBAL_FEATURES;
+        const int nap = p0.net->cfg.n_action_params();      // 3K (dx,dy,phi) or 2 (dest,phi) target
+        const bool target = p0.net->cfg.target_actor;
 
         std::vector<GameState> st = worlds;
         std::vector<char> done(B, 0);
@@ -75,8 +77,11 @@ public:
                 GameState& s = st[i];
                 std::vector<float> am0(E_);
                 for (int r = 0; r < E_; ++r) am0[r] = am[(size_t)i * E_ + r];
-                Action m0 = decode_action_continuous(ad + (size_t)i * E_ * nap, am0.data(),
-                                                     rid[i].data(), rsh[i].data(), E_, K_, act_thr_);
+                Action m0 = target
+                    ? decode_action_target(ad + (size_t)i * E_ * nap, am0.data(), rid[i].data(),
+                                           rsh[i].data(), s, E_, act_thr_)
+                    : decode_action_continuous(ad + (size_t)i * E_ * nap, am0.data(), rid[i].data(),
+                                               rsh[i].data(), E_, K_, act_thr_);
                 Action m1 = (opponent == 0) ? random_agent(s, 1, rng[i]) : starter_agent(s, 1);
                 std::vector<Action> acts = {m0, m1};
                 ow::step(s, acts, cfg_);

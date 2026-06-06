@@ -152,7 +152,7 @@ int main(int argc, char** argv) try {
             auto tp_b = T_tp.index_select(0, mi).to(dev);
             auto cm_b = T_cm.index_select(0, mi).to(dev);
 
-            auto mean = policy.net->forward(ent_b, em_b, am_b, gl_b).first;  // (B,E,3K)
+            auto mean = policy.net->forward(ent_b, em_b, am_b, gl_b).mean;  // (B,E,3K)
             auto act = torch::sigmoid(mean);
             auto a_dx = act.index({Slice(), Slice(), Slice(0, None, 3)});   // (B,E,K)
             auto a_dy = act.index({Slice(), Slice(), Slice(1, None, 3)});   // (B,E,K)

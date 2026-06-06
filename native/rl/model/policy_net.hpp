@@ -1,6 +1,7 @@
 // The agent's network: a per-planet trunk + a separate board-globals embedding feeding two
 // continuous action heads (mean and log-std of a squashed diagonal Gaussian over E x 2K controls).
-// There is **no value head** -- GRPO needs no critic. Architecture (docs/rl_math.pdf sec:policy):
+// An OPTIONAL value head (critic) is built only for PPO+GAE (cfg.use_value_head); GRPO omits it.
+// Architecture (docs/rl_math.pdf sec:policy):
 //   trunk:   tok = proj(x);  tok += GLU(tok) [if use_glu];  tok += resblock_i(tok) x n_res
 //   globals: g' = relu(g_embed(globals))            (a SEPARATE path, broadcast to every planet)
 //   heads:   mu = mu_head([tok; g']);  logstd = logstd_head([tok; g'])  OR  shared vector
@@ -20,12 +21,18 @@ namespace ow {
 struct PolicyNetImpl : torch::nn::Module {
     explicit PolicyNetImpl(const ModelConfig& cfg);
 
-    // entities (B,E,F), entity_mask (B,E) [unused], action_mask (B,E) [unused], globals (B,G)
-    //   -> {mean (B,E,3K), logstd (B,E,3K)}. logstd is clipped to [logstd_min, logstd_max].
-    std::pair<torch::Tensor, torch::Tensor> forward(const torch::Tensor& entities,
-                                                    const torch::Tensor& entity_mask,
-                                                    const torch::Tensor& action_mask,
-                                                    const torch::Tensor& globals);
+    // forward output: the two Gaussian head tensors plus (when use_value_head) the critic's V(s).
+    struct Out {
+        torch::Tensor mean;    // continuous actor: (B,E,3K) Gaussian mean; target actor: (B,E,1) phi mean
+        torch::Tensor logstd;  // matching shape, clipped to [logstd_min, logstd_max]
+        torch::Tensor dest_logits;  // TARGET actor only: (B,E,E) destination logits (else undefined)
+        torch::Tensor value;   // (B,) critic value, or undefined when use_value_head==false
+    };
+    // entities (B,E,F), entity_mask (B,E) [gates attention keys + value pool], action_mask (B,E)
+    //   [unused], globals (B,G) -> Out. The value head pools the post-trunk tokens (masked mean over
+    //   live planets) with the globals embedding -> a 2-layer MLP -> scalar V(s).
+    Out forward(const torch::Tensor& entities, const torch::Tensor& entity_mask,
+                const torch::Tensor& action_mask, const torch::Tensor& globals);
 
     ModelConfig cfg;
     int nap;  // n_action_params = 3*fleets_per_planet (dx,dy,phi per fleet), cached from cfg
@@ -49,6 +56,13 @@ struct PolicyNetImpl : torch::nn::Module {
                                                        // angle (atan2) -- a linear head cannot.
     torch::nn::Linear logstd_head{nullptr};                                   // d+d_g -> 2K (state-dep)
     torch::Tensor logstd_param;                                               // 2K vector (state-indep)
+    // --- v5 TARGET actor heads (built only when cfg.target_actor) ---
+    torch::nn::Linear dest_head{nullptr};       // d+d_g -> E   (destination-planet logits per planet)
+    torch::nn::Linear phi_mu{nullptr};          // d+d_g -> 1   (phi launch-fraction mean)
+    torch::nn::Linear phi_logstd{nullptr};      // d+d_g -> 1   (phi log-std; state-dependent variant)
+    torch::Tensor phi_logstd_param;             // 1-vector phi log-std (state-independent variant)
+    // optional critic (PPO): masked-mean pool of the trunk tokens + g' -> MLP -> scalar V(s)
+    torch::nn::Linear val_h1{nullptr}, val_h2{nullptr};                       // d+d_g -> d -> 1
 };
 TORCH_MODULE(PolicyNet);
 

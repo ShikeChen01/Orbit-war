@@ -7,65 +7,69 @@
 \@writefile{toc}{\contentsline {paragraph}{Training scope of this document.}{2}{section*.2}\protected@file@percent }
 \@writefile{toc}{\contentsline {paragraph}{Continuous, per-planet action space.}{2}{section*.3}\protected@file@percent }
 \@writefile{toc}{\contentsline {paragraph}{No masking --- the legal action space is \emph  {learned} from penalties.}{2}{section*.4}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {2}Observation encoding}{2}{section.2}\protected@file@percent }
-\newlabel{sec:obs}{{2}{2}{Observation encoding}{section.2}{}}
-\newlabel{sec:threat}{{2}{3}{Incoming-fleet threat block (per planet, baked into the row)}{section*.5}{}}
-\@writefile{toc}{\contentsline {paragraph}{Incoming-fleet threat block (per planet, baked into the row).}{3}{section*.5}\protected@file@percent }
-\@writefile{toc}{\contentsline {subparagraph}{Two ranked views per planet (tuneable counts).}{3}{section*.6}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {3}Policy network $\pi _\theta $}{4}{section.3}\protected@file@percent }
-\newlabel{sec:policy}{{3}{4}{Policy network $\pi _\theta $}{section.3}{}}
-\@writefile{toc}{\contentsline {paragraph}{Single-stream trunk (the two variants under comparison).}{4}{section*.7}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Residual GLU block.}{4}{section*.8}\protected@file@percent }
-\newlabel{eq:glu}{{6}{4}{Residual GLU block}{equation.6}{}}
-\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Policy network data flow (continuous action). Each planet row (body $+$ incoming-threat features) is projected and passed through the shared per-row trunk: variant A inserts one residual GLU block (Fig.~\ref {fig:glu}) before the $n_{\mathrm  {res}}$ residual MLP blocks; variant B uses residual MLP blocks only. The $G$ board globals are embedded separately ($g'$, dim $d_g$) and broadcast to the heads. A mean head maps $[h_e;g']$ to the $3K$ means $\mu _e$; the $3K$ log-stds $\varsigma _e$ come from \emph  {either} a second head (state-dependent) \emph  {or} a shared learnable vector (state-independent) --- a switchable A/B. Together they define a squashed Gaussian (Section~\ref {sec:dist}) whose samples are the $K$ fleet triples $(d^x,d^y,\phi )$ for planet $e$. No pooling, no cross-row mixing, no value or pointer head.}}{5}{figure.1}\protected@file@percent }
-\newlabel{fig:arch}{{1}{5}{Policy network data flow (continuous action). Each planet row (body $+$ incoming-threat features) is projected and passed through the shared per-row trunk: variant A inserts one residual GLU block (Fig.~\ref {fig:glu}) before the $n_{\mathrm {res}}$ residual MLP blocks; variant B uses residual MLP blocks only. The $G$ board globals are embedded separately ($g'$, dim $d_g$) and broadcast to the heads. A mean head maps $[h_e;g']$ to the $3K$ means $\mu _e$; the $3K$ log-stds $\varsigma _e$ come from \emph {either} a second head (state-dependent) \emph {or} a shared learnable vector (state-independent) --- a switchable A/B. Together they define a squashed Gaussian (Section~\ref {sec:dist}) whose samples are the $K$ fleet triples $(d^x,d^y,\phi )$ for planet $e$. No pooling, no cross-row mixing, no value or pointer head}{figure.1}{}}
-\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces The residual GLU block $\mathcal  {B}$ (Eq.~\ref {eq:glu}): a value branch $W_v z$ and a sigmoid gate $\sigma (W_g z)$ are multiplied elementwise ($\odot $), projected by $W_o$, and added back to the input (the residual skip). In trunk variant A one such block (its own $d\times d$ weights) follows the input projection, before the residual MLP stack.}}{5}{figure.2}\protected@file@percent }
-\newlabel{fig:glu}{{2}{5}{The residual GLU block $\mathcal {B}$ (Eq.~\ref {eq:glu}): a value branch $W_v z$ and a sigmoid gate $\sigma (W_g z)$ are multiplied elementwise ($\odot $), projected by $W_o$, and added back to the input (the residual skip). In trunk variant A one such block (its own $d\times d$ weights) follows the input projection, before the residual MLP stack}{figure.2}{}}
-\@writefile{toc}{\contentsline {paragraph}{Continuous action heads (mean, and a switchable log-std).}{5}{section*.9}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Layer inventory ($d=128$, variant A).}{6}{section*.10}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {4}Action distribution}{6}{section.4}\protected@file@percent }
-\newlabel{sec:dist}{{4}{6}{Action distribution}{section.4}{}}
-\newlabel{eq:logp}{{8}{6}{Action distribution}{equation.8}{}}
-\newlabel{eq:ent}{{9}{6}{Action distribution}{equation.9}{}}
-\@writefile{toc}{\contentsline {paragraph}{How the mean and log-std heads are learned (no separate target).}{7}{section*.11}\protected@file@percent }
-\newlabel{sec:decode}{{4}{7}{Decode: controls $\to $ engine launches}{section*.12}{}}
-\@writefile{toc}{\contentsline {paragraph}{Decode: controls $\to $ engine launches.}{7}{section*.12}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {5}Reward and return}{7}{section.5}\protected@file@percent }
-\newlabel{sec:reward}{{5}{7}{Reward and return}{section.5}{}}
-\@writefile{toc}{\contentsline {paragraph}{Production-only dense reward $+$ invalid-dispatch penalty.}{7}{section*.13}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Enemy-suppression term (relative to the enemy's own recent growth).}{8}{section*.14}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Outcome, the draw anchor, and the loss forfeit.}{8}{section*.15}\protected@file@percent }
-\newlabel{eq:return}{{13}{8}{Outcome, the draw anchor, and the loss forfeit}{equation.13}{}}
-\@writefile{toc}{\contentsline {paragraph}{Implemented bounded variant (current default).}{8}{section*.16}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Miss penalty $M$ --- the aiming \emph  {stick} (\texttt  {miss\_launch\_penalty}).}{9}{section*.17}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Note --- 2p vs.\ 4p objective.}{9}{section*.18}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {6}Curriculum}{10}{section.6}\protected@file@percent }
-\newlabel{sec:curriculum}{{6}{10}{Curriculum}{section.6}{}}
-\@writefile{toc}{\contentsline {paragraph}{Stage 1 --- solo expansion (passive opponent).}{10}{section*.19}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Stage 2 --- $1$v$1$ vs.\ starter.}{10}{section*.20}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Stage 3 --- mixed opponents.}{10}{section*.21}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {7}GRPO update}{10}{section.7}\protected@file@percent }
-\newlabel{sec:grpo}{{7}{10}{GRPO update}{section.7}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {7.1}Grouped sampling}{10}{subsection.7.1}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {7.2}Group-relative advantage (no critic)}{11}{subsection.7.2}\protected@file@percent }
-\newlabel{eq:adv}{{17}{11}{Group-relative advantage (no critic)}{equation.17}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {7.3}Clipped policy surrogate}{11}{subsection.7.3}\protected@file@percent }
-\newlabel{eq:clip}{{19}{11}{Clipped policy surrogate}{equation.19}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {7.4}KL anchor to a reference policy}{11}{subsection.7.4}\protected@file@percent }
-\newlabel{sec:kl}{{7.4}{11}{KL anchor to a reference policy}{subsection.7.4}{}}
-\newlabel{eq:kl}{{20}{11}{KL anchor to a reference policy}{equation.20}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {7.5}Total objective}{11}{subsection.7.5}\protected@file@percent }
-\newlabel{eq:loss}{{21}{11}{Total objective}{equation.21}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {7.6}Optimization}{12}{subsection.7.6}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {8}Self-play league}{12}{section.8}\protected@file@percent }
-\newlabel{sec:league}{{8}{12}{Self-play league}{section.8}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {9}Batched GPU simulator}{12}{section.9}\protected@file@percent }
-\newlabel{sec:gpuenv}{{9}{12}{Batched GPU simulator}{section.9}{}}
-\@writefile{toc}{\contentsline {paragraph}{Layout (Structure-of-Arrays, leading batch $B$).}{12}{section*.22}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Vectorized dynamics.}{12}{section*.23}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Parity.}{12}{section*.24}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{On-device rollout, host-offloaded trajectory.}{13}{section*.25}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Deep-net numerical stability.}{13}{section*.26}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {10}Symbols $\leftrightarrow $ \texttt  {config.hpp}}{14}{section.10}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {A}Appendix: the PPO/GAE method being replaced}{14}{appendix.A}\protected@file@percent }
-\gdef \@abspage@last{14}
+\@writefile{toc}{\contentsline {paragraph}{Optional action mask (\texttt  {action\_mask\_policy}).}{2}{section*.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {2}Observation encoding}{3}{section.2}\protected@file@percent }
+\newlabel{sec:obs}{{2}{3}{Observation encoding}{section.2}{}}
+\@writefile{toc}{\contentsline {paragraph}{Per-planet body features (rows $0$--$10$).}{3}{section*.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Board-summary globals $g\in \mathbb  {R}^{10}$.}{3}{section*.7}\protected@file@percent }
+\newlabel{sec:threat}{{2}{4}{Incoming-fleet threat block (per planet, baked into the row)}{section*.8}{}}
+\@writefile{toc}{\contentsline {paragraph}{Incoming-fleet threat block (per planet, baked into the row).}{4}{section*.8}\protected@file@percent }
+\@writefile{toc}{\contentsline {subparagraph}{Two ranked views per planet (tuneable counts).}{4}{section*.9}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {3}Policy network $\pi _\theta $}{5}{section.3}\protected@file@percent }
+\newlabel{sec:policy}{{3}{5}{Policy network $\pi _\theta $}{section.3}{}}
+\@writefile{toc}{\contentsline {paragraph}{Trunk pipeline.}{5}{section*.10}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Policy network data flow (continuous action). Planet rows are projected, then mixed by one \textbf  {masked cross-planet self-attention} block (pre-LayerNorm; \texttt  {entity\_mask} hides padding planets) --- the only cross-row step, and what enables targeted aiming. The result passes through the shared per-row trunk: variant A inserts one residual GLU block (Fig.~\ref {fig:glu}) before the $n_{\mathrm  {res}}$ \emph  {pre-LayerNorm} residual MLP blocks (variant B: MLP blocks only), then a final LayerNorm. The $G$ board globals are embedded separately ($g'$, dim $d_g$) and broadcast to the heads. A two-layer \textbf  {MLP} mean head maps $[h_e;g']$ to the $3K$ means $\mu _e$; the $3K$ log-stds $\varsigma _e$ come from \emph  {either} a second head (state-dependent) \emph  {or} a shared learnable vector (state-independent) --- a switchable A/B. They define a squashed Gaussian (Section~\ref {sec:dist}), optionally \texttt  {action\_mask}ed to owned slots, whose samples are the $K$ fleet triples $(d^x,d^y,\phi )$ for planet $e$. No pooling, no value or pointer head.}}{6}{figure.1}\protected@file@percent }
+\newlabel{fig:arch}{{1}{6}{Policy network data flow (continuous action). Planet rows are projected, then mixed by one \textbf {masked cross-planet self-attention} block (pre-LayerNorm; \texttt {entity\_mask} hides padding planets) --- the only cross-row step, and what enables targeted aiming. The result passes through the shared per-row trunk: variant A inserts one residual GLU block (Fig.~\ref {fig:glu}) before the $n_{\mathrm {res}}$ \emph {pre-LayerNorm} residual MLP blocks (variant B: MLP blocks only), then a final LayerNorm. The $G$ board globals are embedded separately ($g'$, dim $d_g$) and broadcast to the heads. A two-layer \textbf {MLP} mean head maps $[h_e;g']$ to the $3K$ means $\mu _e$; the $3K$ log-stds $\varsigma _e$ come from \emph {either} a second head (state-dependent) \emph {or} a shared learnable vector (state-independent) --- a switchable A/B. They define a squashed Gaussian (Section~\ref {sec:dist}), optionally \texttt {action\_mask}ed to owned slots, whose samples are the $K$ fleet triples $(d^x,d^y,\phi )$ for planet $e$. No pooling, no value or pointer head}{figure.1}{}}
+\@writefile{toc}{\contentsline {paragraph}{Residual GLU block.}{6}{section*.11}\protected@file@percent }
+\newlabel{eq:glu}{{7}{6}{Residual GLU block}{equation.7}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces The residual GLU block $\mathcal  {B}$ (Eq.~\ref {eq:glu}): a value branch $W_v z$ and a sigmoid gate $\sigma (W_g z)$ are multiplied elementwise ($\odot $), projected by $W_o$, and added back to the input (the residual skip). In trunk variant A one such block (its own $d\times d$ weights) follows the input projection, before the residual MLP stack.}}{6}{figure.2}\protected@file@percent }
+\newlabel{fig:glu}{{2}{6}{The residual GLU block $\mathcal {B}$ (Eq.~\ref {eq:glu}): a value branch $W_v z$ and a sigmoid gate $\sigma (W_g z)$ are multiplied elementwise ($\odot $), projected by $W_o$, and added back to the input (the residual skip). In trunk variant A one such block (its own $d\times d$ weights) follows the input projection, before the residual MLP stack}{figure.2}{}}
+\@writefile{toc}{\contentsline {paragraph}{Continuous action heads (mean, and a switchable log-std).}{6}{section*.12}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Calm initialization (\texttt  {init\_mu\_scale}, \texttt  {init\_phi\_bias}).}{7}{section*.13}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Layer inventory (variant A).}{7}{section*.14}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {4}Action distribution}{8}{section.4}\protected@file@percent }
+\newlabel{sec:dist}{{4}{8}{Action distribution}{section.4}{}}
+\newlabel{eq:logp}{{9}{8}{Action distribution}{equation.9}{}}
+\newlabel{eq:ent}{{10}{8}{Action distribution}{equation.10}{}}
+\@writefile{toc}{\contentsline {paragraph}{How the mean and log-std heads are learned (no separate target).}{9}{section*.15}\protected@file@percent }
+\newlabel{sec:decode}{{4}{9}{Decode: controls $\to $ engine launches}{section*.16}{}}
+\@writefile{toc}{\contentsline {paragraph}{Decode: controls $\to $ engine launches.}{9}{section*.16}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {5}Reward and return}{9}{section.5}\protected@file@percent }
+\newlabel{sec:reward}{{5}{9}{Reward and return}{section.5}{}}
+\@writefile{toc}{\contentsline {paragraph}{Production-only dense reward $+$ invalid-dispatch penalty.}{9}{section*.17}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Enemy-suppression term (relative to the enemy's own recent growth).}{10}{section*.18}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Outcome, the draw anchor, and the loss forfeit.}{10}{section*.19}\protected@file@percent }
+\newlabel{eq:return}{{14}{10}{Outcome, the draw anchor, and the loss forfeit}{equation.14}{}}
+\@writefile{toc}{\contentsline {paragraph}{Implemented bounded variant (current default).}{10}{section*.20}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Miss penalty $M$ --- the aiming \emph  {stick} (\texttt  {miss\_launch\_penalty}).}{11}{section*.21}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Note --- 2p vs.\ 4p objective.}{11}{section*.22}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {6}Curriculum}{11}{section.6}\protected@file@percent }
+\newlabel{sec:curriculum}{{6}{11}{Curriculum}{section.6}{}}
+\@writefile{toc}{\contentsline {paragraph}{Stage 1 --- solo expansion (passive opponent).}{12}{section*.23}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Stage 2 --- $1$v$1$ vs.\ starter.}{12}{section*.24}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Stage 3 --- mixed opponents.}{12}{section*.25}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {7}GRPO update}{12}{section.7}\protected@file@percent }
+\newlabel{sec:grpo}{{7}{12}{GRPO update}{section.7}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.1}Grouped sampling}{12}{subsection.7.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.2}Group-relative advantage (no critic)}{12}{subsection.7.2}\protected@file@percent }
+\newlabel{eq:adv}{{18}{13}{Group-relative advantage (no critic)}{equation.18}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.3}Clipped policy surrogate}{13}{subsection.7.3}\protected@file@percent }
+\newlabel{eq:clip}{{20}{13}{Clipped policy surrogate}{equation.20}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.4}KL anchor to a reference policy}{13}{subsection.7.4}\protected@file@percent }
+\newlabel{sec:kl}{{7.4}{13}{KL anchor to a reference policy}{subsection.7.4}{}}
+\newlabel{eq:kl}{{21}{13}{KL anchor to a reference policy}{equation.21}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.5}Total objective}{13}{subsection.7.5}\protected@file@percent }
+\newlabel{eq:loss}{{22}{13}{Total objective}{equation.22}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.6}Optimization}{13}{subsection.7.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {8}Self-play league}{14}{section.8}\protected@file@percent }
+\newlabel{sec:league}{{8}{14}{Self-play league}{section.8}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {9}Batched GPU simulator}{14}{section.9}\protected@file@percent }
+\newlabel{sec:gpuenv}{{9}{14}{Batched GPU simulator}{section.9}{}}
+\@writefile{toc}{\contentsline {paragraph}{Layout (Structure-of-Arrays, leading batch $B$).}{14}{section*.26}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Vectorized dynamics.}{14}{section*.27}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Parity.}{14}{section*.28}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{On-device rollout, host-offloaded trajectory.}{14}{section*.29}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Deep-net numerical stability.}{15}{section*.30}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {10}Symbols $\leftrightarrow $ \texttt  {config.hpp}}{16}{section.10}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {A}Appendix: the PPO/GAE method being replaced}{16}{appendix.A}\protected@file@percent }
+\gdef \@abspage@last{16}

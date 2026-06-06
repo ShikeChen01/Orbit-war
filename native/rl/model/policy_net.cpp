@@ -3,8 +3,8 @@
 //   tok = proj(x);  tok += GLU(tok) [if use_glu];  tok += resblock_i(tok) x n_res
 //   g'  = relu(g_embed(globals));   h = [tok ; g'_broadcast]   (dim d + d_g)
 //   mean = mu_head(h);   logstd = logstd_head(h)  OR  shared learnable vector  -> both (B,E,2K)
-// No mask is applied (the actor learns the legal action space from the invalid-dispatch penalty);
-// no value head (GRPO has no critic).
+// No mask is applied to the actor (it learns the legal action space from the invalid-dispatch
+// penalty). The value head (critic) is OPTIONAL -- built only when cfg.use_value_head (PPO+GAE).
 #include "rl/model/policy_net.hpp"
 
 #include <cmath>
@@ -33,34 +33,53 @@ PolicyNetImpl::PolicyNetImpl(const ModelConfig& c) : cfg(c), nap(c.n_action_para
                                          torch::nn::LayerNorm(torch::nn::LayerNormOptions({h}))));
     }
     g_embed = register_module("g_embed", torch::nn::Linear(G, dg));
-    mu_h1 = register_module("mu_h1", torch::nn::Linear(h + dg, h));
-    mu_h2 = register_module("mu_h2", torch::nn::Linear(h, nap));
-    {
-        // Prior: start the policy nearly INERT so it learns to act, instead of spamming ~E*K illegal
-        // dispatches and slowly suppressing them. Small final-layer weights make every head output
-        // start ~= its bias regardless of the deep random trunk (without this, a deep scratch trunk
-        // emits large, varied means -> ~half of all E*K slots commit illegally from step 1). A
-        // strongly negative phi bias (sigmoid(-5)=0.0067 << tau_act) keeps almost nothing committed
-        // at init; the policy then LEARNS to raise phi on owned planets. Layout per fleet is
-        // (dx,dy,phi), so phi is every 3rd component (index 3k+2); dx,dy keep zero bias -> at init
-        // a=sigmoid(0)=0.5 -> centred dir (0,0) -> angle 0 (heading is then learned/explored).
-        torch::NoGradGuard ng;
-        mu_h2->weight.mul_(c.init_mu_scale);
-        mu_h2->bias.zero_();
-        for (int k = 0; k < c.fleets_per_planet; ++k) mu_h2->bias[3 * k + 2].fill_(c.init_phi_bias);
-    }
-    if (c.std_state_dependent) {
-        logstd_head = register_module("logstd_head", torch::nn::Linear(h + dg, nap));
+    if (c.target_actor) {
+        // v5 TARGET actor: a destination-planet categorical (over the E obs slots) + a phi launch-
+        // fraction (continuous, like the old phi). NO (dx,dy) aiming -- a heuristic turns the chosen
+        // destination into the heading. The continuous mu/logstd heads are NOT built in this mode.
+        dest_head = register_module("dest_head", torch::nn::Linear(h + dg, c.max_entities));
+        phi_mu = register_module("phi_mu", torch::nn::Linear(h + dg, 1));
+        {  // calm init: few planets commit at start (sigmoid(init_phi_bias)), destination ~uniform
+            torch::NoGradGuard ng;
+            phi_mu->weight.mul_(c.init_mu_scale);
+            phi_mu->bias.fill_(c.init_phi_bias);
+        }
+        if (c.std_state_dependent)
+            phi_logstd = register_module("phi_logstd", torch::nn::Linear(h + dg, 1));
+        else
+            phi_logstd_param = register_parameter("phi_logstd_param", torch::zeros({1}));
     } else {
-        // one shared learnable log-std vector (state-independent exploration); init sigma ~ 1.
-        logstd_param = register_parameter("logstd_param", torch::zeros({nap}));
+        mu_h1 = register_module("mu_h1", torch::nn::Linear(h + dg, h));
+        mu_h2 = register_module("mu_h2", torch::nn::Linear(h, nap));
+        {
+            // Prior: start the policy nearly INERT so it learns to act, instead of spamming ~E*K
+            // illegal dispatches and slowly suppressing them. Small final-layer weights make every
+            // head output start ~= its bias regardless of the deep random trunk. A strongly negative
+            // phi bias (sigmoid(-5)=0.0067 << tau_act) keeps almost nothing committed at init; the
+            // policy then LEARNS to raise phi on owned planets. Layout per fleet is (dx,dy,phi), so
+            // phi is every 3rd component (index 3k+2); dx,dy keep zero bias -> a=sigmoid(0)=0.5.
+            torch::NoGradGuard ng;
+            mu_h2->weight.mul_(c.init_mu_scale);
+            mu_h2->bias.zero_();
+            for (int k = 0; k < c.fleets_per_planet; ++k) mu_h2->bias[3 * k + 2].fill_(c.init_phi_bias);
+        }
+        if (c.std_state_dependent) {
+            logstd_head = register_module("logstd_head", torch::nn::Linear(h + dg, nap));
+        } else {
+            // one shared learnable log-std vector (state-independent exploration); init sigma ~ 1.
+            logstd_param = register_parameter("logstd_param", torch::zeros({nap}));
+        }
+    }
+    if (c.use_value_head) {  // PPO critic: pooled trunk + g' -> d -> scalar V(s)
+        val_h1 = register_module("val_h1", torch::nn::Linear(h + dg, h));
+        val_h2 = register_module("val_h2", torch::nn::Linear(h, 1));
     }
 }
 
-std::pair<torch::Tensor, torch::Tensor> PolicyNetImpl::forward(const torch::Tensor& entities,
-                                                              const torch::Tensor& entity_mask,
-                                                              const torch::Tensor& action_mask,
-                                                              const torch::Tensor& globals) {
+PolicyNetImpl::Out PolicyNetImpl::forward(const torch::Tensor& entities,
+                                          const torch::Tensor& entity_mask,
+                                          const torch::Tensor& action_mask,
+                                          const torch::Tensor& globals) {
     (void)action_mask;
     auto tok = proj->forward(entities);  // (B,E,d)
     {
@@ -88,15 +107,28 @@ std::pair<torch::Tensor, torch::Tensor> PolicyNetImpl::forward(const torch::Tens
     auto gpb = gp.unsqueeze(1).expand({B, E, cfg.d_g});          // broadcast to every planet
     auto h = torch::cat({tok, gpb}, -1);                         // (B,E,d+d_g)
 
-    auto mean = mu_h2->forward(torch::relu(mu_h1->forward(h)));  // (B,E,3K) nonlinear mean head
-    torch::Tensor logstd;
-    if (cfg.std_state_dependent) {
-        logstd = logstd_head->forward(h);                       // (B,E,3K)
+    torch::Tensor mean, logstd, dest_logits;
+    if (cfg.target_actor) {
+        dest_logits = dest_head->forward(h);                    // (B,E,E) destination-planet logits
+        mean = phi_mu->forward(h);                              // (B,E,1) phi mean
+        logstd = cfg.std_state_dependent ? phi_logstd->forward(h)         // (B,E,1)
+                                         : phi_logstd_param.view({1, 1, 1}).expand({B, E, 1});
     } else {
-        logstd = logstd_param.view({1, 1, nap}).expand({B, E, nap});
+        mean = mu_h2->forward(torch::relu(mu_h1->forward(h)));  // (B,E,3K) nonlinear mean head
+        logstd = cfg.std_state_dependent ? logstd_head->forward(h)        // (B,E,3K)
+                                         : logstd_param.view({1, 1, nap}).expand({B, E, nap});
     }
     logstd = logstd.clamp(cfg.logstd_min, cfg.logstd_max);
-    return {mean, logstd};
+
+    torch::Tensor value;  // undefined unless the critic is built (GRPO leaves it unused)
+    if (cfg.use_value_head) {
+        // masked-mean pool of the post-trunk tokens over LIVE planets, concat the globals embed g'.
+        auto em = entity_mask.unsqueeze(-1);                    // (B,E,1)
+        auto pooled = (tok * em).sum(1) / em.sum(1).clamp_min(1.0);  // (B,d) ignore padding rows
+        auto vh = torch::cat({pooled, gp}, -1);                 // (B,d+d_g)
+        value = val_h2->forward(torch::relu(val_h1->forward(vh))).squeeze(-1);  // (B,)
+    }
+    return {mean, logstd, dest_logits, value};
 }
 
 }  // namespace ow

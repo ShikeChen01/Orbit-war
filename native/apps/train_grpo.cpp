@@ -53,9 +53,14 @@ int main(int argc, char** argv) try {
     cfg.model.d_g = a.i("d-g", 32);                                       // board-globals embed dim
     cfg.model.use_glu = a.i("use-glu", 1) != 0;                           // trunk A/B
     cfg.model.std_state_dependent = a.i("std-state-dependent", 1) != 0;   // exploration A/B
+    cfg.model.action_mask_policy = a.i("action-mask", 0) != 0;            // mask actor to legal slots
+    cfg.model.target_actor = a.i("target-actor", 0) != 0;                 // v5 (dest,phi); else (dx,dy,phi)
     cfg.model.act_threshold = a.f("act-threshold", 0.05);                 // tau_act
     cfg.model.logstd_min = a.f("logstd-min", -2.0);
     cfg.model.logstd_max = a.f("logstd-max", 1.0);
+    cfg.model.logstd_max_end = a.f("logstd-max-end", cfg.model.logstd_max);  // phase-1 decay target
+    cfg.model.logstd_max_post = a.f("logstd-max-post", cfg.model.logstd_max_end);  // phase-2 head cap
+    cfg.model.sigma_decay_iters = a.i("sigma-decay-iters", 0);  // >0: force decay over N iters then head
     cfg.model.init_mu_scale = a.f("init-mu-scale", 0.02);  // policy "calmness" at init (tunable)
     cfg.model.init_phi_bias = a.f("init-phi-bias", -4.0);  // less negative = less calm = more commits
     // --- reward ---
@@ -76,11 +81,35 @@ int main(int argc, char** argv) try {
     cfg.rollout.enemy_growth_weight = a.f("enemy-growth-weight", 0.5);
     cfg.rollout.enemy_growth_warmup = a.i("enemy-growth-warmup", 50);
     cfg.rollout.enemy_growth_ema = a.f("enemy-growth-ema", 0.1);
+    // --- docs/set-ups/1.md event reward set (off by default) ---
+    cfg.rollout.win_decay = a.f("win-decay", 1.0);                       // win bonus * win_decay^len
+    cfg.rollout.loss_decay = a.f("loss-decay", 1.0);                     // loss penalty * loss_decay^len
+    cfg.rollout.capture_reward = a.f("capture-reward", 0.0);             // +/- per planet gained/lost
+    cfg.rollout.dispatch_reward = a.f("dispatch-reward", 0.0);           // first-N committed launches
+    cfg.rollout.dispatch_reward_count = a.i("dispatch-count", 50);      // N
+    cfg.rollout.fleet_hit_base = a.f("fleet-hit-base", 0.0);             // per ego fleet that hits
+    cfg.rollout.fleet_hit_ship_weight = a.f("fleet-hit-ship-weight", 0.0);
+    cfg.rollout.fleet_hit_cap = a.f("fleet-hit-cap", 300.0);             // per-game cap on hit reward
+    cfg.rollout.ppo_reward_scale = a.f("reward-scale", 1.0);             // value-target rescale (PPO)
+    cfg.rollout.selfplay_prob = a.f("selfplay-prob", 0.5);              // stage-4 self-play fraction
+    cfg.rollout.decay_start_step = a.f("decay-start-step", 0.0);         // win/loss flat until this step
+    cfg.rollout.prod_milestone_reward = a.f("prod-milestone-reward", 0.0);  // +r per ego ship doubling
+    cfg.rollout.prod_milestone_base = a.f("prod-milestone-base", 100.0);    // first doubling threshold (then x2)
     // --- GPU-batched on-device rollout (the whole loop stays on the GPU) ---
     cfg.rollout.gpu_env = a.i("gpu-env", 0) != 0;
     cfg.rollout.planet_cap = a.i("planet-cap", 48);  // obs/action dim E (>= max planets + 4 comets)
     cfg.rollout.fleet_cap = a.i("fleet-cap", 1024);
+    // TARGET actor: the destination categorical is over the E=planet_cap obs slots, so the model's
+    // E must equal planet_cap (and the CPU eval obs must use the same width). Force them equal.
+    if (cfg.model.target_actor) cfg.model.max_entities = cfg.rollout.planet_cap;
     cfg.total_steps = a.l("total-steps", 30'000'000);
+    // --- iteration-driven schedule (curriculum + checkpoints by ITER) ---
+    cfg.stage1_iters = a.i("stage1-iters", 0);
+    cfg.stage2_iters = a.i("stage2-iters", 0);
+    cfg.stage3_iters = a.i("stage3-iters", 0);  // >0 enables the 4-stage (self-play) curriculum
+    cfg.total_iters = a.l("total-iters", 0);
+    cfg.ckpt_every_early = a.i("ckpt-every-early", 50);
+    cfg.ckpt_every_late = a.i("ckpt-every-late", 100);
     cfg.grpo.group_size = a.i("group-size", 8);
     cfg.grpo.num_groups = a.i("num-groups", 64);
     cfg.grpo.kl_beta = scratch ? 0.0 : a.f("kl-beta", 0.04);  // no KL anchor when from scratch
@@ -92,6 +121,12 @@ int main(int argc, char** argv) try {
     cfg.grpo.update_epochs = a.i("update-epochs", 2);
     cfg.grpo.minibatches = a.i("minibatches", 8);
     cfg.optim.lr = a.f("lr", 3e-4);
+    // --- algo: GRPO (group baseline, default) or PPO+GAE (value head + per-step credit) ---
+    cfg.algo = a.s("algo", "grpo");
+    cfg.model.use_value_head = cfg.is_ppo() || (a.i("use-value-head", 0) != 0);
+    cfg.ppo.gae_lambda = a.f("gae-lambda", 0.95);
+    cfg.ppo.vf_coef = a.f("vf-coef", 0.5);
+    cfg.ppo.gamma = a.f("ppo-gamma", 0.99);  // PPO discount (GAE applies it); GRPO uses --gamma (=1.0)
     cfg.selfplay.mix_random = a.f("mix-random", 1.0);
     cfg.selfplay.mix_starter = a.f("mix-starter", 1.0);
     cfg.device = a.s("device", "cuda");

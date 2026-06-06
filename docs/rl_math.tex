@@ -87,36 +87,89 @@ is penalized --- in all cases, ``everywhere.'' This continuous, target-free spac
 the earlier discrete} target-mode / angle-bin categorical actions; continuous headings restore full
 aiming precision without the $16$-bin aiming barrier, and without the target-pointer machinery.
 
+\paragraph{Optional action mask (\texttt{action\_mask\_policy}).} The no-mask design above was found
+to stall in practice: with $\sim\!E\cdot K$ controls, the reward-optimal behavior is to commit
+\emph{everywhere} (a lucky landing pays $w_{\mathrm v}$ while each illegal commit costs only the small
+$\rho$), so the policy sprays $\sim\!300$ invalid dispatches/step and the episode-level advantage
+cannot assign credit across the $720$ noisy controls (the gradient cancels; \S\ref{sec:dist}). The
+opt-in mask forces the per-planet legal mask $m_e u_e\mathbf{1}[S_e>0]$ onto the action: masked slots
+emit the no-op (all-zero $\Rightarrow\phi=0$) and are dropped from the joint log-prob and entropy sums
+(Eqs.~\ref{eq:logp},~\ref{eq:ent} sum only over unmasked $e$). The effective action then has only
+$\sim$(owned planets)$\cdot K$ live controls (a $10$--$20\times$ reduction), invalid dispatch
+$\to 0$ structurally, and credit assignment becomes tractable. It is a deliberate departure from
+``learn legality from the penalty,'' adopted when that pressure proved too weak at the margin.
+
 %==============================================================
 \section{Observation encoding}\label{sec:obs}
-For ego player $p$ and state $s$, the encoder (\texttt{native/core/encode.hpp}) emits
-\begin{itemize}[nosep]
-  \item entity features $X\in\R^{E\times F}$ ($F=32$): per planet --- $11$ \emph{body} features
-        (position $x,y$; orbital velocity magnitude; clockwise/counter-clockwise sign; radius;
-        production; ships; ownership code [$0$ neutral, $1$ ego, $2$--$4$ enemy seat];
-        distance-to-center; a \emph{comet flag} $\mathbb{1}[e\text{ is a comet}]$; and the action
-        mask $u_e$), plus a $21$-feature \emph{incoming-threat block} (below). \emph{Radius} and
-        \emph{production} are redundant for normal planets ($r=1+\ln(\mathrm{prod})$), but we feed
-        both so the net need neither invert the $\ln$ nor re-derive the reward-defining quantity. A
-        \emph{stationary} body has velocity $0$ and no rotation sign, but an \emph{orbiting} planet
-        and a \emph{comet} both move, so velocity alone cannot separate them --- hence the explicit
-        comet flag, which also marks where the radius law breaks (a comet carries the fixed
-        \texttt{COMET\_PRODUCTION}$=1$ at an unrelated radius). The comet's remaining lifetime is
-        \textbf{deliberately hidden by the engine} (agents may not reconstruct the spawn/expiry
-        schedule), so a binary flag is the only observable comet signal;
-  \item board-summary globals $g\in\R^{G}$ ($G=10$): a \emph{separate} small input (step/phase,
-        board-wide ship and production margins, planet counts, angular velocity, \dots) ---
-        \textbf{not} replicated into each planet row, but embedded once and broadcast to the action
-        heads (Section~\ref{sec:policy});
-  \item entity mask $m\in\{0,1\}^{E}$: $m_e=1$ iff slot $e$ is a real entity;
-  \item action mask $u\in\{0,1\}^{E}$: $u_e=1$ iff $e$ is an ego-owned planet with $>0$ ships
-        (legally able to launch). It is \emph{both} a per-planet input feature and the signal used
-        to \emph{decode} launches and score the invalid-dispatch penalty (Section~\ref{sec:reward});
-        \emph{neither $m$ nor $u$ masks the actor} --- the policy learns the legal subset from the
-        penalty, not a hard gate.
-\end{itemize}
+For ego player $p$ and state $s$, the encoder (\texttt{native/core/encode.hpp}) emits four arrays:
+the per-planet entity matrix $X\in\R^{E\times F}$ ($E=40$ planet slots, $F=32$ features each); the
+board-summary globals $g\in\R^{G}$ ($G=10$, a \emph{separate} input --- \textbf{not} replicated into
+each row); the entity mask $m\in\{0,1\}^{E}$ ($m_e=1$ iff slot $e$ holds a real entity); and the
+action mask $u\in\{0,1\}^{E}$ ($u_e=1$ iff $e$ is an ego-owned planet with $>0$ ships). \emph{Neither
+$m$ nor $u$ gates the actor} (Section~\ref{sec:policy}): $m$ only hides padding slots inside the
+attention block, and $u$ is \emph{both} an input feature (body row $10$, below) and the key used to
+\emph{decode} launches and score the invalid-dispatch penalty (Section~\ref{sec:reward}); the dynamic
+legal action subset is otherwise \emph{learned} from that penalty, not hard-masked. Each planet row
+$X_e\in\R^{32}$ is $11$ \emph{body} features followed by a $21$-feature \emph{incoming-threat block};
+all $32$ are listed exhaustively below.
+
+\paragraph{Per-planet body features (rows $0$--$10$).} Each value is normalized into roughly
+$[-1,1]$. Here $S$ is the planet's ship count, $\varrho$ its radius, $d_c$ its distance to board
+centre, $\omega$ the board angular velocity, and $\ell(n)=\ln(1+n)/\ln 1000$ the shared ship-count
+log-compressor.
+\begin{center}\small
+\begin{tabular}{@{}clll@{}}
+\toprule
+\# & Feature & Encoded value & Meaning \\
+\midrule
+0  & position $x$        & $p_x/100$                            & horizontal position on the $100{\times}100$ board, $[0,1]$ \\
+1  & position $y$        & $p_y/100$                            & vertical position, $[0,1]$ \\
+2  & orbital speed       & $|\omega|\,d_c/6$ ($0$ if static)    & tangential orbit speed, relative to $v_{\max}{=}6$ \\
+3  & spin sign           & $+1$ ccw / $-1$ cw / $0$             & rotation direction; $0$ if stationary or a comet \\
+4  & radius              & $\varrho/3$                          & capture / collision disk size \\
+5  & production          & $\mathrm{prod}/5$                    & ships made per tick (the reward-defining quantity) \\
+6  & ships               & $\ell(S)$                            & garrison size, log-compressed \\
+7  & ownership code      & $0$ neu / $1$ ego / $2$--$N$ enemy   & owner, ego-relative (stable under seat rotation) \\
+8  & dist.\ to centre    & $d_c/70.71$                          & radial distance from the sun ($70.71{=}\tfrac{\sqrt2}{2}{\cdot}100$, half-diagonal) \\
+9  & comet flag          & $\mathbb{1}[\text{comet}]$           & $1$ for a comet, else $0$ \\
+10 & action mask $u_e$   & $\mathbb{1}[\text{ego}\wedge S{>}0]$ & $1$ iff ego-owned with ships (also the decode/penalty key) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent\emph{Why feed both radius and production?} For a normal planet they are redundant
+($\varrho=1+\ln(\mathrm{prod})$), but we feed both so the net need neither invert the $\ln$ nor
+re-derive the reward-defining quantity. \emph{Why an explicit comet flag?} A \emph{stationary} body
+has speed $0$ and spin sign $0$, but an \emph{orbiting} planet and a \emph{comet} both move, so
+velocity alone cannot separate them; the flag also marks where the radius law breaks (a comet carries
+the fixed \texttt{COMET\_PRODUCTION}$=1$ at an unrelated radius). The comet's remaining lifetime is
+\textbf{deliberately hidden by the engine} (agents may not reconstruct the spawn/expiry schedule), so
+this binary flag is the only observable comet signal.
+
+\paragraph{Board-summary globals $g\in\R^{10}$.} One small vector summarising the whole board,
+embedded once and broadcast to the action heads (Section~\ref{sec:policy}) rather than copied into
+every planet row. With $\Sigma$ a board-wide sum, $n_p$ the planet count, and $\ell$ the same
+log-compressor:
+\begin{center}\small
+\begin{tabular}{@{}cll@{}}
+\toprule
+\# & Encoded value & Meaning \\
+\midrule
+0 & $\mathrm{step}/T$                   & game phase (fraction of the $T$-step episode elapsed) \\
+1 & $10\,\omega$                        & board angular velocity (orbit rate, scaled) \\
+2 & $\ell(\Sigma\,\text{ego ships})$    & ego total garrison ships (log) \\
+3 & $\ell(\Sigma\,\text{enemy ships})$  & enemy total garrison ships (log) \\
+4 & $n^{\mathrm{ego}}_p/n_p$            & ego share of all planets \\
+5 & $n^{\mathrm{enemy}}_p/n_p$          & enemy share of all planets \\
+6 & $n^{\mathrm{neutral}}_p/n_p$        & neutral share of all planets \\
+7 & $\ell(\Sigma\,\text{ego fleet})$    & ego in-flight (fleet) ships (log) \\
+8 & $\ell(\Sigma\,\text{enemy fleet})$  & enemy in-flight (fleet) ships (log) \\
+9 & $\min(n_p,E)/E$                     & planet-slot occupancy (how full the $E$ rows are) \\
+\bottomrule
+\end{tabular}
+\end{center}
 This game is a \textbf{free-for-all}: there are no allies; an inbound fleet is either the ego's own
-(a reinforcement) or an enemy's, distinguished by the owner feature in the threat block.
+(a reinforcement) or an enemy's, distinguished by the owner sign in the threat block (next).
 
 \paragraph{Incoming-fleet threat block (per planet, baked into the row).}\label{sec:threat}
 A purely \emph{reactive} policy cannot defend if it cannot see what is coming. For each planet we
@@ -147,13 +200,35 @@ the lists may overlap. Each of the $7$ slots contributes $3$ features
 \qquad \widetilde\nu=\frac{\ln(1+\nu)}{\ln 1000},
 \end{equation}
 i.e.\ \emph{who it belongs to} ($\mathrm{sgn}=+1$ ego reinforcement $/-1$ enemy), \emph{arrival
-time} as the raw ETA $\tau$ in ticks, and \emph{ship count} $\widetilde\nu$. Empty slots are all
-zero --- $\mathrm{sgn}=0$ there already marks ``no fleet,'' so $\tau=0$ is unambiguous --- giving
-the row's $7\times 3=21$ threat features. Because the list is attached to the destination planet's \emph{own} row, that planet
+time} as the ETA $\tau$ in ticks (scaled by $1/\texttt{THREAT\_ETA\_SCALE}$, $\texttt{THREAT\_ETA\_SCALE}=100$),
+and \emph{ship count} $\widetilde\nu$. Empty slots are all zero --- $\mathrm{sgn}=0$ there already
+marks ``no fleet,'' so $\tau=0$ is unambiguous --- giving the row's $7\times 3=21$ threat features,
+which occupy entity-row indices $11$--$31$ exactly as:
+\begin{center}\small
+\begin{tabular}{@{}cl ccc@{}}
+\toprule
+Slot & Ranked by & $\mathrm{sgn}$ idx & ETA idx & ships idx \\
+\midrule
+1 & soonest ETA (1st)   & 11 & 12 & 13 \\
+2 & soonest ETA (2nd)   & 14 & 15 & 16 \\
+3 & largest fleet (1st) & 17 & 18 & 19 \\
+4 & largest fleet (2nd) & 20 & 21 & 22 \\
+5 & largest fleet (3rd) & 23 & 24 & 25 \\
+6 & largest fleet (4th) & 26 & 27 & 28 \\
+7 & largest fleet (5th) & 29 & 30 & 31 \\
+\bottomrule
+\end{tabular}
+\end{center}
+(slots $1$--$2$ are the \texttt{N\_SOON} soonest-arriving, slots $3$--$7$ the \texttt{N\_BIG}
+largest; per slot the three values are $\mathrm{sgn}\in\{+1\ \text{mine},-1\ \text{enemy},0\
+\text{empty}\}$, ETA $=\tau/100$ ticks, ships $=\widetilde\nu=\ell(\nu)$).
+Because the list is attached to the destination planet's \emph{own} row, that planet
 directly sees ``what is coming at \emph{me} --- how soon, how big, and from whom'' --- local
-defensive awareness with no attention and no separate fleet tokens. The projection ignores planet
-rotation but is computed \emph{identically} in C++ and Python (parity-tested bit-for-bit), so the
-natively trained policy behaves identically when served from pure Python.
+defensive awareness baked into the \emph{observation}, with no separate fleet tokens. (The
+\emph{encoder} has no attention; the \emph{policy network} does add one cross-planet attention block,
+Section~\ref{sec:policy}, so a planet can read the others' positions to aim \emph{at} them.) The
+projection ignores planet rotation but is computed \emph{identically} in C++ and Python (parity-tested
+bit-for-bit), so the natively trained policy behaves identically when served from pure Python.
 
 %==============================================================
 \section{Policy network $\pi_\theta$}\label{sec:policy}
@@ -165,26 +240,43 @@ broadcast to every planet and concatenated at the action heads --- so the trunk 
 per-planet (per-row). It has \textbf{no value head} (GRPO needs no critic) and \textbf{no
 pointer/target head} (the action is continuous control). Let $d=\texttt{hidden}$.
 
-\paragraph{Single-stream trunk (the two variants under comparison).} Every planet row is
-processed independently and identically (weights shared across rows): an input projection
-$h^{(0)}_e=W_{\mathrm{proj}}x_e+b_{\mathrm{proj}}$, then a stack of residual blocks. We compare
-two trunks via \texttt{ModelConfig::use\_glu}, with everything downstream identical:
-\begin{description}[nosep,leftmargin=1.4em]
-\item[\textnormal{(A) GLU $+$ stacked MLP:}] one residual GLU block $\mathcal B$
-(Eq.~\ref{eq:glu}, Fig.~\ref{fig:glu}) then $n_{\mathrm{res}}{=}2$ residual MLP blocks
-$\mathcal M$;
-\item[\textnormal{(B) stacked MLP only:}] $n_{\mathrm{res}}{+}1$ residual MLP blocks (the GLU is
-replaced by a residual MLP block, matching depth) --- no multiplicative gating.
-\end{description}
-A residual MLP block is $\mathcal M(z)=z+W_b\,\relu(W_a z+b_a)+b_b$, so
+\paragraph{Trunk pipeline.} The trunk maps the projected rows through, in order: input projection
+$\to$ \textbf{one masked cross-planet self-attention block} $\to$ an optional residual GLU block
+(variant A) $\to$ $n_{\mathrm{res}}$ pre-LayerNorm residual MLP blocks $\to$ a final LayerNorm. The
+projection $h^{(0)}_e=W_{\mathrm{proj}}x_e+b_{\mathrm{proj}}$ and the MLP/GLU blocks are per-row
+(weights shared across planets); the attention block is the \emph{only} cross-row mixing.
+
+\smallskip\noindent\textbf{(1) Masked self-attention (the aiming mechanism).} A single-head attention
+over the $E$ planet tokens, computed on the pre-LayerNormed tokens $\tilde h=\mathrm{LN}(h^{(0)})$:
 \begin{equation}
-h_e = \big(\underbrace{\mathcal M\circ\mathcal M}_{n_{\mathrm{res}}}
-      \,[\,\circ\,\mathcal B\,]\big)\!\big(h^{(0)}_e\big)\in\R^{d},
+A = \softmax\!\Big(\tfrac{(\tilde h W_Q)(\tilde h W_K)^{\!\top}}{\sqrt d}
+      + \mathcal{M}_{\mathrm{ent}}\Big)\,(\tilde h W_V),\qquad
+h^{(1)} = h^{(0)} + A\,W_O,
+\end{equation}
+where the key-mask $\mathcal{M}_{\mathrm{ent}}[\,\cdot,j]=-\infty$ for \emph{padding} planets
+($m_j=0$, the \texttt{entity\_mask}) so live planets never attend to empty slots. This block is what
+lets a planet read another planet's \emph{position} and point a launch \emph{at} it --- a purely
+per-row trunk cannot represent a targeted heading (it was added precisely to unblock aiming).
+
+\smallskip\noindent\textbf{(2) Optional residual GLU} (variant A only, \texttt{use\_glu};
+Eq.~\ref{eq:glu}, Fig.~\ref{fig:glu}): $h \mathrel{+}= W_o\big((W_v h)\odot\sigma(W_g h)\big)$.
+
+\smallskip\noindent\textbf{(3) Pre-LayerNorm residual MLP blocks} ($n_{\mathrm{res}}$ of them):
+$\mathcal M(z)=z+W_b\,\relu\!\big(W_a\,\mathrm{LN}(z)\big)+b_b$, then a \textbf{final LayerNorm}. The
+pre-norm is not cosmetic: without it the deep trunk drove the head pre-activations large, the sigmoid
+squash saturated, and the aiming gradient vanished --- pre-LN keeps activations bounded so the heads
+stay in the squash's responsive range. So
+\begin{equation}
+h_e = \mathrm{LN}\Big(\big(\underbrace{\mathcal M\circ\dots\circ\mathcal M}_{n_{\mathrm{res}}}\big)
+      \big[\,\circ\,\mathcal B_{\mathrm{GLU}}\,\big]\big(h^{(1)}_e\big)\Big)\in\R^{d},
 \qquad e=1,\dots,E,
 \end{equation}
-(the bracketed $\mathcal B$ present only in variant A). The trunk has no mask-aware mean-pool and no
-cross-row mixing --- each planet is processed independently from its own body $+$ threat features;
-the only board-wide signal is the small broadcast embedding $g'$ added at the heads.
+($\mathcal B_{\mathrm{GLU}}$ present only in variant A; $h^{(1)}$ is the post-attention token). The
+\texttt{use\_glu} A/B (GLU vs.\ an extra residual MLP) is the trunk comparison; everything else is identical.
+Two masks appear and must not be confused: \texttt{entity\_mask} ($m_e$, live-vs-padding) gates
+\emph{attention} above; \texttt{action\_mask} ($u_e\mathbf 1[S_e>0]$, owned-with-ships) gates the
+\emph{action} (the optional policy mask, Section~\ref{sec:dist}). The board-wide signal is the small
+broadcast embedding $g'$ concatenated at the heads.
 
 \begin{figure}[h]
 \centering
@@ -196,28 +288,31 @@ the only board-wide signal is the small broadcast embedding $g'$ added at the he
   act/.style={draw, rounded corners=3pt, fill=green!13,  align=center, minimum height=12mm, inner sep=2.5pt}]
 \node[io]  (x)              {planet rows $X{:}E{\times}F$\\\scriptsize(body $+$ threat)};
 \node[enc, right=of x]    (proj) {input proj\\$F{\to}d$};
-\node[glu, right=of proj] (glu)  {residual GLU\\\scriptsize(variant A)};
-\node[enc, right=of glu]  (res)  {$n_{\mathrm{res}}\times$\\residual MLP};
-\node[act, right=of res, yshift=6.5mm]  (mu)  {mean head\\$d{+}d_g{\to}3K$};
+\node[glu, right=of proj] (attn) {masked\\self-attn\\\scriptsize(LN, cross-planet)};
+\node[glu, right=of attn] (glu)  {residual GLU\\\scriptsize(variant A)};
+\node[enc, right=of glu]  (res)  {$n_{\mathrm{res}}\times$\\LN res-MLP};
+\node[act, right=of res, yshift=6.5mm]  (mu)  {MLP mean head\\$d{+}d_g{\to}d{\to}3K$};
 \node[act, right=of res, yshift=-6.5mm] (ls)  {log-std\\\scriptsize head \emph{or} vector};
-\node[act, right=8mm of mu, yshift=-6.5mm] (samp) {sample\\$+$ squash};
+\node[act, right=8mm of mu, yshift=-6.5mm] (samp) {sample\\$+$ squash\\\scriptsize($+$mask)};
 \node[io,  right=of samp] (a)  {$K$ triples\\$(d^x,d^y,\phi)$};
 \node[io, below=9mm of res] (g) {board globals $g{:}G$};
 \node[enc, right=of g] (gemb) {embed\\$G{\to}d_g$};
-\draw[->] (x)--(proj); \draw[->] (proj)--(glu); \draw[->] (glu)--(res);
+\draw[->] (x)--(proj); \draw[->] (proj)--(attn); \draw[->] (attn)--(glu); \draw[->] (glu)--(res);
 \draw[->] (res)--(mu); \draw[->] (res)--(ls);
 \draw[->] (g)--(gemb); \draw[->] (gemb)--(mu); \draw[->] (gemb)--(ls);
 \draw[->] (mu)--(samp); \draw[->] (ls)--(samp); \draw[->] (samp)--(a);
 \end{tikzpicture}
-\caption{Policy network data flow (continuous action). Each planet row (body $+$ incoming-threat
-features) is projected and passed through the shared per-row trunk: variant A inserts one residual
-GLU block (Fig.~\ref{fig:glu}) before the $n_{\mathrm{res}}$ residual MLP blocks; variant B uses
-residual MLP blocks only. The $G$ board globals are embedded separately ($g'$, dim $d_g$) and
-broadcast to the heads. A mean head maps $[h_e;g']$ to the $3K$ means $\mu_e$; the $3K$ log-stds
+\caption{Policy network data flow (continuous action). Planet rows are projected, then mixed by one
+\textbf{masked cross-planet self-attention} block (pre-LayerNorm; \texttt{entity\_mask} hides padding
+planets) --- the only cross-row step, and what enables targeted aiming. The result passes through the
+shared per-row trunk: variant A inserts one residual GLU block (Fig.~\ref{fig:glu}) before the
+$n_{\mathrm{res}}$ \emph{pre-LayerNorm} residual MLP blocks (variant B: MLP blocks only), then a final
+LayerNorm. The $G$ board globals are embedded separately ($g'$, dim $d_g$) and broadcast to the heads.
+A two-layer \textbf{MLP} mean head maps $[h_e;g']$ to the $3K$ means $\mu_e$; the $3K$ log-stds
 $\varsigma_e$ come from \emph{either} a second head (state-dependent) \emph{or} a shared learnable
-vector (state-independent) --- a switchable A/B. Together they define a squashed Gaussian
-(Section~\ref{sec:dist}) whose samples are the $K$ fleet triples $(d^x,d^y,\phi)$ for planet $e$. No
-pooling, no cross-row mixing, no value or pointer head.}
+vector (state-independent) --- a switchable A/B. They define a squashed Gaussian
+(Section~\ref{sec:dist}), optionally \texttt{action\_mask}ed to owned slots, whose samples are the $K$
+fleet triples $(d^x,d^y,\phi)$ for planet $e$. No pooling, no value or pointer head.}
 \label{fig:arch}
 \end{figure}
 
@@ -262,8 +357,11 @@ residual keeps optimization easy. It is applied per planet row and shares weight
 just like the rest of the trunk. Whether this gating earns its keep over plain stacked MLPs
 (variant A vs.\ B) is exactly the comparison this experiment is set up to answer.
 
-\paragraph{Continuous action heads (mean, and a switchable log-std).} A \emph{mean} head reads each
-planet token, $\mu_e \in\R^{3K}$. The log-std $\varsigma_e$ is supplied in one
+\paragraph{Continuous action heads (mean, and a switchable log-std).} The heads read
+$h'_e=[\,h_e;\,g'\,]\in\R^{d+d_g}$ (trunk token concatenated with the broadcast globals embedding). The
+\emph{mean} head is a \textbf{two-layer MLP}, $\mu_e=W_{\mu 2}\,\relu(W_{\mu 1}h'_e+b_{\mu 1})+b_{\mu 2}\in\R^{3K}$
+(\texttt{mu\_h1}$\to$ReLU$\to$\texttt{mu\_h2}) --- nonlinear, not a single affine map. The log-std
+$\varsigma_e$ is supplied in one
 of \textbf{two switchable ways} (\texttt{ModelConfig::std\_state\_dependent}), kept as an explicit
 A/B because they trade off expressiveness against training stability:
 \begin{description}[nosep,leftmargin=1.4em]
@@ -275,36 +373,59 @@ can destabilize (it may drive $\sigma\!\to\!0$ in ``confident'' states and stop 
 shared across all planets and states --- the standard, stable PPO default.
 \end{description}
 Either way, $\sigma_e=\exp\!\big(\clip(\varsigma_e,\varsigma_{\min},\varsigma_{\max})\big)$, the
-clip keeping $\sigma$ from collapsing to $0$ or exploding; the mean head and trunk are identical
+clip keeping $\sigma$ from collapsing to $0$ or exploding. \textbf{Exploration anneal (explore$\to$exploit
+hand-off).} The entropy bonus pushes $\varsigma$ \emph{up} to the cap, so with a fixed cap $\sigma$ pins
+at its maximum for the whole run: the sampled action $\varphi(\mu+\sigma\,\varepsilon)$ stays
+noise-dominated, the per-trajectory advantage is then $\approx$uncorrelated with the mean, and the
+policy-gradient terms \emph{cancel} --- a frozen policy that never exploits (observed empirically:
+$\operatorname{adv\_std}=1$ yet $\mathrm{kl}\to0$). The fix is a two-phase schedule on the cap. PHASE~1
+(the first \texttt{sigma\_decay\_iters} iterations) \emph{forces} the cap down from $\varsigma_{\max}$ to
+$\varsigma_{\max}^{\,\mathrm{end}}$ (e.g.\ $\sigma:1.0\!\to\!0.05$), so the action quickly becomes
+mean-determined and the gradient attributable. PHASE~2 releases the cap to
+$\varsigma_{\max}^{\,\mathrm{post}}$ (\texttt{logstd\_max\_post}) and hands $\sigma$ to the
+state-dependent log-std head, free within $[\,e^{\varsigma_{\min}},\,e^{\varsigma_{\max}^{\,\mathrm{post}}}\,]$
+(e.g.\ $[0.01,0.2]$): it re-widens where the board is uncertain and tightens where the move is forced.
+(With \texttt{sigma\_decay\_iters}$=0$ the cap instead decays linearly over the whole run, or not at all
+if $\varsigma_{\max}^{\,\mathrm{end}}{=}\varsigma_{\max}$.) The mean head and trunk are identical
 across the two, only the source of $\varsigma$ differs, and $\varsigma$ is trained by the same
 surrogate$+$entropy gradients (Section~\ref{sec:dist}). Each head emits $3K=15$ numbers --- the
 per-component parameters of the $K$ fleet triples $(d^x,d^y,\phi)$; sampling and the $[0,1]$ squash
-are in Section~\ref{sec:dist}, decoding into engine launches in Section~\ref{sec:decode}. Plain
-linear heads suffice because the action is continuous control rather than a discrete target
-ranking, so the pointer actor of the previous design is retired together with target mode.
+are in Section~\ref{sec:dist}, decoding into engine launches in Section~\ref{sec:decode}. The mean
+head is a 2-layer MLP (above) rather than a single linear map --- the extra nonlinearity was added
+alongside attention while chasing the aiming gradient; the discrete pointer/target actor of the
+previous design is retired together with target mode.
 
-\paragraph{Layer inventory ($d=128$, variant A).} All layers are \texttt{nn.Linear}. The trunk is
-the input projection, one residual GLU block (variant A only), and $n_{\mathrm{res}}{=}2$ residual
-MLP blocks; then the small board embedding and the two action heads.
+\paragraph{Calm initialization (\texttt{init\_mu\_scale}, \texttt{init\_phi\_bias}).} A deep
+from-scratch trunk would otherwise drive the freshly initialised mean head to large, arbitrary
+pre-squash values, so the policy would either spray launches everywhere or saturate the squash before
+learning anything. Two init knobs tame the start: the final mean-head weights are scaled by
+\texttt{init\_mu\_scale}$=0.02$ so every output begins $\approx$ its bias regardless of trunk depth,
+and the $\phi$ (ship-fraction) component's bias is set to \texttt{init\_phi\_bias}$=-4$ so
+$\varphi(-4)\approx0.018$ --- with the initial $\sigma$ only $\sim$$14\%$ of slots commit a launch at
+step~$0$. Less calm (smaller $|\text{bias}|$, larger scale) means more early commits and more mistakes
+to learn from; too calm and the policy is inert and learns nothing.
+
+\paragraph{Layer inventory (variant A).} Modules are \texttt{nn.Linear} except the \texttt{ln\_*}
+which are \texttt{nn.LayerNorm}. Names match \texttt{policy\_net.cpp}.
 \begin{center}\small
 \begin{tabular}{@{}lll@{}}
 \toprule
 Module & Layers (name: shape) & Count \\
 \midrule
 Input projection & \texttt{proj}:$F{\to}d$ & 1 \\
+Self-attention & \texttt{attn\_\{q,k,v,o\}}:$d{\to}d$ & 4 \\
+LayerNorm (pre-attn, per-res, final) & \texttt{ln\_attn}, \texttt{ln\_res$i$}, \texttt{ln\_out}:$d$ & $n_{\mathrm{res}}{+}2$ \\
 Residual GLU (variant A) & \texttt{glu\_\{gate,val,out\}}:$d{\to}d$ & 3 \\
-Residual MLP $\times n_{\mathrm{res}}$ & \texttt{r\{0,1\}a}, \texttt{r\{0,1\}b}:$d{\to}d$ & 4 \\
+Residual MLP $\times n_{\mathrm{res}}$ & \texttt{res$i$\{a,b\}}:$d{\to}d$ & $2n_{\mathrm{res}}$ \\
 Board-globals embed & \texttt{g\_embed}:$G{\to}d_g$ & 1 \\
-Mean head & \texttt{mu\_head}:$d{+}d_g{\to}3K$ & 1 \\
+Mean head (MLP) & \texttt{mu\_h1}:$d{+}d_g{\to}d$, \texttt{mu\_h2}:$d{\to}3K$ & 2 \\
 Log-std (switchable) & \texttt{logstd\_head}:$d{+}d_g{\to}3K$ \ \emph{or} vector $\varsigma{:}3K$ & 1 \\
-\midrule
-\multicolumn{2}{@{}l}{\emph{Trainable total (no critic, no pointer --- GRPO)}} & \textbf{11} \\
 \bottomrule
 \end{tabular}
 \end{center}
-\noindent Variant B replaces the $3$-layer GLU block with one $2$-layer residual MLP block
-(i.e.\ $3$ residual MLP blocks, no gating). With $F{=}30$ ($9$ body $+$ $21$ threat), $G{=}10$,
-$d_g{=}32$, $d{=}128$, $K{=}5$ this is $\approx 0.12$M parameters (A) / $\approx 0.10$M (B). The
+\noindent (No critic, no pointer head --- GRPO.) Variant B replaces the GLU block with an extra
+residual MLP block (no gating). With $F{=}32$ ($11$ body $+$ $21$ threat), $G{=}10$, $d_g{=}32$, and
+the trained scale $d{=}512$, $n_{\mathrm{res}}{=}5$, $K{=}5$ this is on the order of a few~M parameters. The
 pure-Python serving twin (\texttt{orbit\_wars\_rl/agents/ppo\_policy.py}) must mirror this trunk,
 board path, and heads bit-for-bit for the Kaggle submission to reproduce the natively trained
 policy; it carries no critic.
@@ -339,8 +460,11 @@ just the total log-std),
 so the bonus regularizes the exploration scale directly. Unlike the previous discrete policy, the
 sums run over \emph{all} $E$ planet slots, not only real entities: the invalid-dispatch penalty
 (Section~\ref{sec:reward}) --- not a mask --- is what drives the controls on non-existent / unowned
-slots toward ``no launch.'' At evaluation the policy is greedy, $a_{e,k,j}=\varphi(\mu_{e,k,j})$ (no
-sampling). \emph{(Remark: the Gaussian is over the Cartesian direction components $(d^x,d^y)$, not a
+slots toward ``no launch.'' \textbf{Exception (\texttt{action\_mask\_policy}):} when the optional
+action mask is enabled, masked planets ($m_e u_e\mathbf 1[S_e>0]=0$) are forced to the no-op
+($a_e\!=\!0$) and \emph{dropped} from both sums, so the joint log-prob and entropy run only over the
+legal (owned, in-supply) slots --- the gradient is then spent only there. At evaluation the policy is
+greedy, $a_{e,k,j}=\varphi(\mu_{e,k,j})$ (masked the same way; no sampling). \emph{(Remark: the Gaussian is over the Cartesian direction components $(d^x,d^y)$, not a
 circular angle, so there is no $0/360^\circ$ wrap discontinuity --- the earlier scalar-heading
 parameterization had one; emitting a direction vector and decoding $\theta=\operatorname{atan2}(\cdot)$
 removes it, at the cost of a benign indeterminacy only at the exact centre $d^x=d^y=\tfrac12$.)}
@@ -713,7 +837,13 @@ $K$ & \texttt{ModelConfig::fleets\_per\_planet} & $5$ \\
 $\tau_{\mathrm{act}}$ & \texttt{ModelConfig::act\_threshold} (fleet-commit) & $0.05$ \\
 \texttt{use\_glu} & \texttt{ModelConfig::use\_glu} (trunk A/B), $n_{\mathrm{res}}$ & true,\ $2$ \\
 $[\varsigma_{\min},\varsigma_{\max}]$ & \texttt{ModelConfig} log-std clip & $[-2,\ 1]$ \\
+$\varsigma_{\max}^{\,\mathrm{end}}$ & \texttt{logstd\_max\_end} (phase-1 forced-decay target) & $=\varsigma_{\max}$ (off) \\
+$\varsigma_{\max}^{\,\mathrm{post}}$ & \texttt{logstd\_max\_post} (phase-2 head cap) & $=\varsigma_{\max}^{\,\mathrm{end}}$ \\
+$N_{\sigma}$ & \texttt{sigma\_decay\_iters} (phase-1 length, iters) & $0$ (off) \\
 \texttt{std\_state\_dependent} & \texttt{ModelConfig} (\(\varsigma\) head vs vector) & true \\
+\texttt{init\_mu\_scale} & \texttt{ModelConfig} (calm-init mean-head weight scale) & $0.02$ \\
+\texttt{init\_phi\_bias} & \texttt{ModelConfig} (calm-init $\phi$ bias at step $0$) & $-4.0$ \\
+\texttt{action\_mask\_policy} & \texttt{ModelConfig} (hard-mask actor to legal slots) & false \\
 $G,\,N$ & \texttt{GrpoConfig::group\_size}, \texttt{num\_groups} & $8,\ 64$ \\
 $\epsilon$ & \texttt{GrpoConfig::clip} & $0.2$ \\
 $\beta$ & \texttt{GrpoConfig::kl\_beta} & $0.04$ \\
