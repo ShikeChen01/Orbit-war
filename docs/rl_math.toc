@@ -1,46 +1,58 @@
-\contentsline {section}{\numberline {1}Problem setup}{1}{section.1}%
+\contentsline {section}{\numberline {1}Problem setup}{2}{section.1}%
 \contentsline {paragraph}{Training scope of this document.}{2}{section*.2}%
-\contentsline {paragraph}{Continuous, per-planet action space.}{2}{section*.3}%
-\contentsline {paragraph}{No masking --- the legal action space is \emph {learned} from penalties.}{2}{section*.4}%
-\contentsline {paragraph}{Optional action mask (\texttt {action\_mask\_policy}).}{2}{section*.5}%
+\contentsline {paragraph}{Target action space (current --- \texttt {target\_actor}).}{2}{section*.3}%
+\contentsline {paragraph}{Superseded continuous actor (\texttt {target\_actor=false}).}{3}{section*.4}%
 \contentsline {section}{\numberline {2}Observation encoding}{3}{section.2}%
-\contentsline {paragraph}{Per-planet body features (rows $0$--$10$).}{3}{section*.6}%
-\contentsline {paragraph}{Board-summary globals $g\in \mathbb {R}^{10}$.}{3}{section*.7}%
-\contentsline {paragraph}{Incoming-fleet threat block (per planet, baked into the row).}{4}{section*.8}%
-\contentsline {subparagraph}{Two ranked views per planet (tuneable counts).}{4}{section*.9}%
+\contentsline {paragraph}{Per-planet body features (rows $0$--$10$).}{4}{section*.5}%
+\contentsline {paragraph}{Board-summary globals $g\in \mathbb {R}^{10}$.}{4}{section*.6}%
+\contentsline {paragraph}{Incoming-fleet threat block (per planet, baked into the row).}{4}{section*.7}%
+\contentsline {subparagraph}{Two ranked views per planet (tuneable counts).}{5}{section*.8}%
 \contentsline {section}{\numberline {3}Policy network $\pi _\theta $}{5}{section.3}%
-\contentsline {paragraph}{Trunk pipeline.}{5}{section*.10}%
-\contentsline {paragraph}{Residual GLU block.}{6}{section*.11}%
-\contentsline {paragraph}{Continuous action heads (mean, and a switchable log-std).}{6}{section*.12}%
-\contentsline {paragraph}{Calm initialization (\texttt {init\_mu\_scale}, \texttt {init\_phi\_bias}).}{7}{section*.13}%
-\contentsline {paragraph}{Layer inventory (variant A).}{7}{section*.14}%
-\contentsline {section}{\numberline {4}Action distribution}{8}{section.4}%
-\contentsline {paragraph}{How the mean and log-std heads are learned (no separate target).}{9}{section*.15}%
-\contentsline {paragraph}{Decode: controls $\to $ engine launches.}{9}{section*.16}%
-\contentsline {section}{\numberline {5}Reward and return}{9}{section.5}%
-\contentsline {paragraph}{Production-only dense reward $+$ invalid-dispatch penalty.}{9}{section*.17}%
-\contentsline {paragraph}{Enemy-suppression term (relative to the enemy's own recent growth).}{10}{section*.18}%
-\contentsline {paragraph}{Outcome, the draw anchor, and the loss forfeit.}{10}{section*.19}%
-\contentsline {paragraph}{Implemented bounded variant (current default).}{10}{section*.20}%
-\contentsline {paragraph}{Miss penalty $M$ --- the aiming \emph {stick} (\texttt {miss\_launch\_penalty}).}{11}{section*.21}%
-\contentsline {paragraph}{Note --- 2p vs.\ 4p objective.}{11}{section*.22}%
-\contentsline {section}{\numberline {6}Curriculum}{11}{section.6}%
-\contentsline {paragraph}{Stage 1 --- solo expansion (passive opponent).}{12}{section*.23}%
-\contentsline {paragraph}{Stage 2 --- $1$v$1$ vs.\ starter.}{12}{section*.24}%
-\contentsline {paragraph}{Stage 3 --- mixed opponents.}{12}{section*.25}%
-\contentsline {section}{\numberline {7}GRPO update}{12}{section.7}%
-\contentsline {subsection}{\numberline {7.1}Grouped sampling}{12}{subsection.7.1}%
-\contentsline {subsection}{\numberline {7.2}Group-relative advantage (no critic)}{12}{subsection.7.2}%
-\contentsline {subsection}{\numberline {7.3}Clipped policy surrogate}{13}{subsection.7.3}%
-\contentsline {subsection}{\numberline {7.4}KL anchor to a reference policy}{13}{subsection.7.4}%
-\contentsline {subsection}{\numberline {7.5}Total objective}{13}{subsection.7.5}%
-\contentsline {subsection}{\numberline {7.6}Optimization}{13}{subsection.7.6}%
-\contentsline {section}{\numberline {8}Self-play league}{14}{section.8}%
-\contentsline {section}{\numberline {9}Batched GPU simulator}{14}{section.9}%
-\contentsline {paragraph}{Layout (Structure-of-Arrays, leading batch $B$).}{14}{section*.26}%
-\contentsline {paragraph}{Vectorized dynamics.}{14}{section*.27}%
-\contentsline {paragraph}{Parity.}{14}{section*.28}%
-\contentsline {paragraph}{On-device rollout, host-offloaded trajectory.}{14}{section*.29}%
-\contentsline {paragraph}{Deep-net numerical stability.}{15}{section*.30}%
-\contentsline {section}{\numberline {10}Symbols $\leftrightarrow $ \texttt {config.hpp}}{16}{section.10}%
-\contentsline {section}{\numberline {A}Appendix: the PPO/GAE method being replaced}{16}{appendix.A}%
+\contentsline {paragraph}{Trunk pipeline.}{6}{section*.9}%
+\contentsline {paragraph}{Residual GLU block.}{6}{section*.10}%
+\contentsline {paragraph}{Target-actor heads.}{7}{section*.11}%
+\contentsline {paragraph}{Continuous action heads (mean, and a switchable log-std) --- continuous-actor variant.}{7}{section*.12}%
+\contentsline {paragraph}{Calm initialization (\texttt {init\_mu\_scale}, \texttt {init\_phi\_bias}).}{8}{section*.13}%
+\contentsline {paragraph}{Layer inventory (variant A).}{9}{section*.14}%
+\contentsline {section}{\numberline {4}Action distribution}{9}{section.4}%
+\contentsline {paragraph}{Continuous-$\phi $ target variant (native, \texttt {TargetActorDist}).}{10}{section*.15}%
+\contentsline {paragraph}{Continuous actor (superseded).}{10}{section*.16}%
+\contentsline {paragraph}{How the destination and $\phi $ heads are learned (no separate target).}{10}{section*.17}%
+\contentsline {paragraph}{Decode: action $\to $ engine launch.}{11}{section*.18}%
+\contentsline {section}{\numberline {5}Reward and return}{11}{section.5}%
+\contentsline {paragraph}{1. Outcome $O$ --- a flat-then-decaying ``flip of winning.''}{11}{section*.19}%
+\contentsline {paragraph}{2. Capture $C$.}{12}{section*.20}%
+\contentsline {paragraph}{3. Dispatch $D$ --- a bounded ``get moving'' carrot.}{12}{section*.21}%
+\contentsline {paragraph}{4. Production milestone $P$ --- bring back the economy reward.}{12}{section*.22}%
+\contentsline {paragraph}{Algorithm: PPO\,+\,GAE per-step assembly.}{12}{section*.23}%
+\contentsline {paragraph}{Legacy production-shaping reward (off in this run).}{12}{section*.24}%
+\contentsline {paragraph}{Note --- 2p vs.\ 4p objective.}{13}{section*.25}%
+\contentsline {section}{\numberline {6}Curriculum (leading: none --- the Elo league \emph {is} the curriculum)}{13}{section.6}%
+\contentsline {paragraph}{Legacy native 4-stage schedule.}{13}{section*.26}%
+\contentsline {section}{\numberline {7}GRPO update}{13}{section.7}%
+\contentsline {subsection}{\numberline {7.1}Grouped sampling}{13}{subsection.7.1}%
+\contentsline {subsection}{\numberline {7.2}Group-relative advantage (no critic)}{14}{subsection.7.2}%
+\contentsline {subsection}{\numberline {7.3}Clipped policy surrogate}{14}{subsection.7.3}%
+\contentsline {subsection}{\numberline {7.4}KL anchor to a reference policy}{14}{subsection.7.4}%
+\contentsline {subsection}{\numberline {7.5}Total objective}{14}{subsection.7.5}%
+\contentsline {subsection}{\numberline {7.6}Optimization}{15}{subsection.7.6}%
+\contentsline {section}{\numberline {8}Self-play league (Elo / PFSP)}{15}{section.8}%
+\contentsline {paragraph}{Opponent sampling (PFSP --- the whole pool, every iteration).}{15}{section*.27}%
+\contentsline {paragraph}{Elo update.}{15}{section*.28}%
+\contentsline {paragraph}{Pool management.}{15}{section*.29}%
+\contentsline {paragraph}{Native variant (win-gated mix).}{16}{section*.30}%
+\contentsline {section}{\numberline {9}Batched GPU simulator}{16}{section.9}%
+\contentsline {paragraph}{Layout (Structure-of-Arrays, leading batch $B$).}{16}{section*.31}%
+\contentsline {paragraph}{Vectorized dynamics.}{16}{section*.32}%
+\contentsline {paragraph}{Parity.}{16}{section*.33}%
+\contentsline {paragraph}{On-device rollout, host-offloaded trajectory.}{16}{section*.34}%
+\contentsline {paragraph}{Deep-net numerical stability.}{17}{section*.35}%
+\contentsline {section}{\numberline {10}Symbols $\leftrightarrow $ \texttt {config.hpp}}{19}{section.10}%
+\contentsline {section}{\numberline {A}Appendix: PPO\,+\,GAE (the current default algorithm)}{20}{appendix.A}%
+\contentsline {section}{\numberline {B}Appendix: search-based policy improvement --- the AlphaZero/MuZero family}{20}{appendix.B}%
+\contentsline {subsection}{\numberline {B.1}What maps directly: AlphaZero, not MuZero}{20}{subsection.B.1}%
+\contentsline {subsection}{\numberline {B.2}Obstacle 1: a combinatorial (factored) action space}{21}{subsection.B.2}%
+\contentsline {subsection}{\numberline {B.3}Obstacle 2: very few simulations --- Gumbel policy improvement}{21}{subsection.B.3}%
+\contentsline {subsection}{\numberline {B.4}Obstacle 3: simultaneous moves and a hidden opponent}{22}{subsection.B.4}%
+\contentsline {subsection}{\numberline {B.5}Targets, loss, and the training-loop change}{22}{subsection.B.5}%
+\contentsline {subsection}{\numberline {B.6}Minimal first cut for Orbit Wars}{23}{subsection.B.6}%

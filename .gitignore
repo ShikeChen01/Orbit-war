@@ -30,5 +30,5 @@ orbit_wars_rl/_native/*.lib
 *.exe
 *.pdb
 .env
-
+weights/
 # keep REFERENCE_* (authoritative game spec copies) tracked on purpose
