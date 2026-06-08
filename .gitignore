@@ -19,6 +19,11 @@ err.txt
 imperr*.txt
 smoke_err.txt
 
+# notebook backups + executed SMOKE copies (junk; regenerate as needed)
+*.ipynb.bak*
+*.SMOKE.ipynb
+*.SMOKE.out.ipynb
+
 # native C++ build artifacts
 native/_bld/
 native/build/
@@ -32,3 +37,21 @@ orbit_wars_rl/_native/*.lib
 .env
 weights/
 # keep REFERENCE_* (authoritative game spec copies) tracked on purpose
+
+# LaTeX build artifacts (keep the .tex source + compiled .pdf tracked)
+*.aux
+*.fdb_latexmk
+*.fls
+*.toc
+*.out
+*.synctex.gz
+*.bbl
+*.blg
+*.lof
+*.lot
+
+# notebook training outputs + scratch (regenerate from runs/)
+notebooks/metrics.json
+notebooks/league_agents/
+notebooks/render/
+_*.ipynb
