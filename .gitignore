@@ -55,3 +55,9 @@ notebooks/metrics.json
 notebooks/league_agents/
 notebooks/render/
 _*.ipynb
+
+# notebook checkpoint dumps (large .pt weights + loss curves; don't bloat git)
+notebooks/weight/
+
+# notebook text-export scratch
+.nbtmp/

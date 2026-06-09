@@ -37,14 +37,21 @@ def load_notebook_defs():
 def build_actor(g, path):
     """Build a PolicyNet matching the ckpt config; load actor weights (strict=False -> skip value head)."""
     blob = torch.load(path, map_location="cpu", weights_only=False)
-    cfg = blob.get("config", {})
+    cfg = blob.get("config") or {}                       # config may be absent OR explicitly None
+    # config-less checkpoints (e.g. E801): infer arch from the weight keys themselves
+    import re
+    mkeys = list(blob["model"].keys())
+    has_attn_w = any(k.startswith("attn_") for k in mkeys)
+    has_glu_w = any(k.startswith("glu_") for k in mkeys)
+    res_idx = [int(m.group(1)) for k in mkeys for m in [re.match(r"res_a\.(\d+)\.", k)] if m]
+    n_res_w = (max(res_idx) + 1) if res_idx else g["N_RES_BLOCKS"]
     PolicyNet = g["PolicyNet"]
     net = PolicyNet(
         g["F_DIM"], g["G_DIM"], cfg.get("HIDDEN", g["HIDDEN"]), cfg.get("D_G", g["D_G"]),
-        g["PLANET_CAP"], cfg.get("N_RES_BLOCKS", g["N_RES_BLOCKS"]), cfg.get("USE_GLU", g["USE_GLU"]),
+        g["PLANET_CAP"], cfg.get("N_RES_BLOCKS", n_res_w), cfg.get("USE_GLU", has_glu_w),
         cfg.get("STD_STATE_DEP", g["STD_STATE_DEP"]), g["LOGSTD_MIN"], g["LOGSTD_MAX"],
         g["INIT_MU_SCALE"], g["INIT_PHI_BIAS"],
-        use_attention=cfg.get("USE_ATTENTION", True), value_res_blocks=0,
+        use_attention=cfg.get("USE_ATTENTION", has_attn_w), value_res_blocks=0,
     )
     # phi-bucket count must match what the actor was trained with
     npx = blob["model"]["phi_cat.bias"].shape[0]
