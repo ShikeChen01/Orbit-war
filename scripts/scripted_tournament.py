@@ -1,9 +1,11 @@
 """Round-robin all scripted agents in the STRICTLY-OFFICIAL Kaggle engine to justify their anchor ELOs.
 
-Wraps each scripted agent (opponent_action codes: random/starter/medium/greedy/ultimate) as a Kaggle
+Wraps each scripted agent (opponent_action codes: random/starter/medium/greedy) as a Kaggle
 agent (obs -> GpuEnv with the scripted side as owner 1 -> opponent_action -> moves), plays every pair
 both seats, and fits implied ELOs (anchored random=0) from the pairwise win-rate matrix. Compare the
-implied gaps to the assigned anchors (random 0, starter 600, greedy 900, medium 1000, ultimate 1200).
+implied gaps to the assigned anchors (random 0, starter 450, greedy 500, medium 500 -- the
+Kaggle-leaderboard-calibrated values; in-house implied gaps are expected to run WIDER than
+these compressed anchors).
 
     python scripts/scripted_tournament.py --games 40
 """
@@ -15,8 +17,8 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "scripts"))
 import viz_target_ckpt as V   # noqa: E402
 
-KIND2CODE = {"random": 0, "starter": 1, "medium": 3, "greedy": 4, "ultimate": 5}
-ASSIGNED = {"random": 0, "starter": 600, "greedy": 900, "medium": 1000, "ultimate": 1200}
+KIND2CODE = {"random": 0, "starter": 1, "medium": 3, "greedy": 4}
+ASSIGNED = {"random": 0, "starter": 450, "greedy": 500, "medium": 500}
 
 
 def _g(obs, key, default=None):
@@ -130,7 +132,7 @@ def main():
     os.chdir(REPO)
     from concurrent.futures import ProcessPoolExecutor
 
-    kinds = ["random", "starter", "greedy", "medium", "ultimate"]
+    kinds = ["random", "starter", "greedy", "medium"]
     upairs = [(kinds[i], kinds[j]) for i in range(len(kinds)) for j in range(i + 1, len(kinds))]
     tasks = [(a, b, i) for (a, b) in upairs for i in range(args.games)]
     print("scripted round-robin | %d agents | %d pairs x %d games = %d games (seats alternate; directions complementary) | %d workers\n"

@@ -1,7 +1,7 @@
 """Render a game between two SCRIPTED agents in the official Kaggle engine, and report the head-to-head
 record over N games. Uses a defs notebook that actually HAS the agents (default: setup1_target_ppo.ipynb).
 
-    python scripts/render_scripted_match.py --a medium --b ultimate --games 20 --render-seed 0
+    python scripts/render_scripted_match.py --a medium --b greedy --games 20 --render-seed 0
 Outputs runs/viz/scripted/<a>_vs_<b>.gif + _keyframes.png (seat0=a=blue, seat1=b=red).
 """
 from __future__ import annotations
@@ -32,7 +32,7 @@ def ships(obs, owner):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--a", default="medium"); ap.add_argument("--b", default="ultimate")
+    ap.add_argument("--a", default="medium"); ap.add_argument("--b", default="greedy")
     ap.add_argument("--defs-nb", default="notebooks/setup1_target_ppo.ipynb")
     ap.add_argument("--games", type=int, default=20)
     ap.add_argument("--steps", type=int, default=500)
