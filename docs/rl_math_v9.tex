@@ -1,0 +1,387 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+\usepackage{xcolor}
+
+% --- macros (match rl_math.tex / rl_math_v6.tex / rl_design_v7.tex usage) ---
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Adv}{\widehat{A}}
+\newcommand{\pol}{\pi_\theta}
+\newcommand{\relu}{\operatorname{relu}}
+\newcommand{\softplus}{\operatorname{softplus}}
+\newcommand{\softmax}{\operatorname{softmax}}
+\newcommand{\clip}{\operatorname{clip}}
+\newcommand{\sign}{\operatorname{sign}}
+\newcommand{\cd}[1]{\texttt{#1}}
+\newcommand{\rlref}[2]{\textbf{see \texttt{rl\_math.tex} \S\,``#1''} (\texttt{#2})}
+\newcommand{\vsixref}[1]{\textbf{see \texttt{rl\_math\_v6.tex} \S\,#1}}
+\newcommand{\vsevenref}[1]{\textbf{see \texttt{rl\_design\_v7.tex} \S\,#1}}
+
+\title{\textbf{Orbit Wars --- RL Math, v9: the mixed 2p/4p league\\ with per-seat categorical ownership (\emph{diff} against \texttt{rl\_design\_v7.tex})}}
+\author{}
+\date{2026-06-10}
+
+\begin{document}
+\maketitle
+
+\noindent\textbf{How to read this.} This document is a \emph{delta} on top of
+\texttt{rl\_design\_v7.tex} (itself a delta on \texttt{rl\_math\_v6.tex}, itself a delta on
+\texttt{rl\_math.tex}). Everything v7 established --- BC warm-start, categorical WHERE $+$
+Bernoulli gate, gate-only entropy, the three PPO guardrails, potential shaping, PopArt, the
+GPU simulator --- carries over unchanged and is not restated. v9 answers the \texttt{it1041}
+post-mortem: \emph{a checkpoint can dominate heads-up (1.000 gauntlet, 0.82 vs.\ the previous
+best) and still lose 4-player free-for-alls (29\% top-rate vs.\ 58\%), and the Kaggle leaderboard
+mixes both formats.} The fix is one training program with two coupled parts:
+\begin{itemize}[nosep,leftmargin=1.6em]
+\item the \textbf{v8 league program} (notebook \cd{setup1\_v8\_a100.ipynb}): an $N$-player
+  environment with the official 4p seating and combat, mixed 2p/4p iterations scheduled by a
+  \textbf{dual correlated Elo}, invited anchored members, weak-point matchmaking, and a mixed
+  best-checkpoint gauntlet --- all \emph{legacy-compatible} (observation unchanged, $F{=}101$;
+  v7 weights drop in);
+\item the \textbf{v9 observation} (notebook \cd{setup1\_v9\_a100.ipynb} $=$ v8 $+$ one change):
+  ownership becomes a \textbf{4-channel ego-relative seat one-hot} ($F{=}104$) so the policy can
+  tell \emph{which} opponent owns each body. v8 is kept as the ablation/compatibility lineage; v9
+  is the design intended to learn per-enemy behavior in FFAs.
+\end{itemize}
+
+\paragraph{One-line map.}
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+component & status in v9 & where \\
+\midrule
+simulator dynamics / comets / parity & unchanged 2p; \textbf{$N$-player combat added} & \S\ref{v9:env} \\
+observation: ownership feature       & \textbf{replaced: seat one-hot} ($F\,101\!\to\!104$) & \S\ref{v9:obs} \\
+observation: threat block, globals   & unchanged (pooled friend/foe)     & \S\ref{v9:obs} \\
+action space, decode, greedy         & unchanged (\vsevenref{cat})       & --- \\
+BC warm-start, PPO guardrails        & unchanged (\vsevenref{bc, guard}) & --- \\
+reward: potentials, outcome          & \textbf{generalized to $N$ players} & \S\ref{v9:reward} \\
+rollout                              & \textbf{unified 2p/4p \cd{collect\_ppo} (seats)} & \S\ref{v9:rollout} \\
+league: ratings                      & \textbf{dual correlated Elo (2p $+$ 4p)} & \S\ref{v9:elo} \\
+league: match-type mix               & \textbf{new: gap-driven, error-diffused} & \S\ref{v9:mix} \\
+league: membership                   & \textbf{new: invited members, weak-point boost} & \S\ref{v9:members} \\
+best-checkpoint rule                 & \textbf{replaced: mixed 2p$+$4p gauntlet} & \S\ref{v9:gauntlet} \\
+anchor Elo scale                     & \textbf{recalibrated to the leaderboard} & \S\ref{v9:anchors} \\
+deployment adapter                   & \textbf{constraint: seat-preserving} & \S\ref{v9:deploy} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%================================================================
+\section{$N$-player environment}\label{v9:env}
+The board, production, orbits, launches, swept collision, sun occlusion, and official comets are
+exactly \rlref{Batched GPU simulator}{sec:gpuenv} with the v6 data path (\vsixref{sys}). v8/v9 add
+$N$-player play ($N\in\{2,4\}$) without touching the 2p path.
+
+\paragraph{Seating.} The official engine assigns homes on one random symmetric group of four
+planets. \cd{generate\_world} records that group's base index $b$; \cd{reset(worlds, n\_players)}
+seats owners exactly like the engine's branches:
+\[
+N{=}2:\ \ \text{owner}(b)=0,\ \text{owner}(b{+}3)=1;\qquad
+N{=}4:\ \ \text{owner}(b{+}j)=j,\ j=0..3;\qquad
+S_{\text{home}}=10 .
+\]
+Under the board's 4-fold rotational symmetry every seat is fair in both formats.
+
+\paragraph{Combat: official top-vs-second, $N$ players.} Arrivals at planet $e$ are summed per
+player, $A_e^{(p)}=\sum_{\text{fleets}\to e,\ \text{owner}=p}n$, and the official resolve is the
+top-two statistic
+\begin{equation}
+\text{surv}_e \;=\; A_e^{(1\text{st})}-A_e^{(2\text{nd})},\qquad
+\text{owner}^{\text{surv}}_e=\begin{cases}\arg\max_p A_e^{(p)} & \text{surv}_e>0\\[2pt]
+\varnothing & \text{tie},\end{cases}
+\end{equation}
+implemented as a $(B,E,N)$ scatter-add $+$ \cd{topk(2)}. For $N{=}2$ this is \emph{algebraically
+identical} to the v6 pairwise max/min resolve; survivors reinforce or attack the garrison exactly as
+before. \textbf{Verified}: \cd{scripts/test\_v8\_parity.py} steps v7 and v8 side-by-side 70 ticks
+(comet spawn included) with identical actions --- planet/fleet state and encodings bit-exact;
+\cd{scripts/test\_v9\_parity.py} repeats v8 vs.\ v9 (state bit-exact; encodings differ only by
+\S\ref{v9:obs}, consistently).
+
+\paragraph{Seat interface.} \cd{env\_step(env, a, seats=[\dots])} takes, per opponent pid
+$1..N{-}1$, either a scripted code (the v6/v7 \cd{opponent\_action}, now seat-parameterized) or a
+neural gated-alloc action decoded exactly like the ego's. Termination: step cap, $\le\!1$ player
+alive, or ego death.
+
+%================================================================
+\section{Observation: per-seat categorical ownership (the v9 change)}\label{v9:obs}
+\texttt{rl\_math.tex} \S\,\texttt{sec:obs} encodes ownership as one scalar body feature
+$b_7\in\{0,1,2\}$ (neutral/ego/enemy), computed ego-relatively with $n_a{=}2$ hard-coded. That
+scalar cannot represent \emph{which} enemy owns a body, and the formula does not extend: fed a
+4-player state, $(o-\mathrm{ego})\bmod 2$ \textbf{aliases seat $\mathrm{ego}{+}2$ onto the ego
+code} --- the policy would read an opponent's planets as its own. v8 therefore \emph{collapses}
+every non-ego owner to the single code $2$ (the deployed everyone-vs-me adapter view; $F{=}101$,
+v7 weights drop in). v9 replaces the scalar entirely.
+
+\paragraph{Seat one-hot.} With $N=\cd{n\_players}$ and ego seat $g$, define the ego-relative seat
+index and the 4-channel categorical
+\begin{equation}
+\rho_e=(o_e-g)\bmod N,\qquad
+\mathbf b_{7}[e]=\Big(\underbrace{\mathbf{1}[o_e\!\ge\!0\wedge\rho_e{=}0]}_{\text{self}},\;
+\mathbf{1}[o_e\!\ge\!0\wedge\rho_e{=}1],\;
+\mathbf{1}[o_e\!\ge\!0\wedge\rho_e{=}2],\;
+\mathbf{1}[o_e\!\ge\!0\wedge\rho_e{=}3]\Big),
+\label{v9:onehot}
+\end{equation}
+i.e.\ $[\,\text{self}\,|\,\text{enemy seat}{+}1\,|\,{+}2\,|\,{+}3\,]$ with \textbf{neutral $=$
+all-zero}. $N_{\text{body}}\,11\!\to\!14$, so $F=101\to104$. Properties that motivated the design:
+\begin{itemize}[nosep,leftmargin=1.6em]
+\item \textbf{categorical, not ordinal}: the scalar $2..n_a$ code imposes a fake magnitude and
+  ordering across seats; one-hot channels are permutation-symmetric inputs the network can attach
+  independent behavior to (per-enemy threat assessment, target selection);
+\item \textbf{rotation-equivariant}: the same \emph{relative} seat always lands in the same
+  channel, from any ego seat (verified: ego $0$ sees owners $1,2,3$ as $0100/0010/0001$; ego $2$
+  sees itself as $1000$ and the others rotated);
+\item \textbf{format-generalizing}: in 2p only the first two channels ever fire, so the 4p input
+  space is a strict superset --- and when a seat is eliminated mid-FFA its channel simply stops
+  firing, so 3-player intermediate states remain well-formed without ever being trained explicitly;
+\item \textbf{no aliasing}: $\rho$ is taken mod $N$ (not mod 2), so no opponent can collide with
+  the ego channel.
+\end{itemize}
+Everything else in the observation is unchanged: the incoming-fleet threat block keeps the
+\emph{signed} friend/foe convention ($+1$ ego, $-1$ any opponent), and the global aggregates pool
+\emph{all} opponents (enemy ships $=\sum_{p\neq g}$, enemy production share vs.\ the pooled field)
+--- seat identity enters only through Eq.~\eqref{v9:onehot}.
+
+\paragraph{Legacy members: the obs adapter.} v9's league still admits v7/v8-format checkpoints
+(invited or seeded; their ckpt config carries $F{=}101$). They are wrapped in
+\cd{LegacyObsAdapter}, which collapses the one-hot back to the scalar they were trained on before
+their forward:
+\begin{equation}
+b_7^{\text{legacy}} \;=\; \mathbf b_7[0] \;+\; 2\,\min\!\Big(1,\ \textstyle\sum_{k=1}^{3}\mathbf b_7[k]\Big)
+\in\{0,1,2\},
+\end{equation}
+exact on every reachable state (the channels are disjoint indicators). The wrapper is unwrapped on
+league-state save and re-wrapped on load; it is dormant in v8 (dimensions match). The \emph{learner}
+cannot be warm-started from v7/v8 weights ($F$ changed): v9 runs its own BC warm-start
+(\vsevenref{bc}; the BC expert is scripted, so nothing else changes).
+
+%================================================================
+\section{Reward: $N$-player potentials and outcome}\label{v9:reward}
+The reward family is v6 potential shaping $+$ terminal outcome (\vsixref{reward}), generalized so
+that $N{=}2$ reproduces it exactly.
+
+\paragraph{Potentials vs.\ the strongest opponent.} With per-player totals $S^{(p)}$ (planets $+$
+fleets), owned production $\Pi^{(p)}$, ship-log $\ell(n)=\ln(1{+}n)/\ln 1000$:
+\begin{equation}
+\Phi_{\mathrm{ship}}(s)=\ell\big(S^{(0)}\big)-\ell\big(\max_{p\ge1}S^{(p)}\big),\qquad
+\Phi_{\mathrm{prod}}(s)=\frac{\Pi^{(0)}-\max_{p\ge1}\Pi^{(p)}}{\max(\Pi_{\mathrm{tot}},1)} .
+\end{equation}
+The $\max$ is the right opponent aggregate for a \emph{win-the-game} potential: in an FFA you are
+measured against whoever currently leads, not the average of the field. For $N{=}2$ both reduce to
+the v6 pair. The shaping form $r_t=c\,[\gamma\Phi(s_{t+1})-\Phi(s_t)]$, the coefficients, the
+$\sigma_R$ scaling, and the policy-invariance argument are unchanged (\vsixref{reward}).
+
+\paragraph{Pairwise scores and the 4p outcome.} At termination, against each seat $k$ with totals
+$S^{(k)}$:
+\begin{equation}
+\mathrm{sc}_k=\begin{cases}1 & S^{(0)}>S^{(k)}\\ \tfrac12 & S^{(0)}=S^{(k)}\\ 0 & S^{(0)}<S^{(k)},\end{cases}
+\qquad
+\Omega=\begin{cases}
+\sign\!\big(S^{(0)}-\max_{p\ge1}S^{(p)}\big) & N{=}2\ \text{or}\ \cd{OUTCOME\_4P}{=}\text{winner},\\[4pt]
+2\cdot\frac1{N-1}\sum_k \mathrm{sc}_k\;-\;1 & \cd{OUTCOME\_4P}{=}\text{placement (default)}.
+\end{cases}
+\label{v9:outcome}
+\end{equation}
+The placement-linear $\Omega\in\{-1,-\tfrac13,+\tfrac13,+1\}$ maps finishing place affinely
+(beat-all $=+1$, lose-to-all $=-1$): a dense, correctly-ordered learning signal where the official
+top-score-only rule pays a 4p game like a lottery (2nd of 4 $=$ dead loss). The terminal payment is
+the v6 win/loss magnitude scaled \emph{linearly} by $\Omega$,
+$O=\Omega\cdot(\Omega>0\,?\,W:\,L)$, so 2p (where $\Omega\in\{\pm1,0\}$) pays exactly as before.
+The per-seat $\mathrm{sc}_k$ are also the dual-Elo update signal (\S\ref{v9:elo}); the logged
+\cd{win\_rate} in 4p is the strict ``beat \emph{every} opponent'' indicator
+$\mathbf{1}[\min_k\mathrm{sc}_k\ge 1]$.
+
+%================================================================
+\section{Unified rollout}\label{v9:rollout}
+One \cd{collect\_ppo(env, net, pool, cursor, rng, seats, n\_players)} runs both formats. The
+learner is always player 0 with the usual on-GPU buffers and GPU GAE (\vsixref{sys}); each opponent
+seat is either a scripted anchor (fully on-GPU, zero forwards) or a frozen neural member acting
+per-step under \cd{no\_grad} via its own \cd{env\_encode(env, pid)} --- the same encode function,
+ego $=$ that seat (Eq.~\eqref{v9:onehot} makes this seat-symmetric by construction). A 4p iteration
+therefore costs the learner's rollout $+$ up to three no-grad forwards per step; scripted seats are
+free. \cd{B\_4P}$=B$ keeps the learner's transition count format-independent. Termination,
+\cd{done}-correct GAE, the outcome scatter, PopArt, and the PPO update are untouched
+(\vsixref{ppo}, \vsevenref{guard}).
+
+%================================================================
+\section{Dual correlated Elo}\label{v9:elo}
+Heads-up strength and FFA strength are correlated but \emph{not} identical (the \cd{it1041}
+failure). Every league member --- and the learner --- carries two ratings $(e^{2}, e^{4})$.
+Scripted anchors and invited members are \textbf{anchored in both} (their ratings never move);
+snapshots float.
+
+\paragraph{2p update.} After a 2p iteration vs.\ member $m$ with mean learner score
+$\bar s\in[0,1]$ over the batch, with expectation
+$\E=\big(1+10^{(e^2_m-e^2_\ell)/400}\big)^{-1}$:
+\begin{equation}
+\Delta=K\,(\bar s-\E),\qquad
+e^2_\ell \mathrel{+}= \Delta,\quad e^4_\ell \mathrel{+}= \kappa\,\Delta,\qquad
+\text{(non-anchor $m$ mirrored: } e^2_m\mathrel{-}=\Delta,\ e^4_m\mathrel{-}=\kappa\Delta\text{)},
+\end{equation}
+with $K=\cd{ELO\_K}=32$ and the \textbf{cross-format coupling} $\kappa=\cd{ELO\_COUPLING}=0.25$.
+
+\paragraph{4p update: pairwise decomposition.} A 4p FFA vs.\ seats $\{m_k\}$ becomes
+$N{-}1$ pairwise updates at $K_4/(N{-}1)$ each (the standard multiplayer decomposition --- total
+rating motion per game matches a 2p game at $K_4$):
+\begin{equation}
+\Delta_k=\frac{K_4}{N-1}\big(\mathrm{sc}_k-\E_k^{(4)}\big),\qquad
+e^4_\ell\mathrel{+}=\Delta_k,\quad e^2_\ell\mathrel{+}=\kappa\,\Delta_k\quad\text{for each }k,
+\end{equation}
+$K_4=\cd{ELO\_K4}=32$, $\E^{(4)}$ the logistic in the $e^4$ ratings. The coupling encodes the
+prior that the two skills share most of their variance: a 2p result moves the 4p belief a quarter
+as much (and vice versa), keeping the ratings correlated without forcing them equal --- it is
+exactly their \emph{gap} that drives the scheduler below.
+
+\paragraph{Recalibration.} The 2p anchor back-solve is unchanged (\vsixref{league}); the 4p analog
+re-grounds $e^4$ from the fixed FFA trio: with mean pairwise score $s$ vs.\
+$\{\cd{starter},\cd{greedy},\cd{intermediate}\}$ and their mean anchored rating $\bar a$,
+$e^4=\bar a+400\log_{10}\!\big(s/(1{-}s)\big)$, $s$ clipped to $[0.02,0.98]$.
+
+%================================================================
+\section{Gap-driven match-type mix}\label{v9:mix}
+The share of 4p iterations is a bounded affine function of the dual-rating gap:
+\begin{equation}
+s_4=\clip\!\Big(\,\cd{S4\_BASE}+\cd{S4\_GAIN}\cdot\frac{e^2_\ell-e^4_\ell}{400},\ \cd{S4\_MIN},\ \cd{S4\_MAX}\Big)
+=\clip\big(0.60+\text{gap}/400,\ \tfrac12,\ \tfrac67\big).
+\label{v9:share}
+\end{equation}
+When the 4p rating lags, more 4p is scheduled (and vice versa); the bounds are the
+\textbf{1:1\,..\,1:6 envelope} --- 4p may dominate up to six 4p iterations per 2p iteration but
+never starves either format. The scheduler is \textbf{error-diffused}: an accumulator
+$a\mathrel{+}=s_4$ each iteration, playing 4p iff $a\ge1$ (then $a\mathrel{-}=1$), so the
+\emph{realized} ratio equals the target exactly over any window (a Bernoulli draw would only match
+in expectation, with format droughts at small iteration counts).
+
+%================================================================
+\section{League membership: invited members and weak-point matchmaking}\label{v9:members}
+PFSP sampling, the behavioral-fingerprint diversity term, snapshot pruning, and the scripted-anchor
+boosts are unchanged (\vsixref{league}). 4p seats are $k{=}3$ weighted draws \emph{without}
+replacement from the same per-format weights. Two additions:
+
+\paragraph{(a) Invited members.} The first existing folder in \cd{INVITE\_DIRS} is scanned for
+\cd{*.pt}; the top \cd{INVITE\_MAX}$=4$ by anchored rating join the league as fixed high-level
+bots. The anchor resolves as \emph{filename suffix} \cd{\_elo<NNNN>} $\succ$ ckpt meta \cd{elo}
+$\succ$ \cd{INVITE\_DEFAULT\_ELO}$=750$ (the submitted \cd{it1041} leaderboard level), and never
+updates. While unmastered they sample at $\times\cd{INVITE\_MATCH\_BOOST}{=}2$ (high-level
+sparring focus); once the learner's per-format score EMA passes \cd{INVITE\_MASTER\_WR}$=0.75$
+their rate \emph{drops} to $\times\cd{INVITE\_MASTERED\_W}{=}0.2$ --- a small anti-forgetting
+floor rather than continued compute spend. Per-member architecture comes from the ckpt's own
+config (smaller invited nets are fine); v7/v8-format members get the \S\ref{v9:obs} obs adapter.
+Caveat (measured): a ckpt whose \emph{meta} carries \cd{elo:\,0} anchors at 0 --- the default only
+applies when the meta key is absent; curate invite folders with \cd{\_elo} suffixes (the league
+export writes them).
+
+\paragraph{(b) Weak-point matchmaking.} Per member and per format, compare the learner's
+\emph{actual} score EMA $w$ against the Elo-\emph{expected} score $\E$. When reality runs below
+theory the member is a measured weak point and its sampling weight is boosted:
+\begin{equation}
+\beta(m,\text{fmt})=
+\begin{cases}
+1 & n<\cd{WEAK\_BOOST\_MIN\_GAMES}\ \text{or}\ \E-w<\cd{WEAK\_BOOST\_MIN\_GAP},\\[2pt]
+\min\!\big(\cd{WEAK\_BOOST\_MAX},\ 1+\cd{WEAK\_BOOST\_GAIN}\,(\E-w)\big) & \text{otherwise},
+\end{cases}
+\end{equation}
+with $(5,\,0.05,\,10,\,3)$: e.g.\ Elo expects $0.90$ but the EMA reads $0.70$ $\Rightarrow$ gap
+$0.20$ $\Rightarrow$ $\times3$ (the cap). It fires \emph{only} on underperformance ---
+overperforming opponents are never down-weighted --- and the deadband keeps EMA noise from
+triggering it. Active boosts are surfaced on the leaderboard as \cd{weak2/weak4 x<mult>}.
+
+%================================================================
+\section{Mixed best-checkpoint gauntlet}\label{v9:gauntlet}
+v6 selected ``best'' on the fixed-opponent \emph{2p} gauntlet (\vsixref{league}); that rule is what
+crowned \cd{it1041} while it was losing FFAs. v9 selects on the mix it will be graded on:
+\begin{equation}
+g \;=\; (1-w_4)\,g_2 \;+\; w_4\,g_4,\qquad w_4=\cd{GAUNTLET\_4P\_W}=0.5,
+\end{equation}
+where $g_2$ is the v6 2p gauntlet (greedy play vs.\ \cd{starter}/\cd{intermediate}/\cd{greedy} on
+held-out worlds) and $g_4$ is the mean \emph{pairwise} score (Eq.~\eqref{v9:outcome} left) of a 4p
+FFA vs.\ the fixed trio $\{\cd{starter},\cd{greedy},\cd{intermediate}\}$ on the same held-out
+worlds. A 2p-only specialist can no longer win the checkpoint race.
+
+%================================================================
+\section{Anchor scale: leaderboard-calibrated}\label{v9:anchors}
+The scripted anchors were re-pinned from the in-house round-robin scale to the \emph{submitted}
+Kaggle leaderboard levels, so the learner's rating reads directly against the competition:
+\begin{center}\small
+\begin{tabular}{@{}lccl@{}}
+\toprule
+anchor & old & new & basis \\
+\midrule
+\cd{random}        & 0    & 0   & scale pin \\
+\cd{starter}       & 600  & 450 & submitted starter $\approx$ 450 \\
+\cd{intermediate}  & 750  & 475 & never submitted; interpolated (keeps in-house ordering) \\
+\cd{greedy}        & 900  & 500 & submitted greedy $\approx$ 500 \\
+\cd{medium}        & 1000 & 500 & submitted medium $\approx$ 500 \\
+\midrule
+\cd{ADVANCE\_TRIGGER/CONFIRM} & 800/700 & 525/425 & $\pm50$ around \cd{intermediate}, as before \\
+\cd{INVITE\_DEFAULT\_ELO}     & 1100    & 750     & $=$ submitted \cd{it1041} level \\
+\bottomrule
+\end{tabular}
+\end{center}
+Two consequences to keep in mind. (i) The compressed scale \emph{understates in-house win
+probabilities}: starter$\to$medium is a $\sim$90\%-win gap in-house but is now encoded as 50 Elo
+($\approx$57\%), so PFSP/weak-boost \emph{expected} scores flatten toward $\tfrac12$ --- the
+weak-point detector compensates since it compares against the same $\E$. (ii) League state stores
+member ratings: \textbf{resuming a pre-rescale train-state keeps the old anchors}; fresh runs (or
+warm-starts without league state) use the new ones.
+
+%================================================================
+\section{Deployment constraint}\label{v9:deploy}
+The v7-era Kaggle adapters map \emph{every} opponent to the single enemy owner before encoding ---
+correct for v7/v8 (it \emph{is} their training view) and \textbf{wrong for v9}: it would zero the
+seat channels' information and discard the trained per-enemy behavior. The v9 submission adapter
+must \emph{preserve seats}: map each opponent id to its own owner $1..3$ (any fixed assignment ---
+Eq.~\eqref{v9:onehot} is ego-relative, so only consistency matters within a game), set
+\cd{n\_players}$=4$ in 4p episodes, and $=2$ heads-up. v9 checkpoints ($F{=}104$) do not load in
+the v7-era eval tools.
+
+%================================================================
+\section{Verification battery}\label{v9:verify}
+\begin{itemize}[nosep,leftmargin=1.6em]
+\item \cd{scripts/test\_v8\_parity.py}: v7 vs.\ v8, 70 ticks (comet spawn included), identical
+  random gated-alloc actions vs.\ scripted \cd{medium} --- planet/fleet state \textbf{and}
+  encodings bit-exact (v8 is a strict superset of v7 on the 2p path).
+\item \cd{scripts/test\_v9\_parity.py}: v8 vs.\ v9 --- 2p \emph{state} bit-exact; encodings
+  bit-equal on all shared features; the one-hot exactly consistent with the scalar
+  (self$\leftrightarrow$1, enemy$\leftrightarrow$2); channels 2/3 provably silent in 2p.
+\item \cd{scripts/verify\_enemy\_id.py}: on a 4-seat state, v8 reads all enemies as code 2 (by
+  design); v9 reads $0100/0010/0001$ and is rotation-equivariant from every ego seat.
+\item \cd{scripts/smoke\_v8\_nb.py} / \cd{scripts/smoke\_v9\_nb.py}: the full notebooks at SMOKE
+  scale (BC $\to$ mixed 2p/4p league $\to$ resume): both formats scheduled within the 1:1..1:6
+  envelope, KL inside the guardrail band, dual ratings and the mixed gauntlet logged; v9
+  additionally asserts $F{=}104$, the legacy wrapper on $F{=}101$ invites, and wrapper survival
+  across the resume round-trip.
+\end{itemize}
+
+%================================================================
+\section{Config $\leftrightarrow$ symbols (delta only)}\label{v9:cfg}
+New or changed knobs (v8 config block $+$ the v9 observation); everything else as in
+\texttt{rl\_design\_v7.tex} / \texttt{rl\_math\_v6.tex}.
+\begin{center}\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+config & symbol / role & value \\
+\midrule
+\cd{N\_BODY\_FEATURES}, $F$  & ownership one-hot (v9 only)            & $14$, $F{=}104$ (v8: $11$, $101$)\\
+\cd{FOURP\_ENABLED}, \cd{B\_4P} & 4p training, envs per 4p iter       & on, $B$\\
+\cd{OUTCOME\_4P}             & $\Omega$ rule, Eq.~\eqref{v9:outcome}  & \cd{placement} (\cd{winner} $=$ official)\\
+\cd{S4\_BASE/MIN/MAX/GAIN}   & match mix, Eq.~\eqref{v9:share}        & $0.60$ / $0.50$ / $6/7$ / $1.0$\\
+\cd{ELO\_K4}                 & $K_4$ (4p K-factor, split $/(N{-}1)$)  & $32$\\
+\cd{ELO\_COUPLING}           & $\kappa$ (cross-format coupling)       & $0.25$\\
+\cd{INVITE\_MAX/DEFAULT\_ELO/ELO4\_OFFSET} & invited members          & $4$ / $750$ / $0$\\
+\cd{INVITE\_MATCH\_BOOST/MASTER\_WR/MASTERED\_W} & sparring focus     & $2.0$ / $0.75$ / $0.2$\\
+\cd{WEAK\_BOOST\_MIN\_GAMES/MIN\_GAP/GAIN/MAX} & weak-point boost $\beta$ & $5$ / $0.05$ / $10$ / $3$\\
+\cd{GAUNTLET\_4P\_W}         & $w_4$ (mixed best-ckpt weight)         & $0.5$\\
+\cd{ELO\_STARTER/INTERMEDIATE/GREEDY/MEDIUM} & anchor ratings         & $450$ / $475$ / $500$ / $500$\\
+\cd{ADVANCE\_TRIGGER\_ELO/CONFIRM\_ELO} & curriculum gates            & $525$ / $425$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\end{document}

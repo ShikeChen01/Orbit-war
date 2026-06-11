@@ -1,0 +1,358 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+\usepackage{xcolor}
+
+% --- macros (match rl_math.tex usage so equations read identically) ---
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Adv}{\widehat{A}}
+\newcommand{\pol}{\pi_\theta}
+\newcommand{\relu}{\operatorname{relu}}
+\newcommand{\softplus}{\operatorname{softplus}}
+\newcommand{\softmax}{\operatorname{softmax}}
+\newcommand{\clip}{\operatorname{clip}}
+\newcommand{\sign}{\operatorname{sign}}
+\newcommand{\cd}[1]{\texttt{#1}}
+\newcommand{\rlref}[2]{\textbf{see \texttt{rl\_math.tex} \S\,``#1''} (\texttt{#2})}
+
+\title{\textbf{Orbit Wars --- RL Math, v6 implementation (\emph{diff} against \texttt{rl\_math.tex})}}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\noindent\textbf{How to read this.} This document is a \emph{delta} on top of \texttt{rl\_math.tex}: it
+restates only what the \textbf{v6} notebook (\texttt{notebooks/setup1\_v6\_ppo.ipynb}) changes, and for
+everything unchanged it points back by section. \texttt{rl\_math.tex} describes the \emph{ungated}
+Dirichlet target actor and the four-channel event reward; v6 keeps the same trunk, simulator, and Elo
+league but changes (i) the action distribution to a \textbf{gated} allocation with a sharpened greedy,
+(ii) the reward to \textbf{potential-based shaping}, (iii) several PPO/GAE knobs and adds \textbf{PopArt}
+value normalization, (iv) the destination head to a \textbf{bilinear pointer}, and (v) the data path to
+be \textbf{on-GPU / bf16 / sync-free} for an A100. Notation, symbols, and any equation cited by its
+\texttt{rl\_math.tex} label (e.g.\ \texttt{eq:return}) live in \texttt{rl\_math.tex}.
+
+\paragraph{One-line map of what changed.}
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\texttt{rl\_math.tex} section & status in v6 & where \\
+\midrule
+\S\,Problem setup (\texttt{sec:problem})            & unchanged                 & \S\ref{v6:same}\\
+\S\,Lead-target aiming (\texttt{sec:lead})          & unchanged                 & \S\ref{v6:same}\\
+\S\,Observation encoding (\texttt{sec:obs})         & unchanged                 & \S\ref{v6:same}\\
+\S\,Policy network (\texttt{sec:policy})            & trunk same; heads changed & \S\ref{v6:net}\\
+\S\,Action distribution (\texttt{sec:dist})         & \textbf{replaced} (gated)  & \S\ref{v6:dist}\\
+\S\,Reward and return (\texttt{sec:reward})         & \textbf{replaced} (shaping)& \S\ref{v6:reward}\\
+\S\,Curriculum / league (\texttt{sec:curriculum},\,\texttt{sec:league}) & mostly same & \S\ref{v6:league}\\
+\S\,KL / trust region (\texttt{sec:kldiv})          & unchanged                 & \S\ref{v6:same}\\
+\S\,PPO\,+\,GAE appendix (\texttt{sec:ppo})         & knobs changed; $+$PopArt  & \S\ref{v6:ppo}\\
+\S\,GPU simulator (\texttt{sec:gpuenv})             & dynamics same; data path  & \S\ref{v6:sys}\\
+\S\,Search appendix (\texttt{sec:search})           & unchanged (not built)     & \S\ref{v6:same}\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%================================================================
+\section{Unchanged --- see \texttt{rl\_math.tex}}\label{v6:same}
+The following are \textbf{identical} in v6; consult \texttt{rl\_math.tex} directly:
+\begin{itemize}[nosep]
+  \item Problem setup, MDP, two-player zero-sum scoring, the engine launch model: \rlref{Problem setup}{sec:problem}.
+  \item Deterministic orbital-intercept aiming (\cd{LEAD\_TARGET}): \rlref{Lead-target aiming}{sec:lead}
+        (used verbatim by the v6 decode).
+  \item Observation encoding --- body rows, the incoming-fleet threat block, globals, all feature scalings:
+        \rlref{Observation encoding}{sec:obs} and \rlref{threat block}{sec:threat}. ($F{=}101$, $G{=}10$ unchanged.)
+  \item KL estimators ($k_1,k_2,k_3$), \cd{approx\_kl}, \cd{clipfrac}, the clipped surrogate definition:
+        \rlref{KL divergence and the PPO trust region}{sec:kldiv}.
+  \item The Elo/PFSP league mechanics, scripted anchors, Elo back-solve recalibration, matchmaking weight:
+        \rlref{Self-play league}{sec:league} and \rlref{interventions}{sec:interventions} (only the two items
+        in \S\ref{v6:league} differ).
+  \item Batched GPU simulator dynamics and sim-to-real fidelity: \rlref{Batched GPU simulator}{sec:gpuenv}
+        (only the \emph{data path} differs, \S\ref{v6:sys}).
+  \item Search-based improvement (AlphaZero/MuZero): \rlref{search-based policy improvement}{sec:search}.
+        \textbf{Not built in v6} (no MCTS); the policy net is the deployed agent.
+\end{itemize}
+
+%================================================================
+\section{Policy network: heads}\label{v6:net}
+The \textbf{trunk is unchanged} --- input projection, one (or $N_{\mathrm{tx}}$) masked cross-planet
+self-attention block(s), GLU/residual-MLP stack, final LayerNorm, separate globals embedding $g'$:
+\rlref{Policy network}{sec:policy}, including the trunk-vs-transformer sizing of \rlref{Recommended
+hyperparameters}{sec:trunkcfg}. v6 changes only the \emph{heads} and one attention \emph{kernel}.
+
+\paragraph{(a) Attention kernel (math-neutral).} The attention of Eq.~(\texttt{sec:policy}) is computed
+with \cd{F.scaled\_dot\_product\_attention} (a fused flash/mem-efficient kernel) under a bf16 autocast;
+the dead-planet key mask is supplied as an additive $-10^9$ bias. Identical function, faster kernel.
+
+\paragraph{(b) Bilinear (pointer) destination head.} \texttt{rl\_math.tex} uses a single
+\cd{Linear}$(d{+}d_g\!\to\!E)$ for the \cd{dest\_head}. v6 replaces it (flag \cd{DEST\_HEAD="bilinear"})
+with a pairwise pointer score over the source/destination tokens $h'_e=[h_e;g']\in\R^{d+d_g}$:
+\begin{equation}
+\ell_{s,d} \;=\; \frac{\big(W_Q\,h'_s\big)^{\!\top}\big(W_K\,h'_d\big)}{\sqrt{d}}\,,\qquad
+W_Q,W_K\in\R^{d\times(d+d_g)} .
+\end{equation}
+The score for sending $s\!\to\!d$ now depends on \emph{both} planets' features (relative geometry,
+ownership, garrison, threat), instead of a fixed per-slot weight vector --- the natural inductive bias for
+a relational allocation. \emph{Calm init:} $W_Q,W_K$ scaled by $\cd{INIT\_DEST\_SCALE}=0.02$ so
+$\ell\approx 0$ (near-uniform WHERE) at start; ``hold by default'' is enforced by the gate bias below, not
+by a diagonal logit bias.
+
+\paragraph{(c) Launch-gate head.} v6 adds \cd{gate\_head}: a \cd{Linear}$(d{+}d_g\!\to\!1)$ emitting a
+per-source fire logit $\eta_s$ (\S\ref{v6:dist}). Bias initialized to $\cd{INIT\_GATE\_BIAS}=-1$ (few
+planets fire at start).
+
+\paragraph{(d) Value head predicts a \emph{normalized} value (PopArt).} The critic architecture is
+unchanged (masked-mean pool of trunk tokens $\,\oplus\,g'\to$ \cd{VALUE\_RES\_BLOCKS} pre-LN residual
+blocks $\to d{\to}1$; \rlref{PPO\,+\,GAE}{sec:ppo}). In v6 its scalar output is the \emph{normalized}
+value $\tilde V_\theta(s)$; the usable value is $V(s)=\sigma\,\tilde V_\theta(s)+\mu$ with the running
+$(\mu,\sigma)$ of \S\ref{v6:popart}. GAE and bootstrapping use the de-normalized $V$.
+
+%================================================================
+\section{Action distribution: gated allocation}\label{v6:dist}
+\texttt{rl\_math.tex} \S\,\texttt{sec:dist} makes each owned source row a Dirichlet over the destination
+simplex with the \emph{self-diagonal as} \cd{HOLD}, and evaluates greedily at the Dirichlet \emph{mean}.
+v6 keeps the Dirichlet for \emph{where} but adds an explicit \textbf{Bernoulli launch gate} for
+\emph{whether}, and replaces the greedy rule. The reachability mask $R_{s,j}$ (sun occlusion) and the
+owned-source factorization are exactly as in \texttt{sec:dist}.
+
+\paragraph{Two factors per owned source $s$.}
+\begin{align}
+\textbf{WHERE: }\quad & \alpha_{s,j}=\softplus\!\big(\clip(\ell_{s,j},\pm \cd{LOGIT\_CLAMP})\big)\cdot\cd{ALLOC\_KAPPA}+\epsilon,
+   \qquad A[s,\cdot]\sim\mathrm{Dirichlet}(\alpha_s),\\[2pt]
+\textbf{WHETHER: }\quad & g_s=\sigma(\eta_s),\quad
+   p_s=\clip\!\Big(\tfrac{g_s-\cd{GATE\_TRIM\_LO}}{\cd{GATE\_TRIM\_HI}-\cd{GATE\_TRIM\_LO}},\,0,1\Big),\quad
+   p_s\leftarrow\clip(p_s,\cd{GATE\_EPS},1-\cd{GATE\_EPS}),\\
+   & f_s\sim\mathrm{Bernoulli}(p_s)\in\{0,1\}.
+\end{align}
+The trim $(\cd{GATE\_TRIM\_LO},\cd{GATE\_TRIM\_HI})=(0.2,0.8)$ gives a dead-zone / saturation band so the
+gate can express ``essentially never/always fire''; the final clip to $[\cd{GATE\_EPS},1{-}\cd{GATE\_EPS}]$,
+$\cd{GATE\_EPS}=0.02$, keeps a saturated gate \emph{trainable} (nonzero gradient) during sampling. The
+sampled action is bundled as the $(B,E,E{+}1)$ tensor $a=[\,A\,|\,f\,]$.
+
+\paragraph{Log-prob and entropy (the WHERE term is gated by firing).}
+\begin{align}
+\log\pol(a\mid s) &= \!\!\sum_{s:\,\text{owned}}\!\!\Big[\,\underbrace{f_s\log p_s+(1{-}f_s)\log(1{-}p_s)}_{\text{Bernoulli gate}}
+   \;+\; f_s\,\log\mathrm{Dirichlet}\big(A[s,\cdot]\mid\alpha_s\big)\,\Big],\\
+\mathcal H[\pol(\cdot\mid s)] &= \!\!\sum_{s:\,\text{owned}}\!\!\Big[\,\mathcal H_{\mathrm{Bern}}(p_s)
+   \;+\; p_s\,\mathcal H_{\mathrm{Dir}}(\alpha_s)\,\Big].
+\end{align}
+The WHERE log-prob counts \emph{only} when the planet fired ($f_s{=}1$): on a hold the destination row is
+unobserved, so it must not contribute to the score (otherwise a holding planet would be credited/penalized
+for an allocation it never executed). Symmetrically the WHERE entropy is weighted by the fire probability
+$p_s$.
+
+\paragraph{Decode (\rlref{Decode}{sec:decode} with the gate).} A firing source dispatches its
+\textbf{full garrison} routed by its renormalized off-diagonal row; a holding source keeps everything:
+\begin{equation}
+\hat A[s,d]=\frac{A[s,d]\,(1-\delta_{sd})}{\sum_{d'\neq s}A[s,d']},\qquad
+n_{s,d}=\big\lfloor \hat A[s,d]\,S_s\,f_s\big\rfloor\ \ \text{for alive } d,\ \ n_{s,d}\ge\cd{MIN\_LAUNCH\_SHIPS}.
+\end{equation}
+Aiming is the orbital intercept of \texttt{sec:lead}. Because the row is a simplex and $f_s\in\{0,1\}$,
+total dispatch is $0$ (hold) or exactly the garrison spread over destinations (fire); over-dispatch is
+structurally impossible, as in \texttt{sec:dist}.
+
+\paragraph{Greedy / deploy --- the v6 change.} \texttt{rl\_math.tex} deploys at the Dirichlet
+\emph{mean}, which is concentration-blind: a moderately-preferred row ($\ell$ gap $\sim$2) has mean mass
+$\approx\softplus(2)/\!\sum\softplus\approx0.06$ on the preferred destination, so the full garrison spreads
+thin and \emph{every} $\lfloor\cdot\rfloor$ floors below \cd{MIN\_LAUNCH\_SHIPS} $\Rightarrow$ zero
+launches (a residual greedy-passive failure that the gate alone does not fix). v6 deploys with a
+\textbf{temperature-sharpened, masked softmax} over the live, sun-reachable, \emph{off-diagonal}
+destinations and a hard gate:
+\begin{equation}
+\boxed{\;A^{\mathrm{greedy}}[s,\cdot]=\softmax\!\Big(\tilde\ell_s/\tau\Big),\quad
+\tilde\ell_{s,j}=\ell_{s,j}\ \text{if}\ (j\neq s)\wedge m_j\wedge R_{s,j},\ \text{else } -\infty;\qquad
+f_s^{\mathrm{greedy}}=\mathbb 1[p_s\ge 0.5]\;}
+\end{equation}
+with $\tau=\cd{GREEDY\_TAU}=0.5$. This concentrates the garrison on the best valid destination (a real
+strike) instead of dust, and never wastes mass on dead/unreachable/self slots. \emph{Verified:} in the
+moderate-preference regime the mean greedy fires $0$ launches while the sharpened greedy fires one
+concentrated strike per firing source. Sampling is unchanged (the unmasked Dirichlet $+$ Bernoulli; the
+decode and the natural sun-occlusion signal still apply).
+
+%================================================================
+\section{Reward and return: potential-based shaping}\label{v6:reward}
+\texttt{rl\_math.tex} \S\,\texttt{sec:reward} uses a four-channel \emph{event} reward
+$R=O+C+D+P$ (outcome, capture, dispatch, production-milestone). Those dense channels are
+\emph{farmable}: capture rewards border-flip churn, dispatch/milestone reward ship expenditure/hoarding
+--- all maximizable while \emph{losing}. v6 (flag \cd{USE\_POTENTIAL\_SHAPING}, default on)
+\textbf{replaces $C,D,P$} with \textbf{potential-based shaping} (Ng, Harada \& Russell, 1999), keeping the
+outcome $O$ exactly as in \texttt{rl\_math.tex} Eq.~(\texttt{eq:return}). The legacy four-channel reward is retained verbatim
+behind \cd{USE\_POTENTIAL\_SHAPING=False} ($\equiv$ \texttt{sec:reward}).
+
+\paragraph{Potentials.} With per-side total ships $S^0,S^1$ (planets $+$ fleets), the ship-log
+$\ell(n)=\ln(1{+}n)/\ln 1000$, per-side owned production $\Pi^0,\Pi^1$ and total alive production
+$\Pi_{\mathrm{tot}}$,
+\begin{equation}
+\Phi_{\mathrm{ship}}(s)=\ell(S^0)-\ell(S^1),\qquad
+\Phi_{\mathrm{prod}}(s)=\frac{\Pi^0-\Pi^1}{\max(\Pi_{\mathrm{tot}},1)} .
+\end{equation}
+Both are zero-sum, bounded ($\Phi_{\mathrm{ship}}\in[-1,1]$, $\Phi_{\mathrm{prod}}\in[-1,1]$), and
+directly track the win condition (ship margin / board-control margin).
+
+\paragraph{Shaping reward.} The per-step reward is the shaping form
+\begin{equation}
+r_t \;=\; c_{\mathrm{ship}}\big(\gamma\,\Phi_{\mathrm{ship}}(s_{t+1})-\Phi_{\mathrm{ship}}(s_t)\big)
+        + c_{\mathrm{prod}}\big(\gamma\,\Phi_{\mathrm{prod}}(s_{t+1})-\Phi_{\mathrm{prod}}(s_t)\big),
+\label{v6:shape}
+\end{equation}
+with $c_{\mathrm{ship}}=\cd{SHAPE\_SHIP}=50$, $c_{\mathrm{prod}}=\cd{SHAPE\_PROD}=50$, the \emph{same}
+$\gamma$ as GAE. As in \texttt{sec:reward} the outcome $O$ is scattered onto the last active step, and
+both $r_t$ and $O$ are divided by $\sigma_R=\cd{PPO\_REWARD\_SCALE}=100$ before GAE.
+
+\paragraph{Policy invariance (why this is un-hackable).} For $F(s,s')=\gamma\Phi(s')-\Phi(s)$ the added
+discounted return telescopes,
+\begin{equation}
+\sum_{t\ge0}\gamma^t F(s_t,s_{t+1}) \;=\; \gamma^{T}\Phi(s_T)-\Phi(s_0),
+\end{equation}
+which is independent of the policy (only of the fixed start state and the terminal). Hence the optimal
+policy and ordering of policies are \emph{unchanged} versus training on the sparse outcome $O$ alone, while
+the gradient is now dense and win-aligned at every step. No reward-farming basin exists: a quantity that
+returns to its prior value (e.g.\ a flip-flopped border planet) contributes net zero. Empirically the
+outcome channel dominates the per-game return (e.g.\ $O\!\sim\!450$ vs.\ shaping $\sim\!8$ each), the
+intended regime.
+
+\paragraph{Minor: comet-masked capture.} In the legacy reward mode the capture channel now excludes comet
+slots (a comet that expires while ego-owned was previously miscounted as a lost planet). No effect in
+shaping mode.
+
+%================================================================
+\section{Curriculum and league}\label{v6:league}
+Mechanics unchanged: \rlref{Curriculum}{sec:curriculum} (the Elo league \emph{is} the curriculum) and
+\rlref{Self-play league}{sec:league}. Two changes:
+\begin{enumerate}[nosep,leftmargin=1.4em]
+  \item \textbf{Best-checkpoint selection = fixed-opponent gauntlet.} \texttt{rl\_math.tex}/the prior
+        notebook saved ``best'' on the per-iter win-rate \emph{vs.\ whatever single PFSP opponent was
+        drawn} (a weak net that drew \cd{random} could be frozen as best). v6 selects on a
+        deployment-faithful, opponent-\emph{independent} gauntlet: greedy play vs.\ a fixed anchor set
+        $\{\cd{starter},\cd{intermediate},\cd{greedy}\}$, scored every \cd{CKPT\_EVERY} iters,
+        $g=\frac1{|\mathcal A|}\sum_{a\in\mathcal A}\mathrm{score}(\pi,a)$.
+  \item \textbf{Fingerprint probe on real states.} The behavioral fingerprint used by PFSP diversity is
+        computed on a cached batch of \emph{real} encoded game states (rolled out), not Gaussian-noise
+        inputs, so the destination-distribution distance measures on-manifold behavior.
+\end{enumerate}
+
+%================================================================
+\section{PPO\,+\,GAE: knobs, KL early-stop, PopArt}\label{v6:ppo}
+The actor--critic PPO\,+\,GAE objective, GAE recursion, and value loss are as in
+\rlref{Appendix: PPO\,+\,GAE}{sec:ppo}. v6 changes the following.
+
+\paragraph{Horizon and sample reuse.} $\gamma=\cd{GAMMA}=0.997$ (was $0.99$) and
+$\lambda=\cd{GAE\_LAMBDA}=0.98$ (was $0.95$): a $\sim$500-step game with $\gamma{=}0.99$ discounts the
+terminal to $0.99^{500}\!\approx\!7\!\times\!10^{-3}$ and confines GAE credit to the last
+$\sim\!1/(1{-}\gamma\lambda)$ steps; raising both lets the (now win-aligned) signal reach mid-game
+actions. \cd{UPDATE\_EPOCHS}$=3$ (was $1$) recovers real multi-epoch PPO sample reuse (one epoch is
+A2C-with-GAE).
+
+\paragraph{KL early-stop (end-of-epoch).} The prior code broke the update on the first \emph{minibatch}
+whose $k_3$ KL exceeded \cd{KL\_TARGET} (a high-variance, order-dependent, subsample-biased stop). v6
+(\cd{KL\_EARLYSTOP}) instead completes each epoch and stops \emph{after} an epoch if its \emph{mean}
+minibatch KL exceeds \cd{KL\_TARGET}$=0.05$, a lower-variance trust-region control.
+
+\paragraph{Entropy normalization (scale-correct).} The entropy bonus is the mean \emph{per owned source}
+entropy,
+\begin{equation}
+\overline{\mathcal H}=\frac1{|\mathcal B|}\sum_{b\in\mathcal B}\frac{\mathcal H_b}{\max(n^{b}_{\mathrm{owned}},1)},
+\qquad n^{b}_{\mathrm{owned}}=\textstyle\sum_e \cd{action\_mask}^{b}_e ,
+\end{equation}
+replacing the prior $\overline{\mathcal H}=\mathcal H/(E\cdot\cd{nap})$ with $\cd{nap}{=}2$ (a stale
+constant from the retired $(\text{dest},\phi)$ actor whose magnitude drifted with how many planets the
+ego owned). The coefficient $c_{\mathcal H}$ is \textbf{annealed} $\cd{ENT\_COEF\_START}=0.02\to
+\cd{ENT\_COEF\_END}=0.002$ over \cd{ENT\_DECAY\_ITERS}$=300$ (explore $\to$ exploit), vs.\ a fixed
+\cd{ent\_coef}.
+
+\paragraph{Terminal-correct GAE \cd{done}.} The episode \cd{done} flag is now set at \emph{any} terminal
+--- both true elimination \emph{and} the time cap --- so $d_t=\mathbb 1[\text{cap}\vee\text{death}]$. With
+the outcome scattered onto each env's last active step, this prevents a spurious $\gamma V(s_T)$ bootstrap
+being added on top of the terminal outcome for time-capped games (the prior code set \cd{done} only on
+death).
+
+\paragraph{PopArt value normalization.}\label{v6:popart} The MSE critic target spans a huge dynamic range
+(the $\pm1000/\sigma_R$ terminal spike vs.\ $O(10^{-2})$ per-step shaping). v6 (\cd{USE\_POPART}) trains
+the value head in a \emph{normalized} space with output-preserving rescaling (Hessel et al., 2018). With
+running statistics over GAE returns $\hat R$, EMA rate $\beta=\cd{POPART\_BETA}=3\!\times\!10^{-4}$,
+\begin{equation}
+\mu\leftarrow(1{-}\beta)\mu+\beta\,\E[\hat R],\quad
+\nu\leftarrow(1{-}\beta)\nu+\beta\,\E[\hat R^2],\quad
+\sigma=\sqrt{\nu-\mu^2},
+\end{equation}
+the value loss regresses the normalized target,
+$\mathcal L^{V}=\big(\tilde V_\theta(s_t)-(\hat R_t-\mu)/\sigma\big)^2$, while GAE/bootstrapping use the
+de-normalized $V=\sigma\tilde V_\theta+\mu$. On each statistics update $(\mu,\sigma)\!\to\!(\mu',\sigma')$
+the final value layer is rescaled to \emph{preserve} raw outputs,
+\begin{equation}
+W\leftarrow W\,\frac{\sigma}{\sigma'},\qquad b\leftarrow\frac{\sigma\,b+\mu-\mu'}{\sigma'},
+\end{equation}
+so $V(s)=\sigma\tilde V_\theta(s)+\mu$ is invariant to the update (verified to $4\times10^{-7}$). PopArt
+state is persisted in the resumable train-state.
+
+\paragraph{Everything else.} The clipped surrogate (\texttt{rl\_math.tex} \texttt{eq:clip}), the log-ratio clamp, \cd{vf\_coef},
+\cd{MINIBATCHES}, \cd{MAX\_GRAD\_NORM}, and the KL definitions are unchanged
+(\rlref{KL / trust region}{sec:kldiv}). \cd{kl\_beta}$=0$ (no reference-policy anchor) for the from-scratch run.
+
+%================================================================
+\section{Systems / data path (A100, compute-bound)}\label{v6:sys}
+The simulator \emph{dynamics} are byte-identical to \rlref{Batched GPU simulator}{sec:gpuenv}; v6 only
+changes how the rollout and update move data so the GPU is the bottleneck (no math change):
+\begin{itemize}[nosep,leftmargin=1.4em]
+  \item \textbf{bf16 autocast} on every net forward (rollout \emph{and} update); the distribution
+        log-prob / entropy / value and the GAE remain fp32. bf16 has fp32 range, so \textbf{no GradScaler}
+        --- safe against the Dirichlet \cd{log\_prob}.
+  \item \textbf{On-GPU rollout buffers $+$ GPU GAE}: the per-step $(\text{ent},\text{mask},\text{act},\log\pi,V,r,\text{done})$
+        buffers live on-device and the GAE recursion runs on-GPU --- no host copies, no
+        \cd{.cpu()}/\cd{.item()}/\cd{synchronize} in the step loop. The only removed CPU sync (the per-step
+        comet-schedule \cd{.item()} and the early-break) is replaced by passing the Python step index.
+  \item \textbf{Flash SDPA} attention kernel (\S\ref{v6:net}a) and \textbf{fused Adam}.
+  \item Minibatch tensors are indexed \emph{on-device} in the update (no per-minibatch host$\to$device copy).
+  \item Batch $B=256$ (\cd{NUM\_GROUPS}$\times$\cd{GROUP\_SIZE}$=16\times16$) for an A100; memory is
+        dominated by the rollout buffers ($\approx\!4$\,GB at $B{=}256,T{=}500$), comfortably within a 40/80\,GB A100.
+\end{itemize}
+
+%================================================================
+\section{Config $\leftrightarrow$ symbols (delta only)}\label{v6:cfg}
+New or changed knobs (all in the v6 config cell); unchanged symbols are in
+\rlref{Symbols $\leftrightarrow$ config}{(symbols table)}.
+\begin{center}\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+config & symbol / role & v6 value (vs.\ rl\_math) \\
+\midrule
+\cd{GAMMA}                 & $\gamma$ (GAE discount)               & $0.997$ (was $0.99$)\\
+\cd{GAE\_LAMBDA}           & $\lambda$ (trace decay)               & $0.98$ (was $0.95$)\\
+\cd{UPDATE\_EPOCHS}        & PPO epochs/iter                       & $3$ (was $1$)\\
+\cd{KL\_EARLYSTOP}         & end-of-epoch KL stop                  & on (was per-minibatch break)\\
+\cd{USE\_POPART},\,\cd{POPART\_BETA} & value normalization $\beta$ & on, $3\!\times\!10^{-4}$ (new)\\
+\cd{ENT\_COEF\_START/END/DECAY\_ITERS} & $c_{\mathcal H}$ anneal  & $0.02\!\to\!0.002$ / $300$ (was fixed)\\
+\cd{USE\_POTENTIAL\_SHAPING} & reward family                       & on (replaces $C,D,P$)\\
+\cd{SHAPE\_SHIP},\,\cd{SHAPE\_PROD} & $c_{\mathrm{ship}},c_{\mathrm{prod}}$ & $50,\,50$ (new)\\
+\cd{DEST\_HEAD}            & WHERE head type                       & \cd{bilinear} (was linear)\\
+\cd{INIT\_DEST\_SCALE}     & calm-init WHERE scale                 & $0.02$ (new)\\
+\cd{GREEDY\_TAU}           & $\tau$, sharpened greedy temp         & $0.5$ (new; was Dirichlet mean)\\
+\cd{GATE\_TRIM\_LO/HI},\,\cd{GATE\_EPS},\,\cd{INIT\_GATE\_BIAS} & gate $p_s$ trim/init & $0.2,0.8,0.02,-1$ (gate is new vs.\ rl\_math)\\
+\cd{USE\_AMP},\,\cd{AMP\_DTYPE} & bf16 autocast                    & on, bf16 (new)\\
+\cd{B} & parallel envs                                              & $256$ (was $128$)\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%================================================================
+\section{Appendix: model scaling (transformer)}\label{v6:scaling}
+Since v6 runs no MCTS, the net \emph{is} the agent and the binding constraint on an A100 is wall-clock
+$\times$ iterations, not memory. A scaling check is a \emph{ladder} of runs differing only in the
+transformer stack, all else fixed (seed, reward, league, $B$, $T$), compared on the gauntlet score of
+\S\ref{v6:league} vs.\ both iteration and wall-clock. With per-layer parameter count $\approx 12d^2$ and
+per-iter forward cost $\propto (12 N_{\mathrm{tx}}{+}c)\,d^2$ (dominated by the $T$ sequential rollout
+forwards), a geometric ladder is e.g.
+\[
+\text{S }(d{=}256,N_{\mathrm{tx}}{=}4)\ \to\ \text{M }(384,6)\ \to\ \text{L }(512,8)\ \to\ \text{XL }(768,12),
+\quad \approx 4\text{M}\to12\text{M}\to28\text{M}\to90\text{M params},
+\]
+with $\cd{N\_HEADS}=d/64$. RL scaling is not guaranteed monotonic (bigger nets are more sample-hungry and
+less stable; use LR warmup and lower LR for L/XL); read the gauntlet-vs-wall-clock curve for the
+compute-optimal size, and keep the deployable size within the Kaggle CPU turn budget.
+
+\end{document}
