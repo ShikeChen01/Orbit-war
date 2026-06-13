@@ -6,8 +6,15 @@ Python stack was sim-bound (~130 env-steps/s); this moves the whole hot path int
 code so the RTX 3070 Ti is the limiting factor, not the interpreter.
 
 > Status: **implemented and verified correct end-to-end.** The system trains fast and the
-> learned weights play in the real engine. Producing a *strong* policy is a compute +
-> tuning task (see [Limitations](#limitations--next-steps)).
+> learned weights play in the real engine.
+>
+> **Update 2026-06-04 — the trainer is now GRPO and the policy beats starter.** The learner is
+> **GRPO** (group-relative advantage, **no value network**; `ow_train_grpo`), not PPO/GAE. The
+> policy is a **threat-aware (F=20) GLU/ResNet** pointer-actor, trained from a strong BC with a
+> **production-only + loss-forfeit** reward. Result: **99.5% vs random, ~52–55% vs starter** (a
+> *trained* policy, no inference search). Full math in `rl_math.pdf`; the journey in
+> `EXPERIMENTS.md`. The PPO/GAE description below is the superseded original design (kept for the
+> env/throughput details, which are unchanged).
 
 ## Why C++ (not Rust/JAX)
 

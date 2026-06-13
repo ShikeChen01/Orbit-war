@@ -11,10 +11,12 @@ struct TrajectoryBatch {
     torch::Tensor entity_mask;  // (N,E)   float32
     torch::Tensor action_mask;  // (N,E)   float32
     torch::Tensor globals;      // (N,G)   float32
-    torch::Tensor action;       // (N,E)   int64
+    torch::Tensor action;       // (N,E,2K) float32 squashed-Gaussian controls
     torch::Tensor old_logp;     // (N,)    behavior log-prob (under the sampling policy)
     torch::Tensor ref_logp;     // (N,)    reference (BC) log-prob, for the KL anchor
-    torch::Tensor advantage;    // (N,)    group-normalized return, broadcast to each step
+    torch::Tensor advantage;    // (N,)    GRPO: group-normalized return broadcast to each step;
+                                //         PPO:  per-step GAE advantage (normalized over kept steps)
+    torch::Tensor returns;      // (N,)    PPO only: GAE value target (advantage + V(s_t)); else empty
     long n_transitions = 0;
 };
 

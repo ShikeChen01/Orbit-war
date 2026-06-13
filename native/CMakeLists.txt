@@ -33,37 +33,35 @@ set_target_properties(orbitwars_native PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../orbit_wars_rl/_native"
 )
 
-# --- Native executables: Python-free train/eval loop -----------------------
-# Same headers as the module, but driven by a C++ main() so the dev loop is
-# edit -> build -> native\run.cmd ow_train ... with no Python / no .pyd reimport.
-# They load-time-link the wheel's torch DLLs, so run via native\run.cmd (puts
-# torch\lib on PATH). Executables land in the build dir (e.g. _bld\ow_train.exe).
-foreach(_app ow_train ow_eval)
-  if(_app STREQUAL ow_train)
-    add_executable(${_app} apps/train.cpp)
-  else()
-    add_executable(${_app} apps/eval.cpp)
-  endif()
-  target_include_directories(${_app} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-  target_link_libraries(${_app} PRIVATE torch_local)
-  target_compile_options(${_app} PRIVATE /EHsc /bigobj /Zc:__cplusplus)
-endforeach()
-
-# --- GRPO refactor: agent-model + algorithm sources (hpp/cpp split) ---------
+# --- GRPO (continuous actor): agent-model + algorithm sources (hpp/cpp split) -----------
+# SquashedGaussian is header-only (distribution.hpp); the rest of the policy is here.
 set(OW_RL_SRC
   rl/model/policy_net.cpp
-  rl/model/distribution.cpp
   rl/model/agent.cpp
   rl/algo/grpo.cpp
 )
-# Parity gate: new PolicyNet/Agent vs the old EntityPolicy on a checkpoint.
-add_executable(ow_test_model apps/test_model.cpp ${OW_RL_SRC})
-target_include_directories(ow_test_model PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(ow_test_model PRIVATE torch_local)
-target_compile_options(ow_test_model PRIVATE /EHsc /bigobj /Zc:__cplusplus)
 
-# GRPO trainer (grouped episodic rollout + KL-anchored update).
-add_executable(ow_train_grpo apps/train_grpo.cpp ${OW_RL_SRC} rl/rollout.cpp rl/grpo_trainer.cpp)
+# GRPO trainer (grouped episodic rollout + group-relative update). The Python-free dev loop:
+#   edit -> native\build.cmd -> native\run.cmd ow_train_grpo --init-from scratch ...
+add_executable(ow_train_grpo apps/train_grpo.cpp ${OW_RL_SRC} rl/rollout.cpp rl/grpo_trainer.cpp rl/gpu_env.cpp)
 target_include_directories(ow_train_grpo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(ow_train_grpo PRIVATE torch_local)
 target_compile_options(ow_train_grpo PRIVATE /EHsc /bigobj /Zc:__cplusplus)
+
+# --- GPU-batched simulator (gpu_env) + its parity oracle vs the reference C++ ow::step ---------
+add_executable(ow_parity_gpu apps/parity_gpu.cpp rl/gpu_env.cpp)
+target_include_directories(ow_parity_gpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(ow_parity_gpu PRIVATE torch_local)
+target_compile_options(ow_parity_gpu PRIVATE /EHsc /bigobj /Zc:__cplusplus)
+
+# --- BC pre-trainer: clone the starter into the continuous PolicyNet -> bc.owc (GRPO warm start) -
+add_executable(ow_bc apps/bc_pretrain.cpp ${OW_RL_SRC})
+target_include_directories(ow_bc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(ow_bc PRIVATE torch_local)
+target_compile_options(ow_bc PRIVATE /EHsc /bigobj /Zc:__cplusplus)
+
+# --- reward-curve diagnostic: trace one game's per-step reward channels + standing to CSV ---------
+add_executable(ow_reward_trace apps/reward_trace.cpp ${OW_RL_SRC})
+target_include_directories(ow_reward_trace PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(ow_reward_trace PRIVATE torch_local)
+target_compile_options(ow_reward_trace PRIVATE /EHsc /bigobj /Zc:__cplusplus)

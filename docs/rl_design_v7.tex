@@ -1,0 +1,402 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+\usepackage{xcolor}
+
+% --- macros (match rl_math.tex / rl_math_v6.tex usage so equations read identically) ---
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Adv}{\widehat{A}}
+\newcommand{\pol}{\pi_\theta}
+\newcommand{\relu}{\operatorname{relu}}
+\newcommand{\softplus}{\operatorname{softplus}}
+\newcommand{\softmax}{\operatorname{softmax}}
+\newcommand{\clip}{\operatorname{clip}}
+\newcommand{\sign}{\operatorname{sign}}
+\newcommand{\cd}[1]{\texttt{#1}}
+\newcommand{\rlref}[2]{\textbf{see \texttt{rl\_math.tex} \S\,``#1''} (\texttt{#2})}
+\newcommand{\vsixref}[1]{\textbf{see \texttt{rl\_math\_v6.tex} \S\,#1}}
+
+\title{\textbf{Orbit Wars --- v7: BC warm-start + guardrailed PPO,\\ a scaling-validated training recipe (\emph{diff} against \texttt{rl\_math\_v6.tex})}}
+\author{}
+\date{2026-06-09}
+
+\begin{document}
+\maketitle
+
+\noindent\textbf{How to read this.} This document is a \emph{delta} on top of
+\texttt{rl\_math\_v6.tex} (which is itself a delta on \texttt{rl\_math.tex}). The simulator, the
+gated-Dirichlet allocation action space, the potential-based reward, PopArt, and the Elo/PFSP league
+are all unchanged from v6 and are not restated. v7 answers one question:
+\emph{what training method + architecture is demonstrably stable and improvable at small scale on an
+RTX~3070~Ti, such that the same recipe can be scaled on an A100 with high confidence?}
+The answer has three parts: (i) a \textbf{behavior-cloning (BC) warm-start} that expresses the
+strongest scripted bot directly in the gated-allocation action space and eliminates the from-scratch
+bootstrap failure entirely; (ii) three \textbf{PPO stability guardrails} (per-minibatch KL hard stop,
+linear LR warmup, critic-only warmup) that remove the catastrophic first-update collapse;
+(iii) a \textbf{measured compute model} (steps/s, \$/iter, ms/move at deploy) that sizes the A100 run
+and proves the deployment budget is nowhere near binding.
+
+\paragraph{One-line map.}
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+component & status in v7 & where \\
+\midrule
+simulator / parity / comets        & unchanged (\vsixref{sys})        & --- \\
+gate (Bernoulli fire) + decode     & unchanged (\vsixref{dist}); grad-vanish fix \textbf{verified} & \S\ref{v7:grad} \\
+WHERE distribution                 & \textbf{replaced: categorical} (Dirichlet kept for A/B) & \S\ref{v7:cat} \\
+entropy bonus                      & \textbf{replaced: gate-only}     & \S\ref{v7:ent} \\
+potential shaping + PopArt         & unchanged (\vsixref{reward})     & --- \\
+Elo/PFSP league                    & unchanged (\vsixref{league})     & --- \\
+bootstrap                          & \textbf{new: BC warm-start}      & \S\ref{v7:bc} \\
+PPO update                         & \textbf{new: 3 guardrails}       & \S\ref{v7:guard} \\
+evidence / scaling ladder          & \textbf{new: measured}           & \S\ref{v7:ladder} \\
+deploy + A100 compute model        & \textbf{new: measured}           & \S\ref{v7:budget} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent\textbf{Method, in one paragraph.} Train a per-planet-token transformer with two factored
+heads --- a per-source \emph{categorical} over destinations (WHERE) and a per-source Bernoulli
+launch gate (FIRE) --- by (1) behavior-cloning the strongest scripted bot directly into those heads
+(2--3 minutes of GPU time), then (2) guardrailed PPO against the Elo/PFSP league. Every piece of
+this was forced by a measured failure of the alternative, documented below.
+
+\section{Why the bootstrap, not the algorithm, was the wall}\label{v7:why}
+
+Every from-scratch run in this project's history --- GRPO (\rlref{GRPO}{sec:grpo}), PPO+GAE, the v5
+target actor, the v6 gated allocation --- hit the same two walls, reproduced one final time as a
+controlled 30-iteration smoke (256-dim/2-layer transformer, $B{=}64$, $T{=}300$, 3070~Ti):
+
+\begin{enumerate}[leftmargin=2em]
+\item \textbf{Catastrophic first update.} At iteration 1 the measured update KL was $2.06$ with
+clip-fraction $0.98$: \emph{every} sample was clipped, i.e.\ the update was pure surrogate-boundary
+drift. The launch rate fell from $13.5$ to $1.0$ launches/step in that single iteration --- the
+fresh policy's exploratory aggression was annihilated before the critic could attribute credit. The
+existing end-of-epoch KL check (\vsixref{ppo}) fires only \emph{after} a full epoch (64 minibatch
+optimizer steps) has already run away.
+\item \textbf{Passivity plateau.} After the slam, the policy stabilizes at $\sim$1 launch/step,
+beats the random anchor ($\approx 0.8$ win rate) and stalls: policy loss $\approx 0$, KL
+$\approx 10^{-3}$, and the fixed-opponent gauntlet (starter/intermediate/greedy) reads $0.000$ for
+all 30 iterations. This is the same basin documented for v4/v5; reward re-shaping moved which basin
+we landed in but never removed it. The best from-scratch result ever obtained here was a $0.47$
+win rate vs.\ starter after 1400 iterations ($\approx$\,20\,h on the 3070~Ti).
+\end{enumerate}
+
+The conclusion that drives v7: \emph{the optimization machinery is fine; the starting point is
+fatal.} The fix is to start PPO from a policy that already commits, aims, and wins against the
+scripted ladder --- which the gated-allocation action space makes trivially expressible
+(\S\ref{v7:bc}) --- and to make the first PPO updates structurally incapable of destroying it
+(\S\ref{v7:guard}).
+
+\section{Gradient-vanish fix: verified}\label{v7:grad}
+
+v6's gradient collapse was caused by applying the deploy-time gate deadzone
+$p = \clip\!\big((\sigma(z)-0.2)/0.6,\,0,\,1\big)$ during training: $\clip$ has zero gradient
+outside the band, and as gate logits sharpen, both the gate head and (through the
+$\mathrm{fire}\cdot\log\pi_{\text{where}}$ coupling) the WHERE head starve. The fix (already in the
+notebook, \cd{GatedAllocDist(deploy=False)}: training uses smooth $p=\sigma(z)$ clamped to
+$[\varepsilon,1-\varepsilon]$; deployment keeps the hard trim; the greedy fire boundary
+$p\ge 0.5 \Leftrightarrow z\ge 0$ is identical in both) is now \textbf{empirically verified}: over
+the 30-iteration smoke the gradient norm stayed in $[0.7,\,5.4]$ with no downward trend, where the
+pre-fix run decayed monotonically toward zero.
+
+\section{BC warm-start in the gated-allocation space}\label{v7:bc}
+
+\subsection{The expert, expressed natively in the action space}
+The strongest scripted anchor is \cd{medium} (nearest non-owned planet, lead-aimed, fire when
+$\lfloor s/2\rfloor \ge 20$). Its decision structure maps \emph{exactly} onto the two gated-alloc
+heads --- this is the payoff of the v6 action-space design:
+\[
+\text{fire}^\ast_{s} = \mathbb{1}\big[\text{owned}_s \wedge \text{alive}_s \wedge
+\lfloor S_s/2\rfloor \ge 20 \wedge \exists\,\text{target}\big],
+\qquad
+\text{where}^\ast_{s} = \operatorname{onehot}\big(\arg\min_{d\,:\,\text{non-owned}} \|x_d - x_s\|\big).
+\]
+Two deliberate deviations from the literal bot: (i) the gated decode dispatches the \emph{full}
+garrison on fire (the action space cannot express ``send half''), so the clone is
+\textbf{``full-send medium''} --- measured \emph{stronger} than its teacher (Table~\ref{tab:bc}),
+consistent with the project-wide lesson that expansion-race aggression dominates; (ii) expert
+targets occluded by the sun are dropped from the WHERE loss (the clone learns
+``medium minus sun-suicide'').
+
+\subsection{Loss: native to the distribution, not a surrogate}
+With $p_s$ the smooth gate fire-probability and $\ell_{sd}$ the masked WHERE logits (alive +
+reachability + no-self, the same \cd{glogits} the sharpened-softmax greedy uses):
+\[
+\mathcal{L}_{\mathrm{BC}}
+= \underbrace{-\tfrac{1}{|O|}\sum_{s\in O}\Big[\text{fire}^\ast_s\log p_s + (1-\text{fire}^\ast_s)\log(1-p_s)\Big]}_{\text{gate BCE, all owned sources}}
+\;\underbrace{-\tfrac{1}{|F|}\sum_{s\in F}\log\softmax(\ell_{s\cdot})_{d^\ast_s}}_{\text{WHERE CE, firing sources only}} .
+\]
+The CE drives $\ell_{sd^\ast}$ up exactly where $\alpha = \softplus(\ell)\,\kappa$ concentrates the
+training-time Dirichlet \emph{and} where the deploy-time sharpened softmax looks, so supervised and
+RL phases optimize the same parameters with consistent semantics. No new heads, no adapter.
+
+\subsection{Data: states visited by the clone itself}
+Rollouts are generated by the \emph{expert acting in the clone's own action space} (one-hot bundles
+through the standard decode) against a starter-heavy scripted mix, so the state distribution BC fits
+is the distribution the warm-started policy will actually visit --- a free DAgger-like property; no
+compounding-error gap on the states that matter. Post-terminal states are masked out; encoded states
+are stashed on CPU ($\sim$0.6\,GB per 500-step rollout at $B{=}64$).
+
+\subsection{Result}
+\begin{table}[h]\centering\small
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+policy & train cost (3070\,Ti) & vs random & vs starter & vs greedy & vs medium \\
+\midrule
+best-ever from-scratch RL (v5, 1400 it) & $\approx$20\,h & 1.00 & 0.47 & --- & --- \\
+from-scratch v7 smoke (30 it)           & 6\,min  & 0.80 & 0.00 & 0.00 & 0.00 \\
+\textbf{BC clone, 256/L2 (10 rounds$\times$3 ep)} & \textbf{144\,s} & \textbf{1.000} & \textbf{0.938} & \textbf{0.625} & \textbf{0.875} \\
+\bottomrule
+\end{tabular}
+\caption{Greedy-deploy GpuEnv scores (win$+\tfrac12$draw, 64 envs, comets on). BC lands at
+league Elo $\approx 900$--$940$ on the anchored scale (random$=0$, starter$=600$, greedy$=900$,
+medium$=1000$; the exact value depends on the deploy greedy: sharpened-softmax 896, categorical
+argmax 938). Quality gate: a deliberately undertrained clone (64-dim, 2 rounds) reached only
+dest-acc $0.40$ and scored $0.03$ vs starter --- BC inits are trustworthy only above
+$\text{dest-acc}\approx 0.85$, reconfirming the v4-era ``weak-BC artifact'' lesson.}
+\label{tab:bc}
+\end{table}
+
+\section{WHERE becomes a categorical (the v7 architecture decision)}\label{v7:cat}
+
+\subsection{The measured failure of PPO on the Dirichlet}
+Warm-started PPO with the v6 Dirichlet WHERE head \emph{destroys} the BC policy. With all
+guardrails of \S\ref{v7:guard} active (run \cd{runs/v6/ppoS2}), the fixed-opponent gauntlet decayed
+$0.755 \to 0.625 \to 0.276 \to 0.104$ over 40 iterations while the per-update $k_3$ KL spiked to
+$2$--$9$ \emph{despite} a per-minibatch KL hard stop. The mechanism is intrinsic, not a tuning
+artifact: BC concentrates $\alpha=\softplus(\ell)\kappa$ into near-one-hot rows, and the log-density
+of a 48-dimensional Dirichlet near a simplex vertex is so steep that a \emph{single} clipped,
+LR-warmed optimizer step moves stored-action log-probs by whole nats. PPO's ratio clip bounds each
+sample's loss contribution, and the KL stop bounds damage per \emph{epoch} --- nothing bounds damage
+per \emph{step} when the density itself is this sharp. (The same property produced the unbounded
+negative Dirichlet entropy of \S\ref{v7:ent}.)
+
+\subsection{The replacement}
+The WHERE head keeps its masked logits $\ell_{sd}$ (alive + sun-reachability + no-self,
+\vsixref{dist}) but the distribution over them becomes a per-source \textbf{categorical};
+the sampled action row is the \emph{one-hot} of the drawn destination, so the action bundle
+$(B,E,E{+}1)$, the decode, the rollout buffers, the league fingerprint, and the checkpoints are all
+untouched. Three independent arguments select this design:
+\begin{enumerate}[leftmargin=2em]
+\item \textbf{Numerics.} $\log\softmax(\ell)_{d}$ has bounded sensitivity in $\ell$; PPO on
+factored categoricals is its most battle-tested regime. Measured: first-update KL drops from
+$0.53$--$2.06$ (Dirichlet, from scratch) to $0.008$--$0.010$ (categorical, same setup).
+\item \textbf{Deploy equivalence.} The v6 \emph{deployed} policy already collapses the Dirichlet to
+a temperature-sharpened softmax over the same $\ell$ --- effectively one-hot. The continuous
+``split allocation'' expressivity was paid for in training fragility and never used at deploy; the
+gate-as-rate (fire probability over repeated steps, garrison refilled by production) already
+delivers multi-target pressure over time.
+\item \textbf{Search-readiness.} A fully discrete factored action (categorical WHERE $\times$
+Bernoulli FIRE) is the prerequisite for the planned Gumbel-AlphaZero extension
+(\rlref{search-based policy improvement}{sec:search}); the Dirichlet was the blocker.
+\end{enumerate}
+The BC loss of \S\ref{v7:bc} is \emph{exactly} the categorical log-likelihood, so the same BC
+checkpoint warm-starts both variants; \cd{WHERE\_DIST='dirichlet'} retains the old path for A/B.
+
+\subsection{Attribution: what the Dirichlet did and did not cause}\label{v7:attrib}
+A follow-up $2{\times}2$ (from-scratch $\times$ \{categorical, Dirichlet\}, both under the full
+\S\ref{v7:guard} guardrails, 30 iters, 256/L2) plus a low-LR BC leg separates three phenomena that
+were previously conflated:
+\begin{center}\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+phenomenon & cause & evidence \\
+\midrule
+\textbf{bootstrap wall} (can't beat starter & \emph{not} the distribution: & scratch-cat gauntlet 0.083, Elo 170; \\
+\quad from scratch in reasonable time) & credit assignment + opponent gap & scratch-dir 0.016, Elo 125 (both walled) \\
+\textbf{first-update slam} (launch rate & Dirichlet $\times$ \emph{unguarded} update; & old code: it1 KL 2.06, lnch 13.5$\to$1.0; \\
+\quad annihilated at it1) & guardrails alone remove it & guardrailed dir: KL $\le$0.024, no slam \\
+\textbf{post-BC erosion} & Dirichlet log-density sharpness; & LR $10^{-4}$: gauntlet 0.755$\to$0.104; \\
+ & LR-dependent (trust-region misfit) & LR $10^{-5}$: 0.719$\to$0.771 (survives) \\
+\bottomrule
+\end{tabular}
+\end{center}
+\noindent So the bootstrap wall is \emph{distribution-independent} (it also predates the Dirichlet:
+the v5 actor's destination head was already categorical and still needed 1400 iterations for a
+0.47 starter win rate); BC removes it under \emph{either} distribution. The Dirichlet's real crime
+is the update fragility, and even that is survivable at $10\times$ reduced LR --- but strictly
+dominated: BC+Dirichlet at LR $10^{-5}$ reaches gauntlet 0.771 with median KL 0.102 (still
+$2$--$3\times$ over target), vs.\ BC+categorical at LR $10^{-4}$ reaching 0.812 with KL 0.035 and
+Elo $+161$ vs.\ $-9$ over the same 40 iterations. You can pay for the Dirichlet with a $10\times$
+smaller trust region; there is no reason to.
+
+\paragraph{Mechanism, quantified (CPU probe, \cd{scripts/probe\_dist\_sensitivity.py}).}
+Over $E{=}48$ logit rows, sampled actions from each distribution, identical logits: the Dirichlet's
+$\|\partial \log\pi(a)/\partial \ell\|_2$ is $5$--$6\times$ the categorical's at every sharpness
+regime, and the log-prob movement per unit logit perturbation is $5$--$10\times$ --- which
+compounds quadratically in KL, matching the $\sim$$100\times$ KL gap measured between the real
+runs. The decisive asymmetry appears at BC sharpness: the \emph{categorical's} gradient on
+confident samples collapses to $\approx 0$ (a sharp categorical is self-stabilizing), while the
+Dirichlet's stays $\approx 5$ \emph{forever} --- it cannot settle, because suppressed components
+sit at $\alpha = \softplus(-6) \approx 0.003 < 1$, where the density is \emph{singular} at the
+simplex corner that every sample occupies; the $(\alpha_d{-}1)\log x_d$ terms keep injecting
+$|\log x_d| \approx 14$-scale gradients regardless of how converged the policy is.
+
+\section{Entropy bonus: gate-only}\label{v7:ent}
+The v6 bonus used $H(\text{Bern}(p_s)) + p_s H(\text{Dir}(\alpha_s))$. Differential entropy of a
+peaked Dirichlet is unboundedly \emph{negative}: after BC it measured $\approx -4{,}000$ per source,
+so with coefficient $0.005$ the ``bonus'' became a $+20$ loss term whose gradient actively blurred
+the BC-learned WHERE head (measured at warmup-end: grad-norm $1380$, KL $4.8$, Elo
+$1032\!\to\!955$). v7 keeps only bounded terms: the gate Bernoulli entropy
+($\le \ln 2$), plus the categorical WHERE entropy ($\le \ln E$) weighted by
+\cd{ENT\_DIR\_COEF} (default $0$). Exploration is supplied by the stochastic gate
+(\cd{GATE\_EPS} keeps $p\in[\varepsilon,1{-}\varepsilon]$), categorical sampling, and PFSP opponent
+diversity --- not by fighting the BC sharpness.
+
+\section{PPO guardrails}\label{v7:guard}
+
+Three additions to the v6 update (\vsixref{ppo}); all are off-by-default-compatible knobs in the
+config cell, defaults chosen for the warm-started regime:
+
+\begin{enumerate}[leftmargin=2em]
+\item \textbf{Per-minibatch KL hard stop} (\cd{KL\_STOP\_MINIBATCH}, default on). The update
+\emph{breaks mid-epoch} the moment a minibatch's $k_3$ KL estimate exceeds
+$\cd{KL\_HARD\_MULT}\,(1.5)\times \cd{KL\_TARGET}\,(0.05)$. The v6 end-of-epoch check provably
+cannot prevent the iteration-1 slam ($\text{KL}=2.06$ happened \emph{within} one epoch).
+\item \textbf{Linear LR warmup} (\cd{LR\_WARMUP\_ITERS}): $\eta_t = \eta \cdot
+\min(1, (t{+}1)/W)$ over the first $W$ iterations \emph{of a \cd{train()} call} (not global iters),
+so every fresh-Adam phase (from-scratch, post-BC, resumed-with-fresh-moments) ramps in.
+\item \textbf{Critic-only warmup} (\cd{VALUE\_WARMUP\_ITERS}): for the first $K$ iterations the
+policy-surrogate and entropy terms are multiplied by 0 \emph{and only \cd{val\_*} parameters are
+stepped}. The second clause is load-bearing and was measured the hard way: with a shared trunk, the
+value loss alone (backpropagating into the trunk) dragged the BC policy by KL $0.15$--$0.84$ per
+iteration with the policy surrogate completely off. Rationale for the warmup itself: after BC the
+actor is strong but the critic is random; advantages computed against a random baseline are
+structured noise, which is exactly what slammed previous warm starts. With the val-only restriction
+the warmup iterations measure KL $\equiv 0.000$, then the actor unfreezes against a usable
+baseline.
+\end{enumerate}
+
+\section{Evidence: the scaling ladder on the 3070 Ti}\label{v7:ladder}
+
+Protocol: identical recipe at two scales --- BC warm-start (10 rounds $\times$ 3 epochs) followed by
+40 PPO iterations ($B{=}64$, $T{=}500$, LR warmup 8, value warmup 5, per-minibatch KL stop on,
+entropy $0.005\!\to\!0.002$), fixed-opponent gauntlet (starter/intermediate/greedy, 64 envs each)
+every 10 iterations for best-checkpoint selection.
+
+\subsection{The decisive A/B at S-scale (256/L2): Dirichlet vs.\ categorical}
+Same BC init, same guardrails, same seeds --- the only change is the WHERE distribution:
+\begin{center}\small
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+ & BC init & it10 & it20 & it30 & it40 \\
+\midrule
+gauntlet, Dirichlet (\cd{ppoS2})    & $\sim$0.74 & 0.755 & 0.625 & 0.276 & \textcolor{red}{0.104} \\
+gauntlet, categorical (\cd{ppoS3})  & $\sim$0.74 & 0.760 & 0.802 & \textbf{0.812} & 0.807 \\
+league Elo, categorical             & 938 & 1050 & 1092 & 1087 & \textbf{1099} \\
+update KL band, Dirichlet           & --- & \multicolumn{4}{c}{$0.2$--$8.9$ (spiking, uncontained)} \\
+update KL band, categorical         & --- & \multicolumn{4}{c}{$0.025$--$0.045$ (in band, all 40 iters)} \\
+\bottomrule
+\end{tabular}
+\end{center}
+The categorical run \emph{passes the medium anchor} (Elo 1000) by iteration 20 and keeps the KL
+exactly where \cd{KL\_TARGET} asks. Training win rates vs.\ the medium anchor reach $0.80$--$0.95$
+by the back half of the run. This is the first time in the project that RL \emph{improves on} a
+strong initialization instead of eroding it.
+\subsection{Scale leg M (512/L4, 13.2M params): same recipe, strictly better}
+\begin{table}[h]\centering\small
+\begin{tabular}{@{}lcc@{}}
+\toprule
+ & S: 256/L2 (1.8M) & M: 512/L4 (13.2M) \\
+\midrule
+BC clone vs starter / greedy / medium & 0.938 / 0.625 / 0.875 & 0.906 / \textbf{0.703} / \textbf{0.953} \\
+gauntlet @ it10 / best of 40          & 0.760 / 0.812         & \textbf{0.844} / \textbf{0.885} \\
+league Elo, BC $\to$ it40             & 938 $\to$ 1099        & 1073 $\to$ \textbf{1172} \\
+median update KL (post-warmup)        & $\approx 0.035$       & 0.044 \\
+wall clock per PPO iter ($B{=}64$, $T{=}500$) & 17.1\,s        & 20.8\,s \\
+BC phase (10 rounds $\times$ 3 epochs) & 144\,s               & 168\,s \\
+\bottomrule
+\end{tabular}
+\caption{The scaling ladder. M dominates S on every quality endpoint at identical
+hyperparameters and iteration count, with the KL signature unchanged --- the recipe transfers
+across a $7\times$ parameter jump untouched. Crucially, M costs only $+22\%$ wall clock per
+iteration: \textbf{the rollout is simulator-bound, so model capacity is nearly free} at these
+scales --- the strongest possible argument for scaling the model further on the A100.}
+\label{tab:ladder}
+\end{table}
+
+\noindent Both legs show the same qualitative dynamics: critic-only warmup (KL $\equiv 0$,
+iters 1--5), one contained transient at actor-unfreeze, then a flat in-band KL while Elo climbs
+$\sim$25 points per 10 iterations. Neither leg shows the erosion mode of the Dirichlet A/B. The
+40-iteration budget was chosen to fit the 3070~Ti's 30-minute experiment ceiling; nothing in
+either trace suggests saturation at it40 (M's Elo was still rising: $1126 \to 1160 \to 1180$
+over the last 15 iterations).
+
+\section{Deployment + compute budget}\label{v7:budget}
+
+\subsection{Kaggle inference budget (measured rule, probed hardware)}
+\cd{actTimeout}\,$=1$\,s per move (\cd{REFERENCE\_orbit\_wars.json}), 500 steps,
+\cd{remainingOverageTime} on top. The submission probe measured the Kaggle worker at
+$\sim 0.032$\,TFLOP/s fp32 (2 CPU cores, 12.9\,GB/s copy bandwidth). Transformer cost per move is
+$\approx 12 d^2 L \cdot 48$ MACs:
+
+\begin{center}\small
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+scale & $d$/$L$ & params & GFLOP/move & est.\ ms/move (Kaggle CPU) \\
+\midrule
+S  & 256/2  & 1.8M   & 0.15 & 5   \\
+M  & 512/4  & 13.2M  & 1.21 & 38  \\
+L  & 768/6  & 43.8M  & 4.08 & 127 \\
+XL & 1024/8 & 102.9M & 9.66 & 302 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Even XL uses $<\!1/3$ of the per-move budget; \textbf{the deploy budget never binds the
+architecture choice} up to $\sim$100M params. Model scale is bounded by \emph{training} compute, not
+inference.
+
+\subsection{Training cost model (measured on the 3070 Ti)}
+\begin{center}\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+quantity & measured & note \\
+\midrule
+PPO iter, S (256/L2, $B{=}64$, $T{=}500$) & 17.1\,s ($\approx$1870\,sps) & rollout-dominated \\
+PPO iter, M (512/L4, same batch)          & 20.8\,s ($\approx$1540\,sps) & $+22\%$ for $7\times$ params \\
+BC round (rollout + 3 supervised epochs)  & 14--17\,s & 10 rounds suffice (dest-acc $\ge 0.90$) \\
+fixed-opponent gauntlet (3 anchors $\times$ 64 envs) & $\approx$2\,min & every \cd{CKPT\_EVERY} iters \\
+world-pool generation                     & 7\,ms/world & negligible (2048 $\approx$ 15\,s) \\
+full S leg (BC + 40 iters + evals)        & $\approx$16\,min & \\
+full M leg (BC + 40 iters + evals)        & $\approx$19\,min & \\
+\bottomrule
+\end{tabular}
+\end{center}
+Decision rule applied throughout: any single experiment projecting $>$30\,min on the 3070~Ti is
+packaged for the A100 instead. Because the workload is simulator-bound, the A100's leverage is
+\emph{batch} (more parallel envs per iteration) and \emph{capacity} (bigger model at $\sim$flat
+iter cost), not raw matmul speed; bf16 autocast + flash SDPA + fused Adam are already in the
+notebook and the 3070~Ti runs the identical code path.
+
+\section{The A100 run}\label{v7:a100}
+\cd{notebooks/setup1\_v7\_a100.ipynb} (generated by \cd{scripts/make\_a100\_nb.py} from the
+patched v6 notebook, so it carries every fix in this document). Spec:
+\begin{itemize}[leftmargin=2em]
+\item \textbf{Model}: $d{=}768$, $L{=}6$ transformer (43.8M params; 127\,ms/move on the Kaggle
+CPU --- comfortably deployable). \textbf{Batch}: $B{=}256$ envs $\times$ $T{=}500$ (128k
+transitions/iter, $4\times$ the ladder legs). \textbf{Iters}: 600 (additional calls resume via
+\cd{TRAIN\_STATE\_PATH}).
+\item \textbf{Recipe}: \cd{BC\_ENABLED=True} (Run-All chains BC $\to$ Elo calibration $\to$
+guardrailed PPO), \cd{WHERE\_DIST='categorical'}, gate-only entropy ($0.005\!\to\!0.002$),
+\cd{VALUE\_WARMUP\_ITERS=5}, \cd{LR\_WARMUP\_ITERS=8}, per-minibatch KL stop, PFSP league with
+snapshots every 25 iters, gauntlet best-ckpt every 25 iters, Elo re-grounding every 500.
+\item \textbf{Projected cost}: simulator-bound scaling from the M leg gives $\approx$30\,s/iter
+at $B{=}256$ on the A100 ($\approx$3$\times$ device factor on the element-wise-heavy env step);
+600 iters $+$ 24 gauntlets $\approx$ \textbf{6\,h}, one Colab session. VRAM $\approx$5\,GB of
+rollout buffers $+$ model/optimizer --- far inside 40\,GB; $B{=}512$ is the next lever if
+throughput disappoints.
+\item \textbf{Health signature to watch} (from the ladder): iters 1--5 KL $\equiv 0.000$; one
+transient at unfreeze; then KL $\in[0.02, 0.06]$, Elo $+\sim$25/10\,iters, gauntlet $\ge$ BC level
+($\approx$0.8) and rising. Any return of KL spikes $>1$ or a falling gauntlet means the
+\cd{WHERE\_DIST} flag got flipped or the BC init failed its dest-acc $\ge 0.85$ gate.
+\end{itemize}
+
+\end{document}

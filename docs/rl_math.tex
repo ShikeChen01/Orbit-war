@@ -7,6 +7,8 @@
 \usepackage[colorlinks=true,linkcolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
 \usepackage{parskip}
 \usepackage{enumitem}
+\usepackage{tikz}
+\usetikzlibrary{positioning, arrows.meta, calc, fit}
 
 \newcommand{\R}{\mathbb{R}}
 \newcommand{\E}{\mathbb{E}}
@@ -20,7 +22,7 @@
 \newcommand{\polold}{\pi_{\theta_{\mathrm{old}}}}
 \newcommand{\polref}{\pi_{\mathrm{ref}}}
 
-\title{\textbf{Orbit Wars --- RL Formulation and GRPO Training Math}}
+\title{\textbf{Orbit Wars --- RL Formulation and Training Math}}
 \author{Native C++/LibTorch stack}
 \date{\today}
 
@@ -28,8 +30,32 @@
 \maketitle
 \vspace{-1.5em}
 \begin{center}\small This document specifies the policy, the reward, and the
-\emph{Group Relative Policy Optimization} (GRPO) update used by the native trainer.
-Symbols map to \texttt{native/rl/config.hpp} and \texttt{native/rl/model/}.\end{center}
+training updates used by the native trainer. The trainer supports \emph{two}
+algorithms --- \emph{Group Relative Policy Optimization} (GRPO, a group baseline,
+Section~\ref{sec:grpo}) and \textbf{PPO\,+\,GAE} (a value-head critic,
+Appendix~\ref{sec:ppo}) --- selected by \texttt{TrainConfig::algo}. The current
+\texttt{docs/set-ups/1.md} run (the \textbf{v5 target actor} with the redesigned
+event reward) trains with \textbf{PPO\,+\,GAE}; GRPO is the alternative.
+Symbols map to \texttt{native/rl/config.hpp} and \texttt{native/rl/model/}.\\[0.4em]
+\textbf{Leading implementation note.} The actively-developed implementation is the
+self-contained pure-PyTorch notebook \texttt{notebooks/setup1\_target\_ppo.ipynb}
+(it mirrors the native trunk/reward bit-for-bit). It has since taken the v5 actor
+\textbf{five} steps further, all reflected below: (i) the per-planet action is now a
+single \textbf{per-source Dirichlet allocation} simplex (Section~\ref{sec:dist}) --- each owned source
+emits one $E$-way row of ship fractions over all destinations \emph{including itself}, the
+self-diagonal being \texttt{HOLD}, so over-launch is structurally impossible; (ii) destinations the
+sun would absorb are \emph{hard-masked} via a reachability mask (Section~\ref{sec:dist}); (iii)
+single-snapshot self-play is replaced by an \textbf{Elo/PFSP league}
+(Section~\ref{sec:league}), and the hand-coded curriculum stages are \emph{removed} --- the league
+\emph{is} the curriculum (Section~\ref{sec:curriculum}); (iv) the launch \emph{budget} is enforced by
+the row simplex rather than a per-slot running deduction --- one source can still fan its garrison
+across several destinations in a turn, but simultaneously, with no slot order to get wrong
+(Section~\ref{sec:problem}); and (v) headings aim at the destination's orbital
+\emph{intercept} (\texttt{LEAD\_TARGET}, Section~\ref{sec:lead}) rather than its current
+position. The native C++ stack still carries the continuous-$\phi$ single-launch
+target actor; porting these is pending. Appendix~\ref{sec:search} maps the
+\textbf{AlphaZero/MuZero family} onto this discrete actor --- the planned next step
+beyond PPO.\end{center}
 \tableofcontents
 \bigskip
 
@@ -55,149 +81,838 @@ world generation, (ii) replacing the zero-sum margin with the FFA return (max-sc
 $-1$, or a rank-based shaping), and (iii) seating $\geq 1$ extra opponents per game. This 2p$\to$4p
 gap is an open modeling item, revisited in Section~\ref{sec:reward}.
 
-\paragraph{Factored action space.}
-A turn's action is \emph{factored over the ego player's planets} (``entities''). The
-observation exposes up to $E$ entity slots ($E=64$). Each owned planet $e$ independently
-chooses a class
+\paragraph{Target action space (current --- per-source Dirichlet \emph{allocation} actor).}
+A turn's action is \emph{factored over the $E$ planet slots} of the observation, but the per-planet
+action is no longer a bundle of $K$ discrete launch slots: it is a single \textbf{allocation
+simplex}. A single head emits, per \textbf{owned} source planet $s$, a row $A[s,\cdot]\in\R^{E}$ of
+\emph{fractions over all $E$ destinations \textbf{including $s$ itself}}, summing to $1$:
+\begin{itemize}[nosep]
+\item the \textbf{self-diagonal} $A[s,s]$ is the \texttt{HOLD} fraction --- the share of $s$'s ships
+\emph{kept} (no launch). Targeting the source itself \emph{is} the no-op, so there is no separate
+launch gate, hold column, or no-op bucket;
+\item each \textbf{off-diagonal} $A[s,d]$ ($d\neq s$) is the fraction of $s$'s ships sent to
+destination $d$ --- a real planet slot, masked to the \emph{alive} \textbf{and sun-reachable}
+destinations (the reachability mask of Section~\ref{sec:dist}).
+\end{itemize}
+Because each source row sums to $1$, the per-planet \textbf{ship budget is structural}: with garrison
+$S=S_s$,
 \begin{equation}
-a_e \in \{0,1,\dots,A-1\}, \qquad A = 1 + C\,|\mathcal{F}|,
+\sum_{d\neq s}\big\lfloor A[s,d]\,S\big\rfloor \;\le\; (1-A[s,s])\,S \;\le\; S,
 \end{equation}
-where class $0$ is \emph{no-op}, $\mathcal{F}=\{0.25,0.5,0.75,1.0\}$ is the set of
-ship-fraction choices, and $C$ is the number of target choices: $C=E$ in
-\emph{target mode} (each class $\geq 1$ names a target entity $t$ and a fraction $f$, with
-aim angle computed analytically to hit $t$), or $C=$ \texttt{angle\_bins} in
-\emph{angle mode} (class names an angle bin and a fraction). The class index for a launch is
+so \textbf{over-launch is impossible} --- there is no running budget and no slot order to get wrong.
+This replaces the previous $K{=}10$ multi-launch design (a fixed bundle of $(d_{e,k},\varphi_{e,k})$
+slots decoded under a per-slot running budget), which the allocation simplex subsumes: one source can
+still fan its garrison across several destinations in one turn (several off-diagonal entries), but the
+fractions are now \emph{simultaneous} rather than sequential, and the budget is enforced by
+construction rather than by decode order. The per-planet action is thus a single $(B,E,E)$ allocation
+matrix $A$ (one $E$-simplex row per source planet), with $\texttt{n\_action\_params}=E$ per source
+and \textbf{no} separate $\phi$ head and \textbf{no} $K$ launch slots.
+
+A \textbf{heuristic} turns each chosen destination $d$ into its heading: with \texttt{LEAD\_TARGET}$=$true
+this aims at the destination's orbital \emph{intercept} (the deterministic lead math below); the
+static-target fallback is the straight line
+$\theta_{s,d}=\operatorname{atan2}\big(p_y[d]-p_y[s],\;p_x[d]-p_x[s]\big)$ at the destination planet's
+current position. Either way the model \textbf{never learns aiming} --- this removes the
+continuous-aiming learning problem that motivated the earlier $(d^x,d^y)$ direction-vector design
+(and its passive-basin failure).
+
+\subparagraph{Policy parameterization (PPO: a Dirichlet over each source row).} Under
+\texttt{POLICY\_MODE="ppo"} the \texttt{dest\_head} logits parameterize a \textbf{Dirichlet} on each
+owned source row. With per-destination logits $\ell_{s}\in\R^{E}$ the concentration is
 \begin{equation}
-\text{class}(t,f) = 1 + t\,|\mathcal{F}| + f .
+\alpha_{s} = \operatorname{softplus}(\ell_{s})\cdot\texttt{ALLOC\_KAPPA} + \epsilon,
+\qquad
+A[s,\cdot] \sim \mathrm{Dirichlet}(\alpha_{s}),
 \end{equation}
+and the action's log-probability and entropy \textbf{sum over the owned source planets} (unowned
+planets contribute nothing). \texttt{ALLOC\_KAPPA} sets the overall concentration (how peaked vs.\
+spread the allocation starts), $\epsilon$ a small floor keeping every $\alpha>0$. A second mode
+\texttt{POLICY\_MODE="mcts"} reuses the \emph{same} \texttt{dest\_head} logits as search \emph{priors}
+and discretizes the allocation into a tree search, with the self-diagonal $A[s,s]$ serving as the
+\textbf{no-op branch} (this is a stub for now; the search appendix, Appendix~\ref{sec:search}, is the
+design it targets).
+
+\subparagraph{Decode: allocation $\to$ engine launches.} For each ego-owned source $s$ ($u_s=1$,
+$S_s>0$) and each \emph{off-diagonal} destination $d\neq s$ that is alive, the launch size is
+$n_{s,d}=\lfloor A[s,d]\,S_s\rfloor$ ships, sent only when $n_{s,d}\ge\texttt{MIN\_LAUNCH\_SHIPS}$.
+A below-threshold off-diagonal entry is simply \textbf{held} (folded back into the garrison), \emph{not}
+penalized --- there is no miss/illegal-launch stick for it. Each executed launch is aimed at the
+orbiting intercept (Section~\ref{sec:lead}). Because every destination is a real, sun-reachable planet
+and the row simplex bounds total dispatch by $S_s$, the action is \textbf{structurally legal} ---
+over-dispatch and spraying are gone, so the old invalid-dispatch-penalty machinery and the ``learn
+legality from a penalty / optional action mask'' discussion become moot for this actor.
+
+The destination axis is sized to $E=\texttt{planet\_cap}$ (the observation slot count), so the target
+actor \textbf{forces} $\texttt{max\_entities}=\texttt{planet\_cap}$: in the GPU env this is $E=48$
+(the build sets \texttt{max\_entities}$\leftarrow$\texttt{planet\_cap} whenever \texttt{target\_actor}
+is on). The self-targeting \texttt{HOLD} trick is what removes the need for any separate launch gate or
+hold column: keeping ships is just allocating mass to the diagonal.
+
+\paragraph{Lead-target aiming (\texttt{LEAD\_TARGET}): deterministic orbital intercept.}\label{sec:lead}
+With \texttt{LEAD\_TARGET}$=$true the heading is no longer a straight line at the destination's
+\emph{current} position --- it aims at where the orbiting destination \emph{will be} when the fleet
+arrives. The destination planet $d$ orbits the board centre $C$ on a circle of radius $r_d$ at a
+\emph{fixed} angular velocity $w$, so at flight-time $t$ (in ticks) it is at
+\begin{equation}
+P(t) = C + r_d\,\big(\cos(\phi_0 + w t),\ \sin(\phi_0 + w t)\big),
+\label{eq:orbit}
+\end{equation}
+where $\phi_0$ is its current orbital phase. A fleet launched from the \emph{source} planet leaves that
+planet's \textbf{surface}: a point at distance $r_{\mathrm{src}}+0.1$ from the source centre
+$c_{\mathrm{src}}$ along the chosen heading. It then flies straight at the speed $v=v(n)$ of
+Eq.~(1) set by its ship count $n$. The deterministic \emph{intercept time} $t^\star$ is the earliest
+root of
+\begin{equation}
+g(t) \;=\; \big\lVert P(t) - c_{\mathrm{src}}\big\rVert - (r_{\mathrm{src}}+0.1) - v\,t \;=\; 0,
+\label{eq:intercept}
+\end{equation}
+i.e.\ the straight-line distance the fleet must cover (target range minus the surface-launch offset)
+equals the distance it travels in $t$ ticks. The heading is then aimed at the predicted point,
+$\theta=\operatorname{atan2}\big(P(t^\star)-c_{\mathrm{src}}\big)$. The static-target case
+($w=0$, or \texttt{LEAD\_TARGET}$=$false) recovers the straight-line heading at the planet's current
+position.
+
+\subparagraph{Intercept bug found and fixed.} The previous solver missed ${\sim}20\%$ of
+\emph{reachable} orbiting targets (static targets were already $100\%$). Two faults compounded:
+(i) it solved Eq.~\eqref{eq:intercept} from the planet \textbf{centre}, dropping the surface-launch
+offset $r_{\mathrm{src}}+0.1$, so the predicted arrival was systematically early; and (ii) it used a
+\emph{$4$-iteration fixed-point} $t\leftarrow \lVert P(t)-c_{\mathrm{src}}\rVert/v$, which is
+\textbf{not a contraction} when $r_d\lvert w\rvert > v$ (a fast-orbiting target outruns the iterate),
+so it failed to converge on exactly the reachable-but-hard cases. The fix accounts for the surface
+offset and replaces the fixed-point with a robust root of $g$ in Eq.~\eqref{eq:intercept} --- more
+iterations / a bracketed bisection on $g(t)$ (which is sign-changing and well behaved on the reachable
+range). This recovers ${\sim}94$--$96\%$ of reachable orbiting targets. The residual ${\sim}4$--$6\%$
+is \textbf{sun occlusion} --- the straight path to the earliest intercept clips the central sun disk,
+so no straight shot at \emph{that} intercept exists --- a \emph{planning} limit (the reachability mask
+of Section~\ref{sec:dist} would reject such a shot), not an aiming bug.
+
+\paragraph{Superseded continuous actor (\texttt{target\_actor=false}).} The target actor
+\emph{supersedes} the earlier \textbf{continuous} actor, which is retained behind the
+\texttt{--target-actor} flag (\texttt{target\_actor=false}, the config default). There each slot $e$
+emitted a fixed block of $3K$ \emph{continuous} controls ($K=5$ fleet slots, three scalars each), so
+the action was a $40\times 15$ matrix $a\in[0,1]^{E\times 3K}$ ($E=40$). Fleet slot $k$ of planet $e$
+was a triple $(d^x_{e,k},d^y_{e,k},\phi_{e,k})\in[0,1]^3$: a \emph{direction vector} $(d^x,d^y)$,
+recentred to $[-1,1]$ as $2d-1$ and mapped to a launch angle
+$\theta_{e,k}=\operatorname{atan2}(2d^y_{e,k}-1,\,2d^x_{e,k}-1)$ ($0$--$360^\circ$, continuous --- no
+bins), and a \emph{ship fraction} $\phi_{e,k}$ mapped to $0$--$100\%$ of the launching planet's current
+ships. A planet could thus dispatch up to $K=5$ fleets in one step, each to an independently chosen
+heading and size; the engine processed the $K$ launches in slot order, deducting ships
+\emph{sequentially}. That actor was \textbf{not} masked: it emitted the full $40\times 15$ block every
+step and was meant to learn the dynamic legal subset from an invalid-dispatch penalty (the desired
+output for a non-existent slot being the zero action; dispatching from an unowned/empty planet or
+\emph{over-dispatching} a planet's $K$ fractions past $100\%$ being penalized ``everywhere''). An
+optional hard mask (\texttt{action\_mask\_policy}) could instead force the per-planet legal mask
+$m_e u_e\mathbf{1}[S_e>0]$ onto the action and drop masked slots from the log-prob/entropy sums; both
+the penalty-learned legality and that mask applied \emph{only} to this continuous actor. The continuous
+actor's direction-vector parameterization made the heading \emph{linear in relative position} ---
+attention over the planet tokens (Section~\ref{sec:policy}) could produce a target-minus-self vector
+directly, whereas a linear head cannot turn a relative position into $\operatorname{atan2}(\cdot)$ a
+scalar heading would require --- but learning that aiming proved hard, which is precisely what the
+target actor sidesteps by emitting a destination slot and aiming via the heuristic above.
 
 %==============================================================
-\section{Observation encoding}
-For ego player $p$ and state $s$, the encoder (\texttt{native/core/encode.hpp}) emits
-\begin{itemize}[nosep]
-  \item entity features $X\in\R^{E\times F}$ ($F=15$): per planet/fleet geometry, ownership
-        (ego/ally/enemy/neutral one-hots), ships, production, comet flags;
-  \item entity mask $m\in\{0,1\}^{E}$: $m_e=1$ iff slot $e$ is a real entity;
-  \item action mask $u\in\{0,1\}^{E}$: $u_e=1$ iff $e$ is an ego-owned planet with $>0$ ships
-        (i.e.\ legally able to launch);
-  \item globals $g\in\R^{G}$ ($G=10$): step/phase, board-wide ship and production margins,
-        counts, angular velocity, etc.
-\end{itemize}
+\section{Observation encoding}\label{sec:obs}
+For ego player $p$ and state $s$, the encoder (\texttt{native/core/encode.hpp}) emits four arrays:
+the per-planet entity matrix $X\in\R^{E\times F}$ ($E=40$ planet slots, $F=101$ features each); the
+board-summary globals $g\in\R^{G}$ ($G=10$, a \emph{separate} input --- \textbf{not} replicated into
+each row); the entity mask $m\in\{0,1\}^{E}$ ($m_e=1$ iff slot $e$ holds a real entity); and the
+action mask $u\in\{0,1\}^{E}$ ($u_e=1$ iff $e$ is an ego-owned planet with $>0$ ships). \emph{Neither
+$m$ nor $u$ gates the actor} (Section~\ref{sec:policy}): $m$ only hides padding slots inside the
+attention block, and $u$ is \emph{both} an input feature (body row $10$, below) and the key used to
+\emph{decode} launches and score the invalid-dispatch penalty (Section~\ref{sec:reward}); the dynamic
+legal action subset is otherwise \emph{learned} from that penalty, not hard-masked. Each planet row
+$X_e\in\R^{101}$ is $11$ \emph{body} features (unchanged) followed by a $90$-feature \emph{incoming-threat
+block}; the body block is enumerated below and the threat block in Section~\ref{sec:threat}.
+
+\paragraph{Per-planet body features (rows $0$--$10$).} Each value is normalized into roughly
+$[-1,1]$. Here $S$ is the planet's ship count, $\varrho$ its radius, $d_c$ its distance to board
+centre, $\omega$ the board angular velocity, and $\ell(n)=\ln(1+n)/\ln 1000$ the shared ship-count
+log-compressor.
+\begin{center}\small
+\begin{tabular}{@{}clll@{}}
+\toprule
+\# & Feature & Encoded value & Meaning \\
+\midrule
+0  & position $x$        & $p_x/100$                            & horizontal position on the $100{\times}100$ board, $[0,1]$ \\
+1  & position $y$        & $p_y/100$                            & vertical position, $[0,1]$ \\
+2  & orbital speed       & $|\omega|\,d_c/6$ ($0$ if static)    & tangential orbit speed, relative to $v_{\max}{=}6$ \\
+3  & spin sign           & $+1$ ccw / $-1$ cw / $0$             & rotation direction; $0$ if stationary or a comet \\
+4  & radius              & $\varrho/3$                          & capture / collision disk size \\
+5  & production          & $\mathrm{prod}/5$                    & ships made per tick (the reward-defining quantity) \\
+6  & ships               & $\ell(S)$                            & garrison size, log-compressed \\
+7  & ownership code      & $0$ neu / $1$ ego / $2$--$N$ enemy   & owner, ego-relative (stable under seat rotation) \\
+8  & dist.\ to centre    & $d_c/70.71$                          & radial distance from the sun ($70.71{=}\tfrac{\sqrt2}{2}{\cdot}100$, half-diagonal) \\
+9  & comet flag          & $\mathbb{1}[\text{comet}]$           & $1$ for a comet, else $0$ \\
+10 & action mask $u_e$   & $\mathbb{1}[\text{ego}\wedge S{>}0]$ & $1$ iff ego-owned with ships (also the decode/penalty key) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent\emph{Why feed both radius and production?} For a normal planet they are redundant
+($\varrho=1+\ln(\mathrm{prod})$), but we feed both so the net need neither invert the $\ln$ nor
+re-derive the reward-defining quantity. \emph{Why an explicit comet flag?} A \emph{stationary} body
+has speed $0$ and spin sign $0$, but an \emph{orbiting} planet and a \emph{comet} both move, so
+velocity alone cannot separate them; the flag also marks where the radius law breaks (a comet carries
+the fixed \texttt{COMET\_PRODUCTION}$=1$ at an unrelated radius). The comet's remaining lifetime is
+\textbf{deliberately hidden by the engine} (agents may not reconstruct the spawn/expiry schedule), so
+this binary flag is the only observable comet signal.
+
+\paragraph{Board-summary globals $g\in\R^{10}$.} One small vector summarising the whole board,
+embedded once and broadcast to the action heads (Section~\ref{sec:policy}) rather than copied into
+every planet row. With $\Sigma$ a board-wide sum, $n_p$ the planet count, and $\ell$ the same
+log-compressor:
+\begin{center}\small
+\begin{tabular}{@{}cll@{}}
+\toprule
+\# & Encoded value & Meaning \\
+\midrule
+0 & $\mathrm{step}/T$                   & game phase (fraction of the $T$-step episode elapsed) \\
+1 & $10\,\omega$                        & board angular velocity (orbit rate, scaled) \\
+2 & $\ell(\Sigma\,\text{ego ships})$    & ego total garrison ships (log) \\
+3 & $\ell(\Sigma\,\text{enemy ships})$  & enemy total garrison ships (log) \\
+4 & $n^{\mathrm{ego}}_p/n_p$            & ego share of all planets \\
+5 & $n^{\mathrm{enemy}}_p/n_p$          & enemy share of all planets \\
+6 & $n^{\mathrm{neutral}}_p/n_p$        & neutral share of all planets \\
+7 & $\ell(\Sigma\,\text{ego fleet})$    & ego in-flight (fleet) ships (log) \\
+8 & $\ell(\Sigma\,\text{enemy fleet})$  & enemy in-flight (fleet) ships (log) \\
+9 & $\min(n_p,E)/E$                     & planet-slot occupancy (how full the $E$ rows are) \\
+\bottomrule
+\end{tabular}
+\end{center}
+This game is a \textbf{free-for-all}: there are no allies; an inbound fleet is either the ego's own
+(a reinforcement) or an enemy's, distinguished by the owner sign in the threat block (next).
+
+\paragraph{Incoming-fleet threat block (per planet, baked into the row).}\label{sec:threat}
+A purely \emph{reactive} policy cannot defend if it cannot see what is coming. For each planet we
+therefore bake a compact list of \emph{its own} inbound fleets directly into that planet's feature
+row. First we project every in-flight fleet to the planet it will hit, and when. A fleet at
+position $o$ with unit heading $\hat d=(\cos\alpha,\sin\alpha)$ and ship count $\nu$ moves at speed
+\begin{equation}
+v(\nu)=\min\!\Big(v_{\max},\; 1+(v_{\max}-1)\big(\tfrac{\ln \max(1,\nu)}{\ln 1000}\big)^{1.5}\Big),
+\qquad v_{\max}=6,
+\end{equation}
+matching the engine's fleet dynamics. For a planet at $c$ with radius $\varrho$, the ray
+$o+t\hat d$ enters the planet disk at
+\begin{equation}
+t_{\mathrm{ca}} = -\langle o-c,\hat d\rangle,\quad
+p^2 = \lVert o-c\rVert^2 - t_{\mathrm{ca}}^2,\quad
+t_{\mathrm{hit}} = t_{\mathrm{ca}} - \sqrt{\varrho^2-p^2}\ \ (\text{if } t_{\mathrm{ca}}\!\geq\!0,\ p^2\!\leq\!\varrho^2).
+\end{equation}
+The fleet is assigned to the planet with the smallest $t_{\mathrm{hit}}\!\geq\!0$ (dropped if the
+ray first crosses the central sun --- a \emph{fixed} disk of radius $\mathrm{SUN\_RADIUS}=10$,
+constant all game --- or hits nothing), with ETA $\tau=t_{\mathrm{hit}}/v(\nu)$ in ticks.
+
+\subparagraph{Two ranked views per planet (tuneable counts).} Among the fleets assigned to a
+planet we keep two short lists: the \texttt{N\_SOON}$=15$ with the smallest ETA (most
+\emph{imminent}) and the \texttt{N\_BIG}$=15$ with the largest ship count (most \emph{dangerous});
+the lists may overlap. Each of the $\texttt{N\_SOON}+\texttt{N\_BIG}=30$ slots contributes $3$ features
+\begin{equation}
+\big[\ \mathrm{sgn},\ \ \tau,\ \ \widetilde\nu\ \big],
+\qquad \widetilde\nu=\frac{\ln(1+\nu)}{\ln 1000},
+\end{equation}
+i.e.\ \emph{who it belongs to} ($\mathrm{sgn}=+1$ ego reinforcement $/-1$ enemy), \emph{arrival
+time} as the ETA $\tau$ in ticks (scaled by $1/\texttt{THREAT\_ETA\_SCALE}$, $\texttt{THREAT\_ETA\_SCALE}=100$),
+and \emph{ship count} $\widetilde\nu$. Empty slots are all zero --- $\mathrm{sgn}=0$ there already
+marks ``no fleet,'' so $\tau=0$ is unambiguous --- giving the row's $30\times 3=90$ threat features,
+which occupy entity-row indices $11$--$100$. The slots are laid out as two contiguous ranked
+blocks; slot $k$ (1-indexed) occupies the three indices $11+3(k-1),\,12+3(k-1),\,13+3(k-1)$:
+\begin{center}\small
+\begin{tabular}{@{}cl ccc@{}}
+\toprule
+Slot $k$ & Ranked by & $\mathrm{sgn}$ idx & ETA idx & ships idx \\
+\midrule
+$1$           & soonest ETA (1st)         & $11$ & $12$ & $13$ \\
+$2$           & soonest ETA (2nd)         & $14$ & $15$ & $16$ \\
+$\vdots$      & $\vdots$ (\texttt{N\_SOON}$=15$) & $\vdots$ & $\vdots$ & $\vdots$ \\
+$15$          & soonest ETA (15th)        & $53$ & $54$ & $55$ \\
+$16$          & largest fleet (1st)       & $56$ & $57$ & $58$ \\
+$\vdots$      & $\vdots$ (\texttt{N\_BIG}$=15$)  & $\vdots$ & $\vdots$ & $\vdots$ \\
+$30$          & largest fleet (15th)      & $98$ & $99$ & $100$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+(slots $1$--$15$ are the \texttt{N\_SOON}$=15$ soonest-arriving, slots $16$--$30$ the
+\texttt{N\_BIG}$=15$ largest; per slot the three values are $\mathrm{sgn}\in\{+1\ \text{mine},-1\
+\text{enemy},0\ \text{empty}\}$, ETA $=\tau/100$ ticks, ships $=\widetilde\nu=\ell(\nu)$).
+Because the list is attached to the destination planet's \emph{own} row, that planet
+directly sees ``what is coming at \emph{me} --- how soon, how big, and from whom'' --- local
+defensive awareness baked into the \emph{observation}, with no separate fleet tokens. (The
+\emph{encoder} has no attention; the \emph{policy network} does add one cross-planet attention block,
+Section~\ref{sec:policy}, so a planet can read the others' positions to aim \emph{at} them.) The
+projection ignores planet rotation but is computed \emph{identically} in C++ and Python (parity-tested
+bit-for-bit), so the natively trained policy behaves identically when served from pure Python.
 
 %==============================================================
 \section{Policy network $\pi_\theta$}\label{sec:policy}
-The network (\texttt{native/rl/model/policy\_net.hpp}) maps $(X,m,u,g)$ to per-entity class
-logits $Z\in\R^{E\times A}$. It has \textbf{no value head}; GRPO needs no critic. Let
-$d=128$ (\texttt{hidden}).
+The network (\texttt{native/rl/model/policy\_net.hpp}) maps the per-planet entity matrix
+$X\in\R^{E\times F}$ (body $+$ incoming-threat features, Section~\ref{sec:obs}) to a per-planet
+block of action parameters ($\texttt{n\_action\_params}=E$ per source for the target actor's single
+$(B,E,E)$ allocation matrix $A$; $3K$ for the superseded continuous actor). The $G=10$ board-summary
+globals enter through a
+\emph{small separate path}: a one-layer embedding $g'=\relu(W_g\,g+b_g)\in\R^{d_g}$ ($d_g=32$),
+broadcast to every planet and concatenated at the action heads --- so the trunk itself stays purely
+per-planet (per-row). The actor heads carry \textbf{no separate pointer head}; a value head (the PPO
+critic) is built \emph{only} when \texttt{use\_value\_head} is set (the \texttt{set-ups/1.md} run is
+PPO, so it is built; GRPO needs no critic). Let $d=\texttt{hidden}$.
 
-\paragraph{Entity encoder.} A shared two-layer MLP over each entity row:
+\paragraph{Trunk pipeline.} The trunk maps the projected rows through, in order: input projection
+$\to$ \textbf{one masked cross-planet self-attention block} $\to$ an optional residual GLU block
+(variant A) $\to$ $n_{\mathrm{res}}$ pre-LayerNorm residual MLP blocks $\to$ a final LayerNorm. The
+projection $h^{(0)}_e=W_{\mathrm{proj}}x_e+b_{\mathrm{proj}}$ and the MLP/GLU blocks are per-row
+(weights shared across planets); the attention block is the \emph{only} cross-row mixing.
+
+\smallskip\noindent\textbf{(1) Masked self-attention (the aiming mechanism).} A single-head attention
+over the $E$ planet tokens, computed on the pre-LayerNormed tokens $\tilde h=\mathrm{LN}(h^{(0)})$:
 \begin{equation}
-h_e = W_2\,\relu\!\big(W_1 x_e + b_1\big) + b_2 \in \R^{d},
-\qquad e=1,\dots,E .
+A = \softmax\!\Big(\tfrac{(\tilde h W_Q)(\tilde h W_K)^{\!\top}}{\sqrt d}
+      + \mathcal{M}_{\mathrm{ent}}\Big)\,(\tilde h W_V),\qquad
+h^{(1)} = h^{(0)} + A\,W_O,
 \end{equation}
+where the key-mask $\mathcal{M}_{\mathrm{ent}}[\,\cdot,j]=-\infty$ for \emph{padding} planets
+($m_j=0$, the \texttt{entity\_mask}) so live planets never attend to empty slots. This block is what
+lets a planet read another planet's \emph{position} and point a launch \emph{at} it --- a purely
+per-row trunk cannot represent a targeted heading (it was added precisely to unblock aiming). It is now
+\textbf{toggleable} (\texttt{USE\_ATTENTION}, an A/B like \texttt{use\_glu}): when off, the whole block
+(its \texttt{attn\_\{q,k,v,o\}} and \texttt{ln\_attn}) is not built and the trunk is \emph{purely
+per-planet}. In the \emph{target} actor aiming is already heuristic, so the block's remaining job is
+\emph{cross-planet board reasoning} --- comparing candidate destinations' ownership/garrisons/threats to
+choose the destination slot --- which makes the ablation meaningful (at $d{=}512$ it is ${\sim}1.05$M of
+the ${\sim}5.3$M parameters; the value head still pools over planets either way).
 
-\paragraph{Context encoder.} A mask-aware mean pool followed by a two-layer MLP on the pooled
-tokens concatenated with the globals:
+\smallskip\noindent\textbf{(2) Optional residual GLU} (variant A only, \texttt{use\_glu};
+Eq.~\ref{eq:glu}, Fig.~\ref{fig:glu}): $h \mathrel{+}= W_o\big((W_v h)\odot\sigma(W_g h)\big)$.
+
+\smallskip\noindent\textbf{(3) Pre-LayerNorm residual MLP blocks} ($n_{\mathrm{res}}$ of them):
+$\mathcal M(z)=z+W_b\,\relu\!\big(W_a\,\mathrm{LN}(z)\big)+b_b$, then a \textbf{final LayerNorm}. The
+pre-norm is not cosmetic: without it the deep trunk drove the head pre-activations large, the sigmoid
+squash saturated, and the aiming gradient vanished --- pre-LN keeps activations bounded so the heads
+stay in the squash's responsive range. So
 \begin{equation}
-\bar h = \frac{\sum_{e} m_e\, h_e}{\max\!\big(\sum_e m_e,\,1\big)},
+h_e = \mathrm{LN}\Big(\big(\underbrace{\mathcal M\circ\dots\circ\mathcal M}_{n_{\mathrm{res}}}\big)
+      \big[\,\circ\,\mathcal B_{\mathrm{GLU}}\,\big]\big(h^{(1)}_e\big)\Big)\in\R^{d},
+\qquad e=1,\dots,E,
+\end{equation}
+($\mathcal B_{\mathrm{GLU}}$ present only in variant A; $h^{(1)}$ is the post-attention token). The
+\texttt{use\_glu} A/B (GLU vs.\ an extra residual MLP) is the trunk comparison; everything else is identical.
+Two masks appear and must not be confused: \texttt{entity\_mask} ($m_e$, live-vs-padding) gates
+\emph{attention} above; \texttt{action\_mask} ($u_e\mathbf 1[S_e>0]$, owned-with-ships) gates the
+\emph{action} (the optional policy mask, Section~\ref{sec:dist}). The board-wide signal is the small
+broadcast embedding $g'$ concatenated at the heads.
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+  font=\footnotesize, >={Stealth[round]},
+  x=26mm, y=8mm,                              % uniform grid: 1 col = 26mm, 1 row = 8mm
+  box/.style ={draw, align=center, minimum height=11mm, minimum width=20mm, inner sep=2.5pt},
+  io/.style  ={box, rounded corners=1pt, fill=gray!12},
+  enc/.style ={box, rounded corners=3pt, fill=blue!9},
+  glu/.style ={box, rounded corners=3pt, fill=orange!18},
+  act/.style ={box, rounded corners=3pt, fill=green!13}]
+% --- trunk row (y=0): one node per integer column 0..4 ---
+\node[io]  (x)    at (0,0) {planet rows\\$X{:}E{\times}F$\\\scriptsize(body $+$ threat)};
+\node[enc] (proj) at (1,0) {input proj\\$F{\to}d$};
+\node[glu] (attn) at (2,0) {masked\\self-attn\\\scriptsize(LN, cross-planet)};
+\node[glu] (glu)  at (3,0) {residual GLU\\\scriptsize(variant A)};
+\node[enc] (res)  at (4,0) {$n_{\mathrm{res}}\times$\\LN res-MLP};
+% --- single allocation head on the trunk centreline at column 5 ---
+\node[act] (mu)   at (5,0) {\texttt{dest\_head}\\$\to E{\cdot}E$\\\scriptsize(alloc $(B,E,E)$)};
+% --- sample + output back on the centreline, columns 6 and 7 ---
+\node[act] (samp) at (6,0) {sample\\\scriptsize Dirichlet/row\\\scriptsize($+$owned-mask)};
+\node[io]  (a)    at (7,0) {alloc $A[s,\cdot]$\\\scriptsize self-diag $=$ HOLD};
+% --- globals path: own row (y=-2.6), columns 3 and 4, embedding aligned under res ---
+\node[io]  (g)    at (3,-2.6) {board globals\\$g{:}G$};
+\node[enc] (gemb) at (4,-2.6) {embed\\$G{\to}d_g$};
+% trunk arrows
+\draw[->] (x)--(proj); \draw[->] (proj)--(attn); \draw[->] (attn)--(glu); \draw[->] (glu)--(res);
+% trunk -> head -> sample -> output
+\draw[->] (res)--(mu);
+\draw[->] (mu)--(samp); \draw[->] (samp)--(a);
+% globals embedding broadcast into the head
+\draw[->] (g)--(gemb); \draw[->] (gemb)--(mu);
+\end{tikzpicture}
+\caption{Policy network data flow. The \textbf{trunk is shared by both actors}; only the heads differ.
+Planet rows are projected, then mixed by one \textbf{masked cross-planet self-attention} block
+(pre-LayerNorm; \texttt{entity\_mask} hides padding planets) --- the only cross-row step. The result
+passes through the shared per-row trunk: variant A inserts one residual GLU block (Fig.~\ref{fig:glu})
+before the $n_{\mathrm{res}}$ \emph{pre-LayerNorm} residual MLP blocks (variant B: MLP blocks only),
+then a final LayerNorm. The $G$ board globals are embedded separately ($g'$, dim $d_g$) and broadcast
+to the heads. \textbf{Target actor (current):} a \emph{single} allocation head ---
+\texttt{dest\_head} maps $[h_e;g']$ to $E{\cdot}E$ logits (reshaped $(B,E,E)$), one $E$-way row per
+source planet over all destinations \emph{including itself}. Under \texttt{POLICY\_MODE="ppo"} each
+owned source row is a Dirichlet $A[s,\cdot]\sim\mathrm{Dirichlet}(\operatorname{softplus}(\ell_s)\,
+\texttt{ALLOC\_KAPPA}{+}\epsilon)$, masked to alive, sun-reachable destinations, with the self-diagonal
+$A[s,s]$ as \texttt{HOLD} (Section~\ref{sec:dist}); log-prob/entropy sum over owned sources. Each
+off-diagonal $A[s,d]$ decodes to $\lfloor A[s,d]S_s\rfloor$ ships ($\ge\texttt{MIN\_LAUNCH\_SHIPS}$,
+else held), aimed by a heuristic ($\operatorname{atan2}$ at the orbital \emph{intercept},
+Section~\ref{sec:lead}). (\texttt{POLICY\_MODE="mcts"} reuses the same logits as search priors with the
+self-diagonal as the no-op branch; stub.) \textbf{Continuous actor
+(superseded):} a two-layer MLP mean head maps $[h_e;g']$ to the $3K$ means $\mu_e$ and a switchable
+second head/vector to the $3K$ log-stds, defining a squashed Gaussian whose samples are the $K$ fleet
+triples $(d^x,d^y,\phi)$. A value head (the PPO critic) is built only when \texttt{use\_value\_head} is
+set; no pooling, no pointer head.}
+\label{fig:arch}
+\end{figure}
+
+\paragraph{Residual GLU block.} For an input $z\in\R^{d}$, with three $d\times d$ weight
+matrices (gate $W_g$, value $W_v$, output $W_o$),
+\begin{equation}
+\mathrm{GLU}(z) = \big(W_v z + b_v\big)\odot \sigma\!\big(W_g z + b_g\big),
 \qquad
-c = W_4\,\relu\!\big(W_3\,[\,\bar h\,;\,g\,] + b_3\big) + b_4 \in\R^{d}.
+\mathcal{B}(z) = z + W_o\,\mathrm{GLU}(z) + b_o \ \in\R^{d},
+\label{eq:glu}
 \end{equation}
 
-\paragraph{Actor head.} Two interchangeable heads produce the raw logits $\tilde Z$:
-\begin{description}[nosep,leftmargin=1.2em]
-\item[Angle mode:] an MLP on each entity token concatenated with the context,
-\begin{equation}
-\tilde z_e = W_6\,\relu\!\big(W_5\,[\,h_e\,;\,c\,] + b_5\big) + b_6 \in\R^{A}.
-\end{equation}
-\item[Target mode (pointer actor):] for each launcher $e$ and fraction $f$ a query
-$q_{e,f}\in\R^{d}$ (from $W_q[\,h_e;c\,]$ reshaped to $|\mathcal{F}|\times d$), for each target
-$t$ a key $k_t=W_k h_t$, and a per-launcher no-op logit $n_e=w_n^{\!\top}[\,h_e;c\,]$:
-\begin{equation}
-\mathrm{score}(e,t,f) = \frac{\langle q_{e,f},\,k_t\rangle}{\sqrt{d}},
-\qquad
-\tilde z_{e,0}=n_e,\quad \tilde z_{e,\,\text{class}(t,f)} = \mathrm{score}(e,t,f).
-\end{equation}
-The score depends on \emph{both} launcher and target encodings, so the head can rank targets
-by geometry (the property a plain MLP actor lacks).
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+  font=\footnotesize, >={Stealth[round]},
+  lin/.style={draw, rounded corners=2pt, fill=blue!9, minimum height=7mm, inner sep=3pt},
+  op/.style ={draw, circle, fill=green!14, inner sep=0.5pt, minimum size=5mm}]
+\node (in) {$z$};
+\node[lin, above right=2mm and 10mm of in] (val)  {$W_v z + b_v$};
+\node[lin, below right=2mm and 10mm of in] (gate) {$\sigma(W_g z + b_g)$};
+\node[op,  right=20mm of in] (mul) {$\odot$};
+\node[lin, right=7mm of mul] (outp) {$W_o(\cdot) + b_o$};
+\node[op,  right=7mm of outp] (add) {$+$};
+\node[right=7mm of add] (y) {$\mathcal{B}(z)$};
+\draw[->] (in) -- (val); \draw[->] (in) -- (gate);
+\draw[->] (val) -- (mul); \draw[->] (gate) -- (mul);
+\draw[->] (mul) -- (outp); \draw[->] (outp) -- (add); \draw[->] (add) -- (y);
+\draw[->, dashed] (in) to[out=90, in=90] node[above, font=\scriptsize] {residual} (add);
+\end{tikzpicture}
+\caption{The residual GLU block $\mathcal{B}$ (Eq.~\ref{eq:glu}): a value branch $W_v z$ and a
+sigmoid gate $\sigma(W_g z)$ are multiplied elementwise ($\odot$), projected by $W_o$, and added
+back to the input (the residual skip). In trunk variant A one such block (its own $d\times d$
+weights) follows the input projection, before the residual MLP stack.}
+\label{fig:glu}
+\end{figure}
+
+where $\sigma$ is the logistic sigmoid and $\odot$ is elementwise. The sigmoid gate lets the
+block pass, attenuate, or suppress each feature channel conditionally (e.g.\ amplify the
+incoming-threat channels of Section~\ref{sec:threat} when a planet is under attack); the
+residual keeps optimization easy. It is applied per planet row and shares weights across rows
+just like the rest of the trunk. Whether this gating earns its keep over plain stacked MLPs
+(variant A vs.\ B) is exactly the comparison this experiment is set up to answer.
+
+\paragraph{Target-actor head (a single $(B,E,E)$ allocation head).} The trunk above is
+\textbf{unchanged}; only the head differs. It reads $h'_e=[\,h_e;\,g'\,]\in\R^{d+d_g}$ (trunk token
+concatenated with the broadcast globals embedding) and emits one allocation row per planet:
+\begin{description}[nosep,leftmargin=1.4em]
+\item[\texttt{dest\_head}:] a single \texttt{Linear}$(d+d_g\to E)$ producing, for each source planet
+$s$, the destination logits $\ell_{s}\in\R^{E}$ (reshaped over the batch to $(B,E,E)$ --- one $E$-way
+row per source, one logit per candidate destination \emph{including $s$ itself}). This is the
+\emph{only} actor head: there is \textbf{no} $\phi$ head and \textbf{no} $K$ launch slots, since the
+ship fractions \emph{are} the row of the allocation simplex and \texttt{HOLD} is the self-diagonal.
+\emph{Calm init:} weights scaled by \texttt{init\_mu\_scale}$=0.02$ and the diagonal (self/\texttt{HOLD})
+bias set positive (off-diagonals near $0$), so the Dirichlet starts strongly biased to ``hold'' with a
+near-uniform spread over destinations, then learns to commit.
 \end{description}
+Under \texttt{POLICY\_MODE="ppo"} these logits parameterize a per-source Dirichlet
+($\alpha_s=\operatorname{softplus}(\ell_s)\,\texttt{ALLOC\_KAPPA}+\epsilon$); under
+\texttt{POLICY\_MODE="mcts"} they are search priors with the self-diagonal as the no-op branch (stub).
+The continuous $E{\times}3K$ heads below are \emph{not} built in target mode. Sampling (the per-source
+Dirichlet over the destination simplex) is in Section~\ref{sec:dist}; the decode into engine launches
+in Section~\ref{sec:decode}.
 
-\paragraph{Legality masking.} Illegal classes are set to $-\infty$ (numerically $-10^{9}$).
-Class $0$ (no-op) is always legal. For a launch class $(t,f)$,
-\begin{equation}
-Z_{e,\,\text{class}(t,f)} =
-\begin{cases}
-\tilde z_{e,\,\text{class}(t,f)} & \text{if } u_e=1 \ \wedge\ m_t=1 \ \wedge\ t\neq e \quad(\text{target mode}),\\[2pt]
-\tilde z_{e,\,\text{class}(t,f)} & \text{if } u_e=1 \quad(\text{angle mode}),\\[2pt]
--\infty & \text{otherwise.}
-\end{cases}
-\end{equation}
+\paragraph{Continuous action heads (mean, and a switchable log-std) --- continuous-actor variant.} The heads read
+$h'_e=[\,h_e;\,g'\,]\in\R^{d+d_g}$ (trunk token concatenated with the broadcast globals embedding). The
+\emph{mean} head is a \textbf{two-layer MLP}, $\mu_e=W_{\mu 2}\,\relu(W_{\mu 1}h'_e+b_{\mu 1})+b_{\mu 2}\in\R^{3K}$
+(\texttt{mu\_h1}$\to$ReLU$\to$\texttt{mu\_h2}) --- nonlinear, not a single affine map. The log-std
+$\varsigma_e$ is supplied in one
+of \textbf{two switchable ways} (\texttt{ModelConfig::std\_state\_dependent}), kept as an explicit
+A/B because they trade off expressiveness against training stability:
+\begin{description}[nosep,leftmargin=1.4em]
+\item[State-dependent (a head):] $\varsigma_e = W_\varsigma\,h_e + b_\varsigma\in\R^{3K}$ --- the
+spread depends on the board, so the policy explores where the board is open/uncertain and commits
+(small $\sigma$) where the move is forced (e.g.\ a clear defensive launch). More expressive, but
+can destabilize (it may drive $\sigma\!\to\!0$ in ``confident'' states and stop exploring).
+\item[State-independent (a vector):] $\varsigma_e\equiv\varsigma\in\R^{3K}$, one learnable vector
+shared across all planets and states --- the standard, stable PPO default.
+\end{description}
+Either way, $\sigma_e=\exp\!\big(\clip(\varsigma_e,\varsigma_{\min},\varsigma_{\max})\big)$, the
+clip keeping $\sigma$ from collapsing to $0$ or exploding. \textbf{Exploration anneal (explore$\to$exploit
+hand-off).} The entropy bonus pushes $\varsigma$ \emph{up} to the cap, so with a fixed cap $\sigma$ pins
+at its maximum for the whole run: the sampled action $\varphi(\mu+\sigma\,\varepsilon)$ stays
+noise-dominated, the per-trajectory advantage is then $\approx$uncorrelated with the mean, and the
+policy-gradient terms \emph{cancel} --- a frozen policy that never exploits (observed empirically:
+$\operatorname{adv\_std}=1$ yet $\mathrm{kl}\to0$). The fix is a two-phase schedule on the cap. PHASE~1
+(the first \texttt{sigma\_decay\_iters} iterations) \emph{forces} the cap down from $\varsigma_{\max}$ to
+$\varsigma_{\max}^{\,\mathrm{end}}$ (e.g.\ $\sigma:1.0\!\to\!0.05$), so the action quickly becomes
+mean-determined and the gradient attributable. PHASE~2 releases the cap to
+$\varsigma_{\max}^{\,\mathrm{post}}$ (\texttt{logstd\_max\_post}) and hands $\sigma$ to the
+state-dependent log-std head, free within $[\,e^{\varsigma_{\min}},\,e^{\varsigma_{\max}^{\,\mathrm{post}}}\,]$
+(e.g.\ $[0.01,0.2]$): it re-widens where the board is uncertain and tightens where the move is forced.
+(With \texttt{sigma\_decay\_iters}$=0$ the cap instead decays linearly over the whole run, or not at all
+if $\varsigma_{\max}^{\,\mathrm{end}}{=}\varsigma_{\max}$.) The mean head and trunk are identical
+across the two, only the source of $\varsigma$ differs, and $\varsigma$ is trained by the same
+surrogate$+$entropy gradients (Section~\ref{sec:dist}). Each head emits $3K=15$ numbers --- the
+per-component parameters of the $K$ fleet triples $(d^x,d^y,\phi)$; sampling and the $[0,1]$ squash
+are in Section~\ref{sec:dist}, decoding into engine launches in Section~\ref{sec:decode}. The mean
+head is a 2-layer MLP (above) rather than a single linear map --- the extra nonlinearity was added
+alongside attention while chasing the aiming gradient; the discrete pointer/target actor of the
+previous design is retired together with target mode.
+
+\paragraph{Calm initialization (\texttt{init\_mu\_scale}, \texttt{init\_phi\_bias}).} A deep
+from-scratch trunk would otherwise drive the freshly initialised mean head to large, arbitrary
+pre-squash values, so the policy would either spray launches everywhere or saturate the squash before
+learning anything. Two init knobs tame the start: the final mean-head weights are scaled by
+\texttt{init\_mu\_scale}$=0.02$ so every output begins $\approx$ its bias regardless of trunk depth,
+and the $\phi$ (ship-fraction) component's bias is set to \texttt{init\_phi\_bias}$=-4$ so
+$\varphi(-4)\approx0.018$ --- with the initial $\sigma$ only $\sim$$14\%$ of slots commit a launch at
+step~$0$. Less calm (smaller $|\text{bias}|$, larger scale) means more early commits and more mistakes
+to learn from; too calm and the policy is inert and learns nothing.
+
+\paragraph{Layer inventory (variant A).} Modules are \texttt{nn.Linear} except the \texttt{ln\_*}
+which are \texttt{nn.LayerNorm}. Names match \texttt{policy\_net.cpp}.
+\begin{center}\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Module & Layers (name: shape) & Count \\
+\midrule
+Input projection & \texttt{proj}:$F{\to}d$ & 1 \\
+Self-attention & \texttt{attn\_\{q,k,v,o\}}:$d{\to}d$ & 4 \\
+LayerNorm (pre-attn, per-res, final) & \texttt{ln\_attn}, \texttt{ln\_res$i$}, \texttt{ln\_out}:$d$ & $n_{\mathrm{res}}{+}2$ \\
+Residual GLU (variant A) & \texttt{glu\_\{gate,val,out\}}:$d{\to}d$ & 3 \\
+Residual MLP $\times n_{\mathrm{res}}$ & \texttt{res$i$\{a,b\}}:$d{\to}d$ & $2n_{\mathrm{res}}$ \\
+Board-globals embed & \texttt{g\_embed}:$G{\to}d_g$ & 1 \\
+\midrule
+\multicolumn{3}{@{}l@{}}{\emph{Target actor (current --- single allocation head, no $\phi$ head):}}\\
+Allocation head & \texttt{dest\_head}:$d{+}d_g{\to}E$ \scriptsize(reshape $(B,E,E)$, Dirichlet/row) & 1 \\
+\midrule
+\multicolumn{3}{@{}l@{}}{\emph{Continuous actor (superseded):}}\\
+Mean head (MLP) & \texttt{mu\_h1}:$d{+}d_g{\to}d$, \texttt{mu\_h2}:$d{\to}3K$ & 2 \\
+Log-std (switchable) & \texttt{logstd\_head}:$d{+}d_g{\to}3K$ \ \emph{or} vector $\varsigma{:}3K$ & 1 \\
+\midrule
+Value head (PPO only): in-proj & \texttt{val\_in}:$d{+}d_g{\to}d$ & $0$/$1$ \\
+\quad residual MLP $\times$\,\texttt{VALUE\_RES\_BLOCKS} & \texttt{val\_res\{a,b\}}:$d{\to}d$, \texttt{val\_ln}:$d$ & $3\,n_v$ \\
+\quad readout & \texttt{val\_out}:$d{\to}1$ & $0$/$1$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+\noindent No pointer head. The value head (the critic) is built \emph{only} when
+\texttt{use\_value\_head} is set --- it is present for the PPO\,+\,GAE run (\texttt{set-ups/1.md}) and
+absent for GRPO. Exactly one actor's heads are built, selected by \texttt{target\_actor}. Variant B
+replaces the GLU block with an extra residual MLP block (no gating). With $F{=}101$ ($11$ body $+$ $90$
+threat), $G{=}10$, $d_g{=}32$, and the \texttt{set-ups/1.md} target-actor scale $d{=}512$,
+$n_{\mathrm{res}}{=}6$ this is on the order of a few~M parameters. The pure-Python serving twin
+(\texttt{orbit\_wars\_rl/agents/ppo\_policy.py}) must mirror this trunk, board path, and heads
+bit-for-bit for the Kaggle submission to reproduce the natively trained policy; it serves the actor
+only (no critic at inference).
+
+\subsection{Recommended hyperparameters: trunk vs.\ transformer trunk}\label{sec:trunkcfg}
+The actor's \textbf{trunk} is configurable via \texttt{ARCH}$\in\{\texttt{"trunk"},\texttt{"transformer"}\}$:
+the legacy path (default \texttt{"trunk"} in \texttt{setup1\_target\_ppo.ipynb}) and a genuine
+multi-head transformer stack (default \texttt{"transformer"} in
+\texttt{setup1\_transformer\_ppo.ipynb}). \textbf{Both feed the identical action heads and value head}
+(Section~\ref{sec:policy}); only the per-row mixing in between differs. The \texttt{TRUNK} path is the
+masked cross-planet self-attention block plus $n_{\mathrm{res}}$ residual MLP blocks described above;
+the \texttt{TRANSFORMER} path is a stack of pre-LayerNorm multi-head-attention $+$ ResNet-MLP blocks,
+bracketed by ResNet-MLP stem/head ends. Recommended settings:
+\begin{center}\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Knob & \texttt{TRUNK} (\texttt{ARCH="trunk"}, legacy) & \texttt{TRANSFORMER} (\texttt{ARCH="transformer"}) \\
+\midrule
+hidden width & \texttt{HIDDEN}$=512$ & \texttt{HIDDEN}$=256$ (CPU/Kaggle) / $512$ (GPU train) \\
+depth        & \texttt{N\_RES\_BLOCKS}$=6$ & \texttt{N\_TX\_LAYERS}$=4$ \\
+attention    & \texttt{USE\_ATTENTION}$=$True (one self-attn layer) & \texttt{N\_HEADS}$=8$ (\texttt{HIDDEN} div.\ by \texttt{N\_HEADS}) \\
+MLP / gating & \texttt{USE\_GLU}$=$True, \texttt{D\_G}$=32$ & \texttt{TX\_MLP\_RATIO}$=4$ \\
+stem / head  & --- & \texttt{N\_STEM\_RES}$=1$, \texttt{N\_HEAD\_RES}$=1$ \\
+\midrule
+params       & ${\sim}6.4$M & ${\sim}3.8$M (h$=256$) / ${\sim}15$M (h$=512$) \\
+forward cost & (reference: h$=512$ trunk) & ${\sim}340$ MFLOP/fwd (h$=256$) $\approx$ h$=512$ trunk; h$=512$ ${\sim}3\times$ \\
+target       & GPU training & CPU/Kaggle inference (h$=256$); GPU training (h$=512$) \\
+\bottomrule
+\end{tabular}
+\end{center}
+\noindent The \texttt{TRUNK} block is the original single cross-planet self-attention layer followed by
+$N$ residual MLP blocks (${\sim}6.4$M params at the settings above). The \texttt{TRANSFORMER} block is a
+stack of $L$ pre-LN multi-head-attention $+$ ResNet-MLP layers with ResNet-MLP stem/head ends; at the
+\textbf{CPU/Kaggle} target \texttt{HIDDEN}$=256$, \texttt{N\_TX\_LAYERS}$=4$ it is ${\sim}3.8$M params
+and ${\sim}340$ MFLOP per forward --- roughly the \emph{same} forward cost as the $h{=}512$ trunk, yet a
+true $4$-layer multi-head transformer. \texttt{HIDDEN}$=512$ (${\sim}15$M params, ${\sim}3\times$ the
+forward cost) is fine for \textbf{GPU} training. \textbf{Sizing rationale:} the Kaggle CPU probe measured
+${\sim}42$ GFLOP/s on $2$ vCPU, so at $h{=}256$/$L{=}4$ a single forward (${\sim}340$ MFLOP) is on the
+order of \emph{tens of ms} --- within the per-turn inference budget --- which is why $h{=}256$ is the
+recommended transformer width for the served Kaggle agent.
+
+\subsection{Inference latency vs.\ configuration}\label{sec:latency}
+The served Kaggle agent runs \textbf{one forward per turn on a single game state} ($B{=}1$, $E{=}48$
+planet slots) on a $2$-vCPU CPU box (probe: $0.04$ TFLOP/s fp32 matmul, $10.9$ GB/s copy). Crucially this
+forward is \emph{compute-bound}, not memory-bound: every per-planet linear is applied across all $E{=}48$
+planet tokens, so each layer is a $(48{\times}h)\,(h{\times}h)$ matmul with arithmetic intensity
+${\sim}17$--$20$ FLOP/byte --- far above the Kaggle ridge point
+$0.04\,\text{TFLOP/s}\,/\,10.9\,\text{GB/s}\approx3.7$ FLOP/byte. (Cross-check: the $h{=}512$ trunk
+forward, ${\sim}0.5$ GFLOP, runs at $4.3$ ms locally ${=}\,0.12$ TFLOP/s $\approx 53\%$ of the local
+matmul peak --- a utilization only a compute-bound kernel reaches.) Latency therefore scales with
+\emph{matmul throughput}, so the Kaggle estimate below is the measured local $B{=}1$ time $\times$ the
+local/Kaggle matmul ratio $0.235/0.040\approx5.9$ (equal fraction-of-peak on the two x86 boxes).
+\begin{center}\small
+\begin{tabular}{@{}llrlrrr@{}}
+\toprule
+Config & arch & $h$ & depth & params & local ms & Kaggle est.\ ms \\
+       &      &     &       &        & ($2$ thr) & ($B{=}1$, $2$ vCPU) \\
+\midrule
+\texttt{trunk}-tiny  & trunk       & $128$ & $4$ res & $0.39$\,M & $0.7$  & ${\sim}4$ \\
+\texttt{trunk}-small & trunk       & $256$ & $6$ res & $1.69$\,M & $1.8$  & ${\sim}10$ \\
+\texttt{trunk}-prod  & trunk       & $512$ & $6$ res & $6.52$\,M & $4.3$  & ${\sim}25$ \\
+\texttt{tx}-S        & transformer & $128$ & $2$ lyr & $0.61$\,M & $1.2$  & ${\sim}7$ \\
+\texttt{tx}-M (rec.) & transformer & $256$ & $4$ lyr & $3.86$\,M & $3.5$  & ${\sim}21$ \\
+\texttt{tx}-M-deep   & transformer & $256$ & $6$ lyr & $5.44$\,M & $5.1$  & ${\sim}30$ \\
+\texttt{tx}-L (GPU)  & transformer & $512$ & $4$ lyr & $15.2$\,M & $10.5$ & ${\sim}61$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+\noindent Even the largest $15$M-parameter transformer is ${\sim}61$ ms/turn on the Kaggle CPU, and the
+recommended served widths --- $h{=}256$ trunk (${\sim}10$ ms) or $h{=}256$ transformer (${\sim}21$ ms) ---
+leave wide headroom under any per-turn budget. \textbf{Inference latency is not the binding constraint};
+model size should be chosen by training compute and policy quality, with $h{=}512$ reserved for GPU
+training (where the same forward is sub-millisecond). Numbers are CPU $B{=}1$; the batched GPU rollout
+during training amortizes the per-call overhead across thousands of envs per forward.
 
 %==============================================================
 \section{Action distribution}\label{sec:dist}
-Each entity is an independent masked categorical; a turn's joint action is their product over
-\emph{real} entities (\texttt{native/rl/model/distribution.hpp}):
+For the \textbf{target actor}, the per-planet action is a single \textbf{allocation simplex} per owned
+source planet --- the row $A[s,\cdot]\in\Delta^{E-1}$ of ship fractions over all $E$ destinations
+\emph{including $s$ itself}, with the self-diagonal $A[s,s]$ the \texttt{HOLD} share (planets
+independent of one another). The \textbf{leading actor} (\texttt{POLICY\_MODE="ppo"}) makes each owned
+source row a \textbf{Dirichlet} over that simplex. The policy thus factorizes as a product over the
+owned source planets,
+$\pol(a\mid s)=\prod_{s:\,\text{owned}}\mathrm{Dirichlet}\big(A[s,\cdot]\mid\alpha_s\big)$,
+and the log-prob and entropy correspondingly \textbf{sum over the owned source planets} (below). One
+structural \textbf{mask} encodes a heuristic the model would otherwise have to relearn:
+\begin{description}[nosep,leftmargin=1.4em]
+\item[Reachability $R_{s,j}$ (sun occlusion).] A straight shot $s\!\to\!j$ is absorbed by the central
+sun (disk centre $c_\odot$, fixed radius $r_\odot{=}10$) iff the segment crosses that disk before
+reaching $j$. With $\hat u=(p_j-p_s)/\lVert p_j-p_s\rVert$, $t=\langle c_\odot-p_s,\hat u\rangle$,
+$p^2=\lVert c_\odot-p_s\rVert^2-t^2$, the shot is blocked iff $t\ge0$, $p^2\le r_\odot^2$, and
+$0\le t-\sqrt{r_\odot^2-p^2}<\lVert p_j-p_s\rVert$ (the \emph{same} ray/disk projection as the threat
+encoder, Section~\ref{sec:threat}). Then $R_{s,j}=\mathbb 1[\text{not blocked}]$, with the self-diagonal
+$R_{s,s}=1$ (\texttt{HOLD} is always reachable). $R$ is recomputed from the encoded positions
+($p_x,p_y$ = body rows $0,1$), so it is identical in rollout and update with \emph{no} extra trajectory
+buffers. There is \textbf{no} $\phi$-bucket validity mask: the row simplex already bounds dispatch by
+the garrison, and below-threshold off-diagonals are simply held (Section~\ref{sec:problem}), not
+illegal.
+\end{description}
+For each owned source $s$ the masked Dirichlet concentration and its sample are
 \begin{align}
-\pol(a_e\mid s) &= \softmax(Z_e)_{a_e}, &
-\pol(a\mid s) &= \prod_{e:\,m_e=1}\pol(a_e\mid s).
+\alpha_{s,j} &= \operatorname{softplus}(\tilde\ell_{s,j})\cdot\texttt{ALLOC\_KAPPA} + \epsilon,
+  & \tilde\ell_{s,j} &= \ell_{s,j}\ \text{if } (j{=}s)\vee(m_j{\wedge}R_{s,j}),\ \text{else } -\infty,\\
+A[s,\cdot] &\sim \mathrm{Dirichlet}(\alpha_{s}),
+  & \textstyle\sum_j A[s,j] &= 1,
 \end{align}
-Hence the joint log-probability and entropy are entity sums:
-\begin{align}
-\log\pol(a\mid s) &= \sum_{e} m_e\,\log\softmax(Z_e)_{a_e},
-\label{eq:logp}\\
-\mathcal{H}\big[\pol(\cdot\mid s)\big] &= \sum_{e} m_e\,
-\Big(-\!\sum_{a'} \softmax(Z_e)_{a'}\,\log\softmax(Z_e)_{a'}\Big).
+where $\ell_{s}$ is the source-$s$ row of the \texttt{dest\_head} logits, the $-\infty$ entries force
+$\alpha\to 0$ so unreachable/padding destinations get \emph{zero} mass while the self-diagonal
+(\texttt{HOLD}) and reachable destinations keep theirs. The joint log-probability and entropy sum over
+\textbf{owned} source planets (unowned planets are forced to all-\texttt{HOLD} and excluded):
+\begin{equation}
+\log\pol(a\mid s) = \sum_{s:\,\text{owned}} \log\mathrm{Dirichlet}\big(A[s,\cdot]\mid\alpha_{s}\big),
+\label{eq:logp}
+\end{equation}
+\begin{equation}
+\mathcal{H}\big[\pol(\cdot\mid s)\big] = \sum_{s:\,\text{owned}}
+\mathcal H_{\mathrm{Dir}}\big(\alpha_{s}\big).
 \label{eq:ent}
-\end{align}
-Sampling draws $a_e\sim\mathrm{Categorical}(\softmax(Z_e))$ per entity (greedy uses
-$\arg\max_a Z_{e,a}$ at evaluation).
+\end{equation}
+At evaluation the allocation is the Dirichlet mean $A[s,j]=\alpha_{s,j}/\sum_{j'}\alpha_{s,j'}$ (no
+sampling). The alternative \texttt{POLICY\_MODE="mcts"} reuses the \emph{same} logits as search priors
+and discretizes the allocation into a tree search, with the self-diagonal as the no-op branch --- the
+prerequisite for the search-based policy improvement of Appendix~\ref{sec:search} (stub for now).
+
+\paragraph{Continuous-$\phi$ target variant (native, \texttt{TargetActorDist}).} The native stack
+still carries the older per-slot squashed-Gaussian $\varphi$ actor (a destination categorical
+$\times$ a squashed-Gaussian $\varphi_{e,k}=\varphi(z_{e,k})$, $z_{e,k}\sim\mathcal
+N(\mu_{e,k},\sigma_{e,k}^2)$, $\sigma_{e,k}=e^{\varsigma_{e,k}}$, $\varphi(z)=1/(1+e^{-z})$, summed over
+slots); the slot's $\phi$ contribution to its log-prob is
+$\log\mathcal N(z_{e,k};\mu_{e,k},\sigma_{e,k}^2)-\log(\varphi_{e,k}(1-\varphi_{e,k}))$ (the last term
+the squash Jacobian, $z_{e,k}=\operatorname{logit}\varphi_{e,k}$) and to its entropy
+$\varsigma_{e,k}+\tfrac12\log2\pi e$. The reachability mask $R$ applies there too (it gates the
+destination factor). Porting it to the per-source Dirichlet allocation head is pending. The
+owned-planet mask is \emph{always} applied for either target actor (replacing the $E{\times}3K$ actor's
+``sum over all slots, invalid-penalty drives unowned to no-op'' rule).
+
+\paragraph{Continuous actor (superseded).} The retired continuous actor was a \textbf{squashed diagonal
+Gaussian} over the $E\times 3K$ controls. For each component $a_{e,k,j}$ ($j\in\{d^x,d^y,\phi\}$) the
+network emitted a mean $\mu_{e,k,j}$ and log-std $\varsigma_{e,k,j}$, drew $z_{e,k,j}\sim\mathcal
+N(\mu,\sigma^2)$ with $\sigma=e^{\varsigma}$, and squashed $a_{e,k,j}=\varphi(z_{e,k,j})$. With the
+components conditionally independent, $\log\pol(a\mid s)=\sum_{e,k,j}\big[\log\mathcal
+N(z_{e,k,j};\mu,\sigma^2)-\log(a_{e,k,j}(1-a_{e,k,j}))\big]$ and $\mathcal
+H=\sum_{e,k,j}(\varsigma_{e,k,j}+\tfrac12\log2\pi e)$. There the sums ran over \emph{all} $E$ slots
+(no mask), the invalid-dispatch penalty --- not a mask --- driving non-existent/unowned slots toward
+``no launch,'' unless the optional \texttt{action\_mask\_policy} forced
+$m_e u_e\mathbf 1[S_e>0]$ and dropped masked slots from both sums. The Gaussian was over the Cartesian
+direction $(d^x,d^y)$, so there was no $0/360^\circ$ wrap discontinuity.
+
+\paragraph{How the destination and $\phi$ heads are learned (no separate target).} No head has
+labels; all are trained \emph{only} by the policy-gradient surrogate (PPO\,+\,GAE for the current run,
+Appendix~\ref{sec:ppo}; or GRPO, Section~\ref{sec:grpo}) and the entropy bonus, through the dependence
+of $\log\pol$ on them. The \textbf{destination logits} get the standard policy-gradient
+$\partial\log\softmax(\tilde\ell_e)[d_e]/\partial\ell_e=\mathrm{onehot}(d_e)-\softmax(\tilde\ell_e)$, so
+an advantage step pushes mass toward the destination chosen when $\Adv>0$ and away when $\Adv<0$. The
+\textbf{$\phi$ mean/log-std} story is the squashed-Gaussian one below. Per component, with the
+standardized sample $u=(z-\mu)/\sigma$,
+\begin{equation}
+\frac{\partial \log\mathcal N}{\partial \mu}=\frac{u}{\sigma},
+\qquad
+\frac{\partial \log\mathcal N}{\partial \varsigma}=u^2-1
+\quad(\text{since }\sigma=e^{\varsigma}).
+\end{equation}
+A policy-gradient step moves each parameter along $\Adv\cdot\partial\log\pol/\partial(\cdot)$ (plus
+the entropy term), where $\Adv$ is the GAE per-step advantage (PPO) or the group-relative advantage
+(GRPO). For the \textbf{$\phi$ mean}: a sampled $\phi$ that beat its baseline ($\Adv>0$)
+pulls $\mu$ toward the fraction taken, one that underperformed pushes it away. For the
+\textbf{log-std}: the factor $u^2-1$ is positive when the draw landed \emph{far} from the mean
+($|z-\mu|>\sigma$) and negative when \emph{close}, so a far-out action that \emph{helped} ($\Adv>0$)
+\textbf{widens} $\sigma$ (explore more there), a far-out action that \emph{hurt} \textbf{narrows} it
+(exploit), and a near-mean action that helped also narrows it (commit to the good mean). The entropy
+bonus adds a constant $+c_{\mathcal H}$ to the log-std gradient ($\partial\mathcal H/\partial\varsigma=1$),
+a steady upward pressure against premature collapse of $\sigma$. Because $\varsigma_e=W_\varsigma h_e$
+is produced by the log-std head, these gradients flow on into $W_\varsigma$ and the shared trunk ---
+that is how the network learns \emph{where} on the board to be exploratory versus decisive. (In the
+state-independent variant the same gradients instead accumulate over all slots into the one shared
+$\varsigma$, tuning a single global exploration scale.) Adam applies the update; $\varsigma$ is
+clipped to $[\varsigma_{\min},\varsigma_{\max}]$ for numerical safety.
+
+\paragraph{Decode: action $\to$ engine launch.}\label{sec:decode}
+\textbf{Target actor.} For each ego-owned source planet $s$ (ownership $u_s=1$, ships $S_s>0$) and each
+\emph{off-diagonal} destination $d\neq s$ that is alive, the launch size is
+$n_{s,d}=\lfloor A[s,d]\,S_s\rfloor$ ships, executed when $n_{s,d}\ge\texttt{MIN\_LAUNCH\_SHIPS}$; a
+below-threshold off-diagonal entry (and the self-diagonal \texttt{HOLD} share $A[s,s]$) keeps its ships
+in the garrison and is \emph{not} penalized. Because each source row is a simplex, the dispatched ships
+$\sum_{d\neq s}n_{s,d}\le(1-A[s,s])\,S_s\le S_s$ never exceed the garrison --- the budget is structural,
+with no running deduction and no slot order. Each executed launch is aimed by the corrected orbital
+intercept of Section~\ref{sec:lead}:
+$\theta_{s,d}=\operatorname{atan2}\big(P(t^\star)-c_{\mathrm{src}}\big)$ under \texttt{LEAD\_TARGET}
+(else the straight line at the destination's current position). Because every destination is a real,
+sun-reachable planet and the row simplex bounds total dispatch by $S_s$, over-dispatch and
+phantom/unowned launches cannot arise --- there is no invalid-launch rate to penalize.
+\textbf{Continuous actor (superseded).} There the $K$ fleet triples were emitted in slot order; fleet
+$k$ launched $n_{e,k}=\lfloor\phi_{e,k}\,S_e\rfloor$ ships at angle
+$\theta_{e,k}=\operatorname{atan2}(2d^y_{e,k}-1,\,2d^x_{e,k}-1)$, the engine deducting ships
+\emph{sequentially}; committed fleets that failed to execute (phantom slots, unowned planets, or past
+the ship budget) were exactly the $x_t$ counted by that actor's invalid-dispatch penalty.
 
 %==============================================================
 \section{Reward and return}\label{sec:reward}
-\paragraph{Shaped potential.} Let $\mathrm{ships}_p(s)$ and $\mathrm{prod}_p(s)$ be player
-$p$'s total ships (planets $+$ fleets) and total planetary production in $s$. Define the
-production-aware potential (\texttt{native/rl/reward}; \texttt{prod\_weight}$=w_{\Phi}$)
-\begin{equation}
-\Phi(s) = \big(\mathrm{ships}_0(s)-\mathrm{ships}_1(s)\big)
-        + w_{\Phi}\big(\mathrm{prod}_0(s)-\mathrm{prod}_1(s)\big).
-\end{equation}
-Including production makes \emph{capturing a planet} immediately rewarding, counteracting the
-short-term ship cost of expansion that made a ship-only reward collapse to passivity.
+The current \texttt{set-ups/1.md} reward is an \textbf{event-based} reward with \emph{four} channels ---
+outcome, capture, dispatch, and a production milestone --- that \textbf{entirely replaces} the legacy
+production-shaping reward (the production-margin term $P$, the valid-launch carrot $V$, the miss-penalty
+stick $M$, the invalid-dispatch penalty $I$, and the enemy-suppression term $S$ are all \emph{off} in
+this run: \texttt{prod\_reward\_weight}, \texttt{valid\_launch\_reward}, \texttt{miss\_launch\_penalty},
+\texttt{illegal\_launch\_penalty}, \texttt{enemy\_growth\_weight} are all set to $0$). The four live
+channels (\texttt{RolloutConfig}, used identically by the CPU and GPU rollouts of
+Section~\ref{sec:gpuenv}) are:
 
-\paragraph{Per-step shaped reward.} With scale $\sigma$ (\texttt{reward\_scale}) and clip
-$\kappa$ (\texttt{reward\_clip}),
+\paragraph{1. Outcome $O$ --- a flat-then-decaying ``flip of winning.''} At termination the game is
+scored by total ships ($o_i=+1$ win, $0$ draw, $-1$ loss). The outcome is worth $\pm 1000$
+(\texttt{win\_bonus}$=$\texttt{loss\_penalty}$=1000$), held \textbf{flat for the first $100$ steps} and
+then \emph{decaying symmetrically} thereafter. With episode length $L$ and
+$\delta_{\mathrm o}=$\texttt{win\_decay}$=$\texttt{loss\_decay}$=0.995$ and
+$L_0=$\texttt{decay\_start\_step}$=100$,
 \begin{equation}
-r^{\mathrm{sh}}_t = \clip\!\left(\frac{\Phi(s_{t+1})-\Phi(s_t)}{\sigma},\,-\kappa,\,\kappa\right).
-\end{equation}
-
-\paragraph{Outcome.} At the terminal step $T_i$ of trajectory $i$, the game is scored by total
-ships; let $o_i=+1$ if ego wins, $-1$ if it loses, $0$ on a draw.
-
-\paragraph{GRPO return.} GRPO scores a \emph{whole trajectory} by a scalar return blending the
-discounted shaped reward and the outcome (\texttt{gamma}~$\gamma$, weights
-$w_{\mathrm{d}}=$\texttt{dense\_weight}, $w_{\mathrm{o}}=$\texttt{outcome\_weight}):
-\begin{equation}
-\boxed{\;
-R_i \;=\; w_{\mathrm{d}}\sum_{t=0}^{T_i-1}\gamma^{t}\,r^{\mathrm{sh}}_{i,t}
-       \;+\; w_{\mathrm{o}}\,o_i
-\;}
+O = \operatorname{sign}(\text{margin})\cdot 1000\cdot \delta_{\mathrm o}^{\,\max(0,\,L-L_0)}.
 \label{eq:return}
 \end{equation}
-Setting $w_{\mathrm{d}}=0$ recovers \emph{pure-outcome} GRPO; $\gamma=1$ is the
-undiscounted Monte-Carlo return (the default).
+The symmetric decay is a ``flip of winning'': it rewards a \emph{decisive} game without making a slow
+loss cheaper than a fast one in the opening (both win and loss are flat through the first $L_0$ steps,
+so an early scramble is never penalized for taking time). Draw is $0$. The outcome applies in
+\emph{all} stages of the $4$-stage curriculum (Section~\ref{sec:curriculum}).
 
-\paragraph{Note --- 2p vs.\ 4p objective.} The margin potential $\Phi$ and the outcome $o_i$ are
-the two-player ($N=2$) zero-sum forms. In $N=4$ free-for-all the objective is \emph{ordinal} ---
-be the maximum of four --- which is not zero-sum: e.g.\ $\Phi$ would become
-$\mathrm{ships}_0 - \max_{k\neq 0}\mathrm{ships}_k$ (margin over the \emph{strongest} rival, or a
-soft-max thereof) and $o_i$ the FFA win/lose of Section~\ref{sec:problem}. The GRPO machinery
-(advantage, surrogate, KL) is unchanged --- only $R_i$ in Eq.~\eqref{eq:return} is redefined.
+\paragraph{2. Capture $C$.} $+30$ for each ego planet \emph{gained} this step and $-30$ for each planet
+\emph{lost} (an owner flip to/from ego among alive slots), with $w_{\mathrm c}=$\texttt{capture\_reward}$=30$:
+\begin{equation}
+C_t = w_{\mathrm c}\,\big(\#\text{gained}_t - \#\text{lost}_t\big).
+\end{equation}
+
+\paragraph{3. Dispatch $D$ --- a bounded ``get moving'' carrot.} $+1$ for each of the \textbf{first $50$
+\emph{valid} launches} of the game --- a committed launch whose straight-line heading actually lands on
+a planet (the same closed-form ray-vs-disk projection, with sun occlusion, used for the threat features
+of Section~\ref{sec:threat}). With $w_{\mathrm d}=$\texttt{dispatch\_reward}$=1$ and budget
+$N_{\mathrm d}=$\texttt{dispatch\_count}$=50$, and $\sum_{<t}v$ the valid launches so far,
+\begin{equation}
+D_t = w_{\mathrm d}\cdot\min\!\big(v_t,\ \max(0,\ N_{\mathrm d}-\textstyle\sum_{<t}v)\big).
+\end{equation}
+(It counts \emph{valid} launches, not all launches: ships thrown into empty space earn nothing.)
+
+\paragraph{4. Production milestone $P$ --- bring back the economy reward.} $+20$ each time the ego's
+\textbf{total ship count} (planets $+$ in-flight fleets), $s$, crosses a \emph{doubling} threshold
+starting at \texttt{prod\_milestone\_base}$=100$ (i.e.\ $100,200,400,\dots$). Let the milestone level be
+\begin{equation}
+m(s) = \big\lfloor \log_2(s/\mathrm{base})\big\rfloor + 1 \ \ (s\ge\mathrm{base}),\qquad m(s)=0\ \ (s<\mathrm{base}),
+\end{equation}
+and let $m_{\mathrm{prev}}$ be the highest level reached so far. The step reward is
+$P_t = w_{\mathrm m}\cdot\max(0,\ m(s_t)-m_{\mathrm{prev}})$ with $w_{\mathrm m}=$\texttt{prod\_milestone\_reward}$=20$,
+then $m_{\mathrm{prev}}\leftarrow\max(m_{\mathrm{prev}},\,m(s_t))$. The $\max(0,\cdot)$ and the monotone
+$m_{\mathrm{prev}}$ make it \textbf{monotonic}: \emph{losing} ships never claws reward back, so the
+channel cleanly rewards a growing economy. The old ``fleet hits a planet'' reward is \textbf{dropped}
+--- it rewarded ship depletion (anti-win).
+
+\paragraph{Algorithm: PPO\,+\,GAE per-step assembly.} The \texttt{set-ups/1.md} run trains with
+\textbf{PPO\,+\,GAE} (a value-head critic and GAE, Appendix~\ref{sec:ppo}), \emph{not} GRPO. The
+per-step reward is the sum of the three dense channels, $r_t = C_t + D_t + P_t$, while the outcome $O$
+is \emph{scattered onto the episode's last active step} (so GAE propagates it backward as a return,
+rather than a flat offset). Both $r_t$ and $O$ are divided by
+$\sigma_R=$\texttt{reward\_scale}$=$\texttt{ppo\_reward\_scale}$=100$ before GAE, which shrinks the value
+targets to a fittable range for the MSE critic; advantages are re-normalized afterward, so the policy
+objective is unchanged. The per-game return is
+\begin{equation}
+R = O + C + D + P,\qquad C=\textstyle\sum_t C_t,\ \ D=\textstyle\sum_t D_t,\ \ P=\textstyle\sum_t P_t.
+\end{equation}
+(The GRPO path of Section~\ref{sec:grpo} would instead broadcast the group-normalized $R$ to every step;
+the same four channels feed it, but PPO is the algorithm for this run.)
+
+\paragraph{Legacy production-shaping reward (off in this run).} For reference, the previous reward was a
+\emph{smooth bounded} per-game form $R_i=O_i+P_i+V_i-I_i-M_i+S_i$ with: a capped production-margin term
+$P=\clip(\sum_t\delta_\Pi^{\,t}\gamma^t w_\Pi\Delta\Pi_0(t),\pm P_{\max})$ on ego production
+$\Pi_0(s)=\sum_{p:\mathrm{owner}=0}\mathrm{prod}(p)$; a capped valid-launch \emph{carrot}
+$V=\clip(\sum_t\gamma^t w_{\mathrm v}v_t,0,V_{\max})$; an uncapped invalid-dispatch penalty
+$I=\sum_t\gamma^t\rho\,x_t$ on committed-but-failed launches $x_t$ (the continuous actor's legality
+signal); an uncapped \emph{miss} stick $M=\sum_t\gamma^t\rho_{\mathrm m}m_t$ on legal launches that land
+on nothing ($m_t=$ executed $-$ valid); and an enemy-suppression term
+$S=-\sum_{t\ge x_0}\gamma^t w_{\mathrm e}y_t$ that rewarded bending the opponent's production growth
+down. All of these carry weight $0$ in the current run and are listed only for completeness; their
+config knobs survive in \texttt{RolloutConfig}.
+
+\paragraph{Note --- 2p vs.\ 4p objective.} The outcome $O$ (and the implicit margin) are the
+two-player ($N=2$) zero-sum forms. In $N=4$ free-for-all the objective is \emph{ordinal} --- be the
+maximum of four --- which is not zero-sum: $\operatorname{sign}(\text{margin})$ would become the FFA
+win/lose of Section~\ref{sec:problem} (max-score seat $+1$ else $-1$, or a rank-based shaping). The
+algorithm machinery (advantage, surrogate, KL) is unchanged --- only $R$ in Eq.~\eqref{eq:return} is
+redefined.
+
+%==============================================================
+\section{Curriculum (leading: none --- the Elo league \emph{is} the curriculum)}\label{sec:curriculum}
+\textbf{The leading implementation has no hand-coded stages.} Every iteration the opponent is
+PFSP-sampled from the Elo league (Section~\ref{sec:league}) over \emph{all} pool members --- the two
+scripted anchors (\texttt{random}, \texttt{starter}) plus the historical snapshots --- so the schedule
+\emph{emerges from skill}. The learner starts rated at the \texttt{random} anchor ($\mathrm{ELO\_INIT}=0$)
+and PFSP feeds it the nearest-rated opponents, so it practices against \texttt{random} first, shifts to
+\texttt{starter} as its rating climbs past it, then to ever-stronger snapshots --- reproducing the old
+stage progression organically, with no boundaries to tune. The only schedule knobs left are
+\texttt{TOTAL\_ITERS}, the snapshot cadence \texttt{SELFPLAY\_REFRESH}, and a short
+\texttt{SNAPSHOT\_WARMUP} that keeps the pool anchors-only until the learner is worth snapshotting. All
+opponents share the one reward of Section~\ref{sec:reward} (the outcome $O$ always applies), and the Elo
+update happens every iteration regardless of which opponent was drawn.
+
+\paragraph{Legacy native 4-stage schedule.} The native trainer still uses a \textbf{4-stage,
+iteration-driven} curriculum (enabled by \texttt{stage3\_iters}$>0$): the stage advances by
+\emph{iteration count} and only the \textbf{opponent} changes. With its flags (\texttt{stage1\_iters}$=0$,
+\texttt{stage2\_iters}$=100$, \texttt{stage3\_iters}$=300$, \texttt{total\_iters}$=1400$): Stage~1 (noop)
+skipped; Stage~2 vs.\ \texttt{random} (iters $1$--$100$); Stage~3 vs.\ \texttt{starter} (iters
+$101$--$400$); Stage~4 self-play$+$starter$+$random (iters $401$--$1400$, drawn $50/25/25$ via
+\texttt{selfplay\_prob}$=0.5$). Its self-play opponent is a single \emph{frozen snapshot}
+(\texttt{clone\_frozen}), rebuilt on Stage-4 entry and refreshed every \texttt{ckpt\_every\_late}$=100$
+iters --- a lagging mirror. The notebook's league/no-stages design supersedes this (the explicit stages
+become PFSP weight over the same opponents); the legacy step-fraction $3$-stage schedule remains
+available when \texttt{stage3\_iters}$=0$.
 
 %==============================================================
 \section{GRPO update}\label{sec:grpo}
-GRPO replaces the value baseline of actor--critic methods with a \emph{group-relative}
-baseline: the policy plays a group of trajectories from the \emph{same} start against the
-\emph{same} opponent, and each trajectory's return is centered against its group.
+GRPO is the trainer's \emph{alternative} algorithm (the \texttt{set-ups/1.md} run uses PPO\,+\,GAE,
+Appendix~\ref{sec:ppo}). It replaces the value baseline of actor--critic methods with a
+\emph{group-relative} baseline: the policy plays a group of trajectories from the \emph{same} start
+against the \emph{same} opponent, and each trajectory's return is centered against its group.
 
 \subsection{Grouped sampling}
 For iteration we draw $N$ groups (\texttt{num\_groups}); group $j$ fixes an initial state
@@ -278,15 +993,404 @@ clip \texttt{max\_grad\_norm}. Advantages are computed once per iteration (off $
 ratio \eqref{eq:clip} and KL \eqref{eq:kl} are recomputed each minibatch under the live $\pol$.
 
 %==============================================================
-\section{Self-play league}\label{sec:league}
-Once training has reached \texttt{start\_step}, the opponent for each group is sampled from a
-mix of \{\,\texttt{random}, \texttt{starter}, league\,\} with weights
-$(\,$\texttt{mix\_random}, \texttt{mix\_starter}, \texttt{mix\_pool}$\,)$. The league is a
-bounded set (\texttt{pool\_capacity}) of \emph{historical} frozen snapshots --- not a single
-latest self --- which avoids the cycling/forgetting of single-snapshot self-play. Promotion is
-\emph{win-gated}: a new snapshot is admitted only when the current policy beats the pool with
-win rate $\geq$ \texttt{promote\_winrate}, so the policy never trains against a regression of
-itself.
+\section{KL divergence and the PPO trust region}\label{sec:kldiv}
+PPO (Appendix~\ref{sec:ppo}) is the algorithm for the \texttt{set-ups/1.md} run. Its defining idea is a
+\emph{trust region}: keep each policy update close, in KL, to the behavior policy that generated the
+data, so the off-policy importance-sampling correction stays valid. This section collects the
+KL definitions, the probability ratio, the three sample estimators of KL, and how the trainer uses the
+KL signal alongside the clip fraction. (The KL anchor of Eq.~\eqref{eq:kl} is a \emph{separate},
+explicitly-penalized KL to the frozen reference policy $\polref$; here we treat the
+\emph{old-vs-new} KL that PPO controls implicitly through clipping and monitors as a diagnostic.)
+
+\paragraph{Definition.} For discrete distributions $p,q$ over the same support, the Kullback--Leibler
+divergence is the expected log-ratio
+\begin{equation}
+\KL(p\,\|\,q) \;=\; \sum_{x} p(x)\,\log\frac{p(x)}{q(x)} \;=\; \E_{x\sim p}\!\Big[\log\frac{p(x)}{q(x)}\Big]
+\;\ge\; 0,
+\label{eq:kldef}
+\end{equation}
+with equality iff $p=q$; it is \emph{not} symmetric ($\KL(p\|q)\neq\KL(q\|p)$ in general). For the
+factored Orbit Wars policy of Section~\ref{sec:dist} the joint KL is the \emph{sum} of the per-source
+Dirichlet KLs over owned planets, since KL is additive over independent factors:
+$\KL(\pol\|\polold)=\sum_{s:\text{owned}}\KL\big(\mathrm{Dirichlet}(\alpha_s)\,\|\,\mathrm{Dirichlet}(\alpha_s^{\mathrm{old}})\big)$.
+
+\paragraph{Probability ratio.} PPO constrains the step through the per-sample importance ratio between
+the candidate policy $\pol$ and the behavior policy $\polold$ that collected the transition,
+\begin{equation}
+r_t(\theta) \;=\; \frac{\pol(a_t\mid s_t)}{\polold(a_t\mid s_t)}
+\;=\; \exp\!\big(\log\pol(a_t\mid s_t) - \log\polold(a_t\mid s_t)\big),
+\label{eq:ratio}
+\end{equation}
+the same $\rho_{i,t}$ of Eq.~\eqref{eq:clip} (each log-prob the per-source Dirichlet sum over owned
+planets of Eq.~\eqref{eq:logp}). At collection time $\theta=\theta_{\mathrm{old}}$ so $r_t=1$; as the update epochs
+drift $\theta$ away, $r_t$ moves off $1$ and the KL$(\polold\|\pol)$ grows.
+
+\paragraph{Three sample estimators of KL (Schulman).} The KL in Eq.~\eqref{eq:kldef} is an expectation
+over $\polold$, so it can be estimated from the \emph{same} samples already drawn during the rollout.
+Writing $r=r_t(\theta)$ for the ratio Eq.~\eqref{eq:ratio} and $\log r=\log\pol-\log\polold$, the three
+standard Monte-Carlo estimators of $\KL(\polold\,\|\,\pol)$ are
+\begin{align}
+k_1 &= \E_{\polold}\!\big[-\log r\big] = \E_{\polold}\!\big[\log\tfrac{\polold}{\pol}\big]
+   && \text{(unbiased; high variance; can be negative),}\label{eq:k1}\\
+k_2 &= \tfrac12\,\E_{\polold}\!\big[(\log r)^2\big]
+   && \text{(low variance; biased; always }\ge 0\text{),}\label{eq:k2}\\
+k_3 &= \E_{\polold}\!\big[(r-1) - \log r\big]
+   && \text{(unbiased; lower variance; always }\ge 0\text{).}\label{eq:k3}
+\end{align}
+$k_1$ is the literal definition Eq.~\eqref{eq:kldef} estimated by sampling --- exactly unbiased, but its
+per-sample term $-\log r$ is signed, so a finite-sample average is noisy and \emph{can come out
+negative} even though the true KL cannot. $k_3$ is the control-variate fix: $(r-1)$ has expectation
+$\E_{\polold}[r]-1=0$ under $\polold$, so adding it cancels variance without adding bias, and the convex
+inequality $r-1\ge\log r$ makes every term $\ge 0$. ($k_3$ is the same $\exp(\Delta)-\Delta-1$ form used
+for the reference-anchor penalty, Eq.~\eqref{eq:kl}, with $\Delta=\log r$ there pointed at $\polref$.)
+$k_2$ matches $k_3$ to second order ($\tfrac12(\log r)^2\approx(r-1)-\log r$ for small $\log r$) and is a
+cheap, always-positive proxy.
+
+\paragraph{What the trainer logs.} The training loop logs the $k_1$ estimator as its KL signal,
+\begin{equation}
+\texttt{approx\_kl} \;=\; \operatorname{mean}\big(\log\polold - \log\pol\big)
+\;=\; \operatorname{mean}\big(\texttt{old\_logp}-\texttt{new\_logp}\big) \;=\; \E\big[-\log r\big],
+\label{eq:approxkl}
+\end{equation}
+averaged over the minibatch transitions (computed in the update inner loop alongside the surrogate). It
+serves two purposes: (i) \textbf{policy-step sizing / early-stopping} --- a large \texttt{approx\_kl}
+means the epoch has moved the policy too far off the data it was collected on, so the update epochs can
+be cut short before $\polold$-vs-$\pol$ drift invalidates the ratio; and (ii) it is the \textbf{diagnostic
+paired with the clip fraction}
+\begin{equation}
+\texttt{clipfrac} \;=\; \E\big[\mathbb 1(\,|r_t-1|>\epsilon\,)\big],\qquad \epsilon=\texttt{CLIP}=0.2,
+\label{eq:clipfrac}
+\end{equation}
+the fraction of samples whose ratio left the clip band $[1-\epsilon,1+\epsilon]$. (Because $k_1$ is
+signed, a small \emph{negative} \texttt{approx\_kl} early in an epoch is normal noise, not an error.)
+
+\paragraph{Clipped surrogate and the KL$\leftrightarrow$clip relation.} PPO does not penalize this
+old-vs-new KL directly; it bounds it by \emph{clipping} the ratio in the surrogate
+\begin{equation}
+\mathcal L^{\mathrm{CLIP}}(\theta) \;=\;
+\E_t\Big[\min\!\big(r_t(\theta)\,\Adv_t,\ \ \clip\big(r_t(\theta),\,1-\epsilon,\,1+\epsilon\big)\,\Adv_t\big)\Big],
+\label{eq:lclip}
+\end{equation}
+the maximized form of the minimized $\mathcal L^{\mathrm{clip}}$ of Eq.~\eqref{eq:clip}. The
+$\min$/$\clip$ removes the incentive to push $r_t$ beyond $1\pm\epsilon$: once a sample's ratio crosses
+the band (it joins \texttt{clipfrac}) its surrogate gradient is gated off, so the policy stops moving on
+that sample. Thus \texttt{approx\_kl} and \texttt{clipfrac} rise together --- KL growth is what
+\emph{activates} the clip, and a spiking \texttt{clipfrac} with a large \texttt{approx\_kl} is the signal
+that the trust region is binding and the epoch should stop. This implicit-KL control (clipping) is
+distinct from, and runs alongside, the explicit KL \emph{anchor} to $\polref$ of
+Eqs.~\eqref{eq:kl}/\eqref{eq:loss}: clipping keeps each step near \emph{last iteration's} policy, while
+the anchor keeps the whole run near the \emph{frozen BC reference}.
+
+%==============================================================
+\section{Self-play league (Elo / PFSP)}\label{sec:league}
+The leading implementation replaces single-snapshot self-play with a \textbf{rated league} (notebook
+\texttt{League}). The pool holds two \emph{anchored} scripted opponents (\texttt{random} at fixed Elo
+$0$, \texttt{starter} at fixed Elo $600$ --- they pin the rating scale) plus a growing set of
+\emph{frozen policy snapshots}, each with a floating rating $r_m$; the learner carries its own rating
+$r_\theta$.
+
+\paragraph{Opponent sampling (PFSP --- the whole pool, every iteration).} There are no stages: at
+\emph{every} iteration the single rollout opponent is drawn from \emph{all} pool members $m$ (anchors
+\emph{and} snapshots) by \emph{prioritized fictitious self-play}, with weight $w_m=f(p_m)+\epsilon_0$,
+where
+\begin{equation}
+p_m=\Big(1+10^{(r_m-r_\theta)/400}\Big)^{-1}
+\end{equation}
+is the learner's expected score against $m$ (the logistic Elo expectation) and $f$ is the PFSP curve ---
+$f(p)=p(1-p)$ (\texttt{PFSP\_MODE="even"}, default: prefer near-equal opponents) or $f(p)=(1-p)^{P}$
+(\texttt{"hard"}: prefer opponents not yet beaten) --- with a uniform floor $\epsilon_0$
+(\texttt{PFSP\_FLOOR}) on every member for anti-forgetting (so the scripted anchors keep a residual
+probability even once the learner has outgrown them). This single weighting is what makes the Elo ladder
+double as the curriculum (Section~\ref{sec:curriculum}): a low-rated fresh learner gets the nearest
+anchors, a high-rated one gets the strong snapshots. \textbf{One} opponent is used per rollout, so the
+ego win$+\tfrac12$draw fraction over the batch is a clean match score $S\in[0,1]$. (The earlier
+\texttt{selfplay\_prob} snapshot-vs-anchor split is retired --- the unified PFSP weight subsumes it.)
+
+\paragraph{Elo update.} After \emph{every} rollout against the drawn opponent $m$, with K-factor $K$
+(\texttt{ELO\_K}$=32$ --- raised from $16$ now that Elo \emph{drives} sampling and so must track skill
+quickly),
+\begin{equation}
+r_\theta \leftarrow r_\theta + K\,(S-p_m),\qquad
+r_m \leftarrow r_m - K\,(S-p_m)\ \ (\text{anchored }r_m\text{ frozen}).
+\end{equation}
+Because the learner starts at the \texttt{random} anchor's rating and is updated against whatever it
+plays from iteration~0, $r_\theta$ self-calibrates and climbs the ladder. The update is zero-sum and the
+fixed anchors pin the absolute scale, so $r_\theta$ is an interpretable, drift-free skill curve (logged
+$+$ plotted alongside win rate).
+
+\paragraph{Pool management.} After a short anchors-only warmup (\texttt{SNAPSHOT\_WARMUP} iters, so the
+pool is not seeded with a useless random-init net) the learner is snapshotted into the pool every
+\texttt{SELFPLAY\_REFRESH} iters (the new snapshot inherits $r_\theta$); auto-snapshots are FIFO-pruned
+to \texttt{LEAGUE\_MAX\_SNAPSHOTS}. Externally supplied checkpoints (\texttt{LEAGUE\_INIT\_CKPTS}) are
+\emph{pinned} (never pruned), letting past weights seed the pool. Snapshots live on CPU; only the sampled
+opponent is moved to the GPU for its rollout, so pool size costs RAM, not VRAM. A bounded pool of
+\emph{historical} snapshots (vs.\ a single latest self) is what avoids the cycling/forgetting of naive
+self-play; the Elo/PFSP weighting then focuses compute on the most \emph{informative} opponents. (Note:
+a discrete-actor learner cannot load a continuous-$\phi$ checkpoint --- the $\phi$ head shape differs ---
+so pre-discretization weights are skipped when seeding a discrete league.)
+
+\paragraph{Native variant (win-gated mix).} The native trainer's league is the simpler win-gated form:
+opponents mixed from \{\,\texttt{random}, \texttt{starter}, pool\,\} with fixed weights
+$(\,$\texttt{mix\_random}, \texttt{mix\_starter}, \texttt{mix\_pool}$\,)$, the pool a bounded set
+(\texttt{pool\_capacity}) of historical snapshots, and promotion \emph{win-gated} --- a new snapshot is
+admitted only when the current policy beats the pool at win rate $\geq$\texttt{promote\_winrate}. The
+notebook's Elo/PFSP scheme generalizes this: rating-weighted sampling instead of a fixed mix, and a
+soft Elo ladder instead of a hard promotion gate.
+
+%==============================================================
+\section{Self-play league, curriculum, and reward shaping}\label{sec:interventions}
+This session extends the league of Section~\ref{sec:league} into a full \textbf{scripted-anchor
+difficulty ladder} with an \textbf{Elo-gated curriculum}, a grounding \textbf{recalibration} that
+removes self-play Elo inflation, an \textbf{anti-clone / anchor-boosted matchmaking} rule, and a
+\textbf{production-weighted, asymmetric capture reward}. Where Section~\ref{sec:league} described two
+anchors (\texttt{random}, \texttt{starter}) and ``the league \emph{is} the curriculum,'' the ladder
+below supplies six anchors and a gated unlock; the PFSP machinery of Section~\ref{sec:league} is the
+substrate, the additions here are the anchors, the gate, the recal, and the reward channel.
+
+\subsection{Scripted anchor bots (the difficulty ladder)}\label{sec:anchors}
+The pool is pinned by six hand-coded opponents, all \textbf{vectorized in the GPU env}
+(Section~\ref{sec:gpuenv}) so they cost no host round-trip. Each carries a fixed Elo that pins the
+rating scale (Section~\ref{sec:league}); the ratings are an \emph{approximate, slightly conservative}
+ladder (see the round-robin note below). Throughout, ``half-garrison'' means half the source planet's
+ship count, fired only when that planet holds $\ge 20$ ships, and ``lead-aimed'' means the heading aims
+at the orbital \emph{intercept} (\texttt{LEAD\_TARGET}, Section~\ref{sec:lead}) rather than the target's
+current position.
+\begin{center}\small
+\begin{tabular}{@{}llp{0.62\linewidth}@{}}
+\toprule
+Bot & Elo & Behavior \\
+\midrule
+\texttt{random} & $0$ & Random heading; launches half its garrison ($\ge 20$ ships) from any planet. \\
+\texttt{starter} & $600$ & Fires half-garrison ($\ge 20$) at the \textbf{nearest static} (non-rotating)
+  non-owned planet, with a straight $\operatorname{atan2}$ aim at its current position. \\
+\texttt{intermediate} & $750$ & \textbf{In-flight-aware} capture from the nearest \emph{capable} owned
+  source (cascading to the 2nd/3rd-nearest if closer ones cannot beat the target), lead-aimed at the
+  intercept. Per target the ships needed are
+  $\lfloor\text{garrison}\rfloor + \lceil\text{enemy\_inbound}\rceil - \lfloor\text{friendly\_inbound}\rfloor + \texttt{CAPTURE\_MARGIN}$,
+  where the inbound counts are the in-flight fleet ships attributed to that planet by the \emph{same}
+  fleet$\to$target geometry as the threat encoder (Section~\ref{sec:threat}). This (a) stops piling onto
+  a target a friendly fleet already covers ($\text{needed}\le 0\Rightarrow$ skip) and (b) sends enough to
+  \emph{counter} an enemy fleet inbound to the same target (auto-recapture). Plus \textbf{local
+  rebalancing} (send $\lfloor\text{gap}/2\rfloor$ to the poorest owned planet within
+  $\texttt{REBALANCE\_RADIUS}=30$ when surplus $> \texttt{REBALANCE\_PCT}=0.4$ of garrison) and
+  \textbf{comet-escape} (an owned comet planet evacuates \emph{all} its ships to the nearest owned
+  non-comet planet before it expires). \\
+\texttt{greedy} & $900$ & \textbf{Every} owned planet independently captures the nearest beatable
+  non-owned planet within $\texttt{CAPTURE\_RADIUS}=25$, sending
+  $\lfloor\text{target\_ships}\rfloor + \texttt{CAPTURE\_MARGIN}\ (=2)$, lead-aimed. \emph{Note:}
+  empirically the \textbf{strongest} scripted bot --- its every-planet aggression $+$ just-enough
+  efficiency wins the board-grab race. \\
+\texttt{medium} & $1000$ & ``\texttt{starter}{+}{+}'': nearest non-owned planet \emph{including} rotating
+  ones, lead-aimed at the intercept, half-garrison. \\
+\bottomrule
+\end{tabular}
+\end{center}
+\noindent (The \texttt{random}, \texttt{starter}, \texttt{intermediate}, \texttt{greedy}, \texttt{medium}
+rows are the five behavior families; \texttt{starter} differs from \texttt{medium} only by the
+static-vs-rotating target choice and the lead aim, and the listed Elos pin the scale.) The shared
+constant is $\texttt{CAPTURE\_MARGIN}=2$ (the over-send that beats combat round-off).
+\textbf{Empirical strength order} from a complementary round-robin in the official Kaggle engine is
+\[
+\texttt{greedy} \;>\; \texttt{medium} \;>\; \texttt{intermediate} \;>\; \texttt{starter} \;>\; \texttt{random},
+\]
+so the anchor Elos above are an \emph{approximate, slightly conservative} ladder (greedy is rated $900$
+yet is the practical ceiling).
+
+\subsection{Curriculum: Elo-gated anchor regimes}\label{sec:gatedcurriculum}
+The anchors split into two regimes by skill, so a \emph{weak} learner is not handed bots that would
+exploit and destabilize it before it can learn:
+\begin{description}[nosep,leftmargin=1.4em]
+\item[Base regime (always-active anchors):] \texttt{random}, \texttt{starter}, \texttt{intermediate}.
+  These are on from iteration~0.
+\item[Advanced regime (gated anchors):] \texttt{greedy}, \texttt{medium}. Withheld early because they
+  are too strong for a weak learner and would exploit / destabilize it.
+\end{description}
+\textbf{Unlock mechanism (anti-inflation guard).} When the learner's online Elo first reaches the
+trigger $\texttt{ADVANCE\_TRIGGER\_ELO}=800$, the trainer runs a \emph{full recalibration with all anchors on}
+(including the gated ones) on \textbf{fresh random seeds}. If that honest recal grades the learner
+at $\ge\texttt{ADVANCE\_CONFIRM\_ELO}=700$, the advanced anchors (\texttt{greedy}, \texttt{medium})
+are \emph{permanently} unlocked; otherwise the learner stays in the base regime --- the $800$ was self-play
+inflated (Section~\ref{sec:eloRecal}) and the gate refuses to be fooled. \textbf{Normally} (before any
+unlock) the periodic recalibration grounds the learner's Elo against only the \emph{active} anchors
+(\texttt{random}, \texttt{starter}, \texttt{intermediate}); the $800$-trigger recal is the one moment
+all anchors are turned on at once.
+
+\subsection{Elo grounding, recalibration, and matchmaking}\label{sec:eloRecal}
+\paragraph{Logistic Elo back-solve (grounding against the anchors).} Online self-play Elo
+(Section~\ref{sec:league}) inflates: the learner farms its own under-rated frozen snapshots, so
+$r_\theta$ drifts above true skill. The fix re-grounds $r_\theta$ against the \emph{fixed} scripted
+anchors. For a measured score $s$ (the \texttt{greedy} win $+\tfrac12$\,draw fraction, clamped to
+$[0.02,0.98]$) against an anchor of rating $R$, the implied rating is the logistic inverse of the Elo
+expectation,
+\begin{equation}
+\hat r(R,s) = R + 400\,\log_{10}\!\frac{s}{1-s},
+\label{eq:elo-backsolve}
+\end{equation}
+and the recalibrated $r_\theta$ is $\hat r$ \emph{averaged over the active anchors}. This is run every
+$\texttt{ELO\_RECAL\_EVERY}$ iterations on \textbf{fresh worlds}, which removes the online self-play
+inflation that otherwise accrues; the clamp $[0.02,0.98]$ keeps $\log_{10}(s/(1-s))$ finite at a
+blow-out or a shut-out.
+
+\paragraph{PFSP matchmaking weight.} Each pool opponent's sampling weight blends an Elo-based PFSP term
+with a behavioral-footprint term:
+\begin{equation}
+w_m = \texttt{MATCH\_ELO\_W}\cdot \underbrace{f(p_m)}_{\text{Elo PFSP}}
+    \;+\; \texttt{MATCH\_FP\_W}\cdot \underbrace{\mathrm{JS}\big(\hat\pi_m,\hat\pi_\theta\big)}_{\text{footprint dist.}}
+    \;+\; \texttt{PFSP\_FLOOR},
+\label{eq:match-weight}
+\end{equation}
+with $\texttt{MATCH\_ELO\_W}=0.7$ and $\texttt{MATCH\_FP\_W}=0.3$,
+where $f(p_m)$ is the Elo-based PFSP curve of Section~\ref{sec:league} (the
+$p(1-p)$/$(1-p)^P$ weight on the logistic expectation $p_m$) and
+$\mathrm{JS}(\hat\pi_m,\hat\pi_\theta)$ is the Jensen--Shannon distance between opponent $m$'s and the
+learner's \textbf{behavioral footprints}. The
+footprint term is \textbf{anti-clone}: it down-weights near-identical snapshots (so the learner does not
+over-play copies of itself) and, since scripted anchors are maximally distinct from the learner, keeps
+them in the mix.
+
+\paragraph{Scripted-anchor matchmaking boost.} On top of Eq.~\eqref{eq:match-weight}, each scripted
+anchor's weight is multiplied by $\texttt{SCRIPT\_MATCH\_BOOST}=2.0$ (i.e.\ $+100\%$ --- sampled twice
+as often) \emph{until} the learner has mastered that bot, after which the boost drops to $1\times$. The
+boost-drop test uses a per-bot EMA win-rate $m[\texttt{wr}]$ (EMA factor $\texttt{WR\_EMA\_BETA}=0.1$):
+the boost drops once $m[\texttt{wr}]\ge\texttt{SCRIPT\_BOOST\_DROP\_WR}=0.90$ after at least
+$\texttt{SCRIPT\_BOOST\_MIN\_GAMES}=5$ games against it. The purpose is to \textbf{concentrate rollouts on
+the bots the learner has not yet mastered}.
+\begin{center}\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Knob & Symbol / use & Value \\
+\midrule
+\texttt{ELO\_RECAL\_EVERY} & recalibration period (fresh worlds) & --- \\
+score clamp & $s\in[\,\cdot\,]$ for Eq.~\eqref{eq:elo-backsolve} & $[0.02,0.98]$ \\
+\texttt{ADVANCE\_TRIGGER\_ELO} & online Elo that triggers the all-anchor recal & $800$ \\
+\texttt{ADVANCE\_CONFIRM\_ELO} & recal Elo needed to unlock \texttt{greedy}/\texttt{medium} & $700$ \\
+\texttt{MATCH\_ELO\_W} / \texttt{MATCH\_FP\_W} & Elo-PFSP vs.\ footprint blend, Eq.~\eqref{eq:match-weight} & $0.7$ / $0.3$ \\
+\texttt{SCRIPT\_MATCH\_BOOST} & scripted-anchor weight multiplier (until mastered) & $2.0$ \\
+\texttt{SCRIPT\_BOOST\_DROP\_WR} & EMA win-rate that drops the boost to $1\times$ & $0.90$ \\
+\texttt{SCRIPT\_BOOST\_MIN\_GAMES} & games before the boost can drop & $5$ \\
+\texttt{WR\_EMA\_BETA} & EMA factor for the per-bot win-rate $m[\texttt{wr}]$ & $0.1$ \\
+\texttt{CAPTURE\_MARGIN} & scripted over-send (all capture bots) & $2$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Reward shaping: production-weighted, asymmetric capture}\label{sec:capshape}
+The capture channel $C$ of Section~\ref{sec:reward} is sharpened so the agent is pulled toward
+\emph{valuable} targets and is rewarded for \emph{net expansion}. Two changes:
+\begin{description}[nosep,leftmargin=1.4em]
+\item[Production-weighted capture.] Capturing a planet of production $\Pi$ pays
+  $\texttt{CAPTURE\_REWARD}\cdot(1+\texttt{CAPTURE\_PROD\_SCALE}\cdot\Pi)$, so higher-production planets
+  are worth more. With $\texttt{CAPTURE\_REWARD}=30$ (tunable base) and
+  $\texttt{CAPTURE\_PROD\_SCALE}=0.2$, a prod-$1$ planet pays $1.2\times$ base and a prod-$5$ planet
+  $2.0\times$ base.
+\item[Asymmetric loss.] Losing a planet removes only $\texttt{CAPTURE\_LOSS\_FRAC}=0.9$ of its
+  (production-weighted) value, so a capture-then-recapture cycle is net $+10\%$ --- an
+  \textbf{anti-passivity} incentive to keep expanding rather than trade evenly.
+\end{description}
+The full per-step capture reward, masked to the \textbf{active (alive)} ego planets, is the following
+(writing $w_{\mathrm c}$ for \texttt{CAPTURE\_REWARD}, $\rho_{\Pi}$ for \texttt{CAPTURE\_PROD\_SCALE},
+$\lambda_\ell$ for \texttt{CAPTURE\_LOSS\_FRAC}, and $n^{\pm},\Pi^{\pm}$ for the count and
+summed-production gained $(+)$ and lost $(-)$ this step):
+\begin{equation}
+C_t = w_{\mathrm c}\,\Big[
+  \big(n^{+} + \rho_{\Pi}\,\Pi^{+}\big)
+  - \lambda_\ell\,\big(n^{-} + \rho_{\Pi}\,\Pi^{-}\big)
+\Big],
+\qquad w_{\mathrm c}=30,\ \rho_{\Pi}=0.2,\ \lambda_\ell=0.9.
+\label{eq:capreward}
+\end{equation}
+This generalizes the flat $\pm 30$ form $C_t=w_{\mathrm c}(\#\text{gained}-\#\text{lost})$ of
+Section~\ref{sec:reward}: setting $\rho_{\Pi}=0$ and $\lambda_\ell=1$ recovers it exactly.
+\begin{center}\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Knob & Meaning & Value \\
+\midrule
+\texttt{CAPTURE\_REWARD} & base capture pay (tunable) & $30$ \\
+\texttt{CAPTURE\_PROD\_SCALE} & per-unit-production bonus (prod-$1\!\to\!1.2\times$, prod-$5\!\to\!2.0\times$) & $0.2$ \\
+\texttt{CAPTURE\_LOSS\_FRAC} & fraction of value removed on a loss (net $+10\%$/cycle) & $0.9$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%==============================================================
+\section{Batched GPU simulator}\label{sec:gpuenv}
+The naive rollout is \emph{latency-bound}: each of the $T{\approx}500$ ticks is a strict chain
+\textsf{encode (CPU)} $\to$ \textsf{forward (GPU)} $\to$ \textsf{decode$+$step (CPU)} with a host
+$\leftrightarrow$ device transfer on either side of the forward, so the GPU sits idle ${\sim}70\%$
+of the time waiting on the CPU simulation. \texttt{GpuEnv} (\texttt{native/rl/gpu\_env.\{hpp,cpp\}},
+enabled by \texttt{RolloutConfig::gpu\_env}) instead runs the \emph{entire} game as batched
+LibTorch tensor ops on the GPU, so the whole loop --- encode, sample, decode, step, scripted
+opponent --- stays on-device. The deep-policy forward and the swept fleet/planet collision then
+dominate, making the loop \textbf{GPU-compute-bound} (observed $100\%$ SM utilization), not
+CPU- or transfer-bound. It uses \emph{pure} tensor ops (no custom CUDA kernel / toolkit).
+
+\paragraph{Layout (Structure-of-Arrays, leading batch $B$).} Planets live in $E_c=$
+\texttt{planet\_cap} \emph{fixed} slots (the last $4$ reserved for the at-most-one live comet
+group); fleets in a fixed pool of \texttt{fleet\_cap} slots with an \emph{alive} mask. Because the
+per-planet actor is permutation-equivariant (Section~\ref{sec:policy}), \textbf{no
+\textsf{entity\_order} sort is needed} --- row order is irrelevant, which removes the one operation
+that does not vectorize cleanly. So here $E=E_c$ (the obs/action dim), independent of the
+serving-time top-$40$ cap. Integer quantities (ships, production, owner, step) are kept in
+\texttt{float32} (exact $<2^{24}$).
+
+\paragraph{Vectorized dynamics.} The per-tick update mirrors the reference engine
+(\texttt{core/sim.hpp}) branch-free: orbital motion and production are elementwise; launches scatter
+into free fleet slots; the swept ray/disk collision is the $B\times\texttt{fleet\_cap}\times E_c$
+pairwise test (the heavy on-device compute). \emph{Combat needs no sort}: with exactly two players,
+arriving ships scatter-add per owner into $(B,E_c)$, then top/second/survivor are elementwise
+(the reference's stable-sort/first-seen order only matters for ${>}2$ owners). Comets are a baked
+per-env schedule (spawn step, ships, precomputed path positions) overlaid each tick. The threat
+encoder (Section~\ref{sec:threat}) breaks equal-ship ties by a per-fleet \emph{launch-order} stamp
+to match the reference's \texttt{stable\_sort} over the fleet list.
+
+\paragraph{Parity.} \texttt{GpuEnv} is a third engine and must implement the same rules as the
+C++ \texttt{ow::step} that is also the Kaggle submission engine. \texttt{apps/parity\_gpu} drives
+both from identical states/actions and compares per-env aggregates: the deterministic core is
+\textbf{bit-exact} ($64$ envs $\times$ many ticks), the observation encoder is parity-exact (max
+feature diff ${\sim}10^{-6}$), the \texttt{starter} opponent is bit-exact, and full episodes with
+comets stay $\ge 90\%$ exact, the residual being benign \texttt{float32}-vs-\texttt{float64}
+boundary flips in marginal collisions (a training-time fidelity choice, not a logic error).
+
+\paragraph{On-device rollout, host-offloaded trajectory.} \texttt{GroupedRollout::collect\_gpu}
+keeps the loop on-device but copies each step's $(\,$obs, action, log-prob$\,)$ to \emph{pinned} host
+buffers with non-blocking transfers, so VRAM holds only the model, the current step's working set,
+and the collision intermediate --- bounded in $T$ and $B$, i.e.\ \textbf{not memory-bound}. The
+reward channels (Section~\ref{sec:reward}, bounded variant), terminal test, and group advantage are
+computed on-device; valid transitions then flatten into the same host \texttt{TrajectoryBatch} the
+CPU path produces, so the GRPO update (Section~\ref{sec:grpo}) is unchanged and streams minibatches
+back to the GPU. Within a group all envs share one $(\text{world},\text{opponent})$ so the group
+baseline stays valid; the opponent is uniform across the batch per iteration.
+
+\paragraph{Deep-net numerical stability.} Summing the squashed-Gaussian log-prob over $E\cdot 3K$
+components makes a deep, from-scratch policy prone to blow-ups: an extreme $\mu$ with a saturated
+sample (latent $z$ far from $\mu$) over a tiny $\sigma^2$ produces a huge \texttt{logN}, hence an
+exploding step and $\exp(\text{logp}-\text{old})\to\infty$. The trainer guards this with a tight
+log-std range $[\varsigma_{\min},\varsigma_{\max}]=[-2,1]$, a clamp on $\mu$ inside the density (the
+saturated region is unchanged), a clamp on the log-ratio before $\exp$, a $[-10,10]$ clamp on the
+whitened advantage (a near-degenerate group otherwise explodes it), and skipping any optimizer step
+whose gradient norm is non-finite.
+
+\subsection{Simulator fidelity (sim-to-real gap)}\label{sec:simfidelity}
+The vectorized GPU simulator (\texttt{GpuEnv}) was verified \textbf{bit-exact} against the official
+Kaggle engine (\texttt{kaggle\_environments} \texttt{orbit\_wars}) for steps $0$--$48$ across many
+games of \texttt{starter} versus \texttt{starter}. The method replays \emph{identical} moves through both
+engines and compares, each tick, planet ships/owner/position and the per-owner fleet counts. Every core
+mechanic matches: fleet launch (the surface offset of Section~\ref{sec:lead}), production timing, planet
+orbit, the swept-pair continuous collision, combat resolution (top/second, ties, owner-flip), sun
+occlusion, and the fleet speed law
+\begin{equation}
+\text{speed} = \min\!\Big(\text{shipSpeed},\;
+  1 + (\text{shipSpeed}-1)\big(\tfrac{\ln(\text{ships})}{\ln 1000}\big)^{1.5}\Big),
+\label{eq:speedlaw}
+\end{equation}
+which is exactly the fleet speed $v(\nu)$ of Section~\ref{sec:threat} (with $\text{shipSpeed}=v_{\max}=6$).
+\textbf{The only divergence is comets:}
+the official engine spawns comets at steps $50/150/250/350/450$ (random ship counts and paths), which
+\texttt{GpuEnv} omits --- so comets are the \emph{sole} sim-to-real gap. Empirically (official-engine
+eval) a current checkpoint scores ${\sim}0.91$ vs.\ \texttt{random} but only ${\sim}0.04$ vs.\
+\texttt{starter}, with comets costing ${\sim}6$ points; the dominant weakness is therefore \textbf{policy
+quality, not the simulator}.
 
 %==============================================================
 \section{Symbols $\leftrightarrow$ \texttt{config.hpp}}
@@ -296,8 +1400,21 @@ itself.
 Symbol & \texttt{config.hpp} field & Default \\
 \midrule
 $d$ & \texttt{ModelConfig::hidden} & $128$ \\
-$E$ & \texttt{ModelConfig::max\_entities} & $64$ \\
-$\mathcal{F}$ & \texttt{ModelConfig::fractions} & $\{.25,.5,.75,1\}$ \\
+$E$ & \texttt{ModelConfig::max\_entities} & $40$ \\
+$K$ & \texttt{ModelConfig::fleets\_per\_planet} (continuous/native only; leading target uses none) & $5$ \\
+$\tau_{\mathrm{act}}$ & \texttt{ModelConfig::act\_threshold} (fleet-commit) & $0.05$ \\
+\texttt{use\_glu} & \texttt{ModelConfig::use\_glu} (trunk A/B), $n_{\mathrm{res}}$ & true,\ $2$ \\
+\texttt{USE\_ATTENTION} & cross-planet self-attention block (notebook A/B ablation) & true \\
+$n_v$ & \texttt{VALUE\_RES\_BLOCKS} (critic depth; residual, same block as trunk) & $2$ \\
+$[\varsigma_{\min},\varsigma_{\max}]$ & \texttt{ModelConfig} log-std clip & $[-2,\ 1]$ \\
+$\varsigma_{\max}^{\,\mathrm{end}}$ & \texttt{logstd\_max\_end} (phase-1 forced-decay target) & $=\varsigma_{\max}$ (off) \\
+$\varsigma_{\max}^{\,\mathrm{post}}$ & \texttt{logstd\_max\_post} (phase-2 head cap) & $=\varsigma_{\max}^{\,\mathrm{end}}$ \\
+$N_{\sigma}$ & \texttt{sigma\_decay\_iters} (phase-1 length, iters) & $0$ (off) \\
+\texttt{std\_state\_dependent} & \texttt{ModelConfig} (\(\varsigma\) head vs vector) & true \\
+\texttt{init\_mu\_scale} & \texttt{ModelConfig} (calm-init mean-head weight scale) & $0.02$ \\
+\texttt{init\_phi\_bias} & \texttt{ModelConfig} (calm-init $\phi$ bias at step $0$) & $-4.0$ \\
+\texttt{action\_mask\_policy} & \texttt{ModelConfig} (hard-mask actor to legal slots) & false \\
+\texttt{target\_actor} & \texttt{ModelConfig} (false $\Rightarrow$ continuous $(d^x,d^y,\phi)$ actor) & false \\
 $G,\,N$ & \texttt{GrpoConfig::group\_size}, \texttt{num\_groups} & $8,\ 64$ \\
 $\epsilon$ & \texttt{GrpoConfig::clip} & $0.2$ \\
 $\beta$ & \texttt{GrpoConfig::kl\_beta} & $0.04$ \\
@@ -305,8 +1422,44 @@ $c_{\mathcal H}$ & \texttt{GrpoConfig::ent\_coef} & $0.01$ \\
 $\varepsilon$ & \texttt{GrpoConfig::adv\_eps} & $10^{-4}$ \\
 $w_{\mathrm d},\,w_{\mathrm o}$ & \texttt{GrpoConfig::dense\_weight}, \texttt{outcome\_weight} & $1,\ 1$ \\
 $\gamma$ & \texttt{GrpoConfig::gamma} & $1.0$ \\
-$w_{\Phi}$ & \texttt{RolloutConfig::prod\_weight} & $20$ \\
-$\sigma,\,\kappa$ & \texttt{RolloutConfig::reward\_scale}, \texttt{reward\_clip} & $50,\ 5$ \\
+$w_{\Pi},\,P_{\max}$ & \texttt{prod\_reward\_weight}, \texttt{prod\_reward\_cap} & $2.5,\ 100$ \\
+$\delta_{\Pi}$ & \texttt{prod\_reward\_decay} (per-step prod decay) & $0.997$ \\
+$w_{\mathrm v},\,V_{\max}$ & \texttt{valid\_launch\_reward}, \texttt{valid\_reward\_cap} & $0.02,\ 30$ \\
+$\rho$ & \texttt{illegal\_launch\_penalty} (uncapped $I$) & $0.005$ \\
+$\rho_{\mathrm m}$ & \texttt{miss\_launch\_penalty} (uncapped $M$, aiming stick) & $0.01$ \\
+win/loss & \texttt{win\_bonus}, \texttt{loss\_penalty} (legacy default; run uses $1000$) & $300,\ 100$ \\
+$w_{\mathrm e}$ & \texttt{enemy\_growth\_weight} (off in the run) & $0.5$ \\
+$x_0,\,\beta$ & \texttt{enemy\_growth\_warmup}, \texttt{enemy\_growth\_ema} & $50,\ 0.1$ \\
+\midrule
+\multicolumn{3}{@{}l@{}}{\emph{\texttt{set-ups/1.md} event reward (defaults off; the run sets them):}}\\
+$\delta_{\mathrm o}$ & \texttt{win\_decay}, \texttt{loss\_decay} (run: $0.995$) & $1.0$ \\
+$L_0$ & \texttt{decay\_start\_step} (win/loss flat until this step; run: $100$) & $0$ \\
+$w_{\mathrm c}$ & \texttt{capture\_reward} (run: $30$) & $0$ \\
+$w_{\mathrm d},\,N_{\mathrm d}$ & \texttt{dispatch\_reward}, \texttt{dispatch\_count} (run: $1,\,50$) & $0,\ 50$ \\
+$w_{\mathrm m}$, base & \texttt{prod\_milestone\_reward}, \texttt{prod\_milestone\_base} (run: $20,\,100$) & $0,\ 100$ \\
+$\sigma_R$ & \texttt{ppo\_reward\_scale} ($=$\texttt{reward-scale}; run: $100$) & $1.0$ \\
+\multicolumn{3}{@{}l@{}}{\emph{PPO\,+\,GAE (\texttt{PpoConfig}; \texttt{algo="ppo"}):}}\\
+$\lambda$ & \texttt{ppo.gae\_lambda} & $0.95$ \\
+$\gamma_{\mathrm{ppo}}$ & \texttt{ppo.gamma} (GAE discount) & $0.99$ \\
+$c_V$ & \texttt{ppo.vf\_coef} (value-loss weight) & $0.5$ \\
+\texttt{selfplay\_prob} & \texttt{RolloutConfig} (stage-4 self-play fraction) & $0.5$ \\
+\multicolumn{3}{@{}l@{}}{\emph{Allocation actor $+$ reachability $+$ Elo league (notebook \texttt{setup1\_target\_ppo.ipynb}):}}\\
+\texttt{POLICY\_MODE} & \texttt{"ppo"} (per-source Dirichlet) vs.\ \texttt{"mcts"} (search priors; stub) & ppo \\
+$\kappa$ & \texttt{ALLOC\_KAPPA} (Dirichlet concentration scale, $\alpha=\operatorname{softplus}(\ell)\kappa+\epsilon$) & --- \\
+$n_{\min}$ & \texttt{MIN\_LAUNCH\_SHIPS} (below this, an off-diagonal entry is held not launched) & $1$ \\
+\texttt{LEAD\_TARGET} & aim at orbital intercept (Section~\ref{sec:lead}) vs.\ static target & true \\
+\texttt{REACH\_MASK}, $r_\odot$ & sun-reachability mask; \texttt{SUN\_RADIUS} disk & true,\ $10$ \\
+$r_\theta(0)$, $r_{\mathrm{rand}},r_{\mathrm{start}}$ & \texttt{ELO\_INIT}; anchored \texttt{ELO\_RANDOM}/\texttt{ELO\_STARTER} & $0$;\ $0,600$ \\
+$K$ & \texttt{ELO\_K} (raised: Elo now drives sampling) & $32$ \\
+PFSP & \texttt{PFSP\_MODE}, \texttt{PFSP\_FLOOR} & even,\ $0.05$ \\
+pool & \texttt{LEAGUE\_MAX\_SNAPSHOTS}, \texttt{SELFPLAY\_REFRESH} & $12,\ 100$ \\
+no stages & \texttt{TOTAL\_ITERS}, \texttt{SNAPSHOT\_WARMUP} (league $=$ curriculum) & $1400,\ 100$ \\
+\midrule
+stage & \texttt{RolloutConfig::stage} & $2$ \\
+\texttt{gpu\_env} & \texttt{RolloutConfig} (on-device rollout, Section~\ref{sec:gpuenv}) & false \\
+$E_c$ & \texttt{RolloutConfig::planet\_cap}, \texttt{fleet\_cap} & $48,\ 1024$ \\
+\texttt{N\_SOON}, \texttt{N\_BIG} & per-planet inbound fleets: soonest / largest (\texttt{encode.hpp}) & $15,\ 15$ \\
+$d_g$ & board-globals embedding dim (\texttt{ModelConfig}) & $32$ \\
 $\eta$ & \texttt{OptimConfig::lr} & $3\!\times\!10^{-4}$ \\
 \bottomrule
 \end{tabular}
@@ -314,18 +1467,186 @@ $\eta$ & \texttt{OptimConfig::lr} & $3\!\times\!10^{-4}$ \\
 
 \appendix
 %==============================================================
-\section{Appendix: the PPO/GAE method being replaced}
-The previous trainer (\texttt{native/rl/trainer.hpp}) used actor--critic PPO with a value head
-$V_\phi$ and Generalized Advantage Estimation. For completeness, with TD residual
-$\delta_t = r_t + \gamma V_\phi(s_{t+1}) - V_\phi(s_t)$,
+\section{Appendix: PPO\,+\,GAE (the current default algorithm)}\label{sec:ppo}
+The \texttt{set-ups/1.md} run trains with \textbf{actor--critic PPO\,+\,GAE}
+(\texttt{TrainConfig::algo="ppo"}, which sets \texttt{ModelConfig::use\_value\_head}); GRPO of
+Section~\ref{sec:grpo} is the alternative. PPO adds a value head $V_\phi$ (the critic: a masked-mean pool
+of the post-trunk tokens over live planets, concatenated with the globals embedding $g'$, then an input
+projection $d{+}d_g\to d$, \texttt{VALUE\_RES\_BLOCKS} \textbf{pre-LayerNorm residual MLP blocks} --- the
+\emph{same} ResNet block as the trunk, $z\mapsto z+W_b\,\relu(W_a\,\mathrm{LN}(z))$, so every hidden MLP
+layer in the network is residual with the skip running all the way through --- and a $d\to 1$ readout) and
+uses Generalized Advantage Estimation so the \emph{per-step} reward
+$r_t=C_t+D_t+P_t$ of Section~\ref{sec:reward} (with the outcome $O$ scattered onto the last step) reaches
+the policy gradient temporally --- the credit assignment that GRPO discards by collapsing each
+trajectory to a single episode return. With TD residual
+$\delta_t = r_t + \gamma V_\phi(s_{t+1}) - V_\phi(s_t)$ and the alive/done masks of the rollout,
 \begin{align}
 \Adv^{\mathrm{GAE}}_t &= \sum_{l\geq 0}(\gamma\lambda)^{l}\,\delta_{t+l},
 &
 \mathcal{L}^{V} &= \tfrac12\,\big(V_\phi(s_t) - \hat R_t\big)^2,
 \quad \hat R_t = \Adv^{\mathrm{GAE}}_t + V_\phi(s_t),
 \end{align}
-and total loss $\mathcal{L}^{\mathrm{clip}} + c_V\,\mathcal{L}^{V} - c_{\mathcal H}\overline{\mathcal H}$.
-GRPO removes $V_\phi$ (and thus $\lambda$, $c_V$, and value warmup) entirely, replacing
-$\Adv^{\mathrm{GAE}}_t$ with the group-relative $\Adv_i$ of Eq.~\eqref{eq:adv}.
+with discount $\gamma=$\texttt{ppo.gamma}$=0.99$ (GAE applies it, so the reward must \emph{not}
+pre-discount) and trace decay $\lambda=$\texttt{gae\_lambda}$=0.95$; an env alive at the time cap
+bootstraps with $V_\phi(s_T)$, while a true death contributes no bootstrap. The total loss reuses the
+clipped surrogate \eqref{eq:clip}, KL anchor \eqref{eq:kl}, and entropy bonus of the GRPO objective with
+$\Adv_i$ replaced by $\Adv^{\mathrm{GAE}}_t$, plus the value loss at weight
+$c_V=$\texttt{vf\_coef}$=0.5$:
+\[
+\mathcal{L} = \mathcal{L}^{\mathrm{clip}} + \beta\,\mathcal{L}^{\mathrm{KL}}
+            + c_V\,\mathcal{L}^{V} - c_{\mathcal H}\,\overline{\mathcal H}.
+\]
+PPO reuses \texttt{GrpoConfig}'s \texttt{clip}, \texttt{ent\_coef}, \texttt{update\_epochs},
+\texttt{minibatches}, and \texttt{kl\_beta}. Conversely, GRPO (Section~\ref{sec:grpo}) removes $V_\phi$
+(and thus $\lambda$, $c_V$, and value warmup), replacing $\Adv^{\mathrm{GAE}}_t$ with the
+group-relative $\Adv_i$ of Eq.~\eqref{eq:adv}.
+
+%==============================================================
+\section{Appendix: search-based policy improvement --- the AlphaZero/MuZero family}\label{sec:search}
+PPO improves the policy with a \emph{first-order} gradient on sampled returns. The AlphaZero/MuZero
+family instead improves it by \emph{planning}: at each state a tree search produces a \emph{locally
+improved} policy $\pi'$ and a sharpened value, and the network is trained to imitate them. Discretizing
+the action (Section~\ref{sec:dist}) was the prerequisite, so this appendix maps the family onto Orbit
+Wars: what transfers directly, the three obstacles our game poses, and which post-MuZero paper resolves
+each. This is the planned successor to PPO, not yet implemented.
+
+\subsection{What maps directly: AlphaZero, not MuZero}
+MuZero (Schrittwieser et al., 2020) learns a \emph{model} --- a representation $h$, a dynamics function
+$g$, and a reward head --- precisely because Atari/real domains give no usable simulator. \textbf{We have
+the opposite situation:} \texttt{GpuEnv} (Section~\ref{sec:gpuenv}) is a perfect, deterministic,
+\emph{batched and cheaply cloneable} simulator (state is flat SoA tensors; a node is a tensor slice
+copy). So the learned model is unnecessary --- \textbf{AlphaZero} (Silver et al., 2018), which searches
+with the \emph{real} model, is the template. The components line up as:
+\begin{center}\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+MuZero component & Orbit Wars analogue & Status \\
+\midrule
+representation $h_\theta(o)\!\to\! s$ & encoder $X,g$ (Section~\ref{sec:obs}) + trunk (Section~\ref{sec:policy}) & exists \\
+dynamics $g_\theta(s,a)\!\to\! s'$ & the real \texttt{GpuEnv} step (perfect) & exists; \textbf{not learned} \\
+reward head $r_\theta(s,a)$ & the real event reward (Section~\ref{sec:reward}) & exists; \textbf{not learned} \\
+prediction policy $p_\theta(s)$ & factored actor $\prod_{s:\text{owned}}\mathrm{Dirichlet}(\alpha_s)$ (per-source allocation, Section~\ref{sec:dist}) & exists \\
+prediction value $v_\theta(s)$ & value head $V_\phi$ (the PPO critic, Appendix~\ref{sec:ppo}) & exists \\
+\bottomrule
+\end{tabular}
+\end{center}
+Our network is therefore \emph{already} an AlphaZero ``prediction function'': a policy prior $+$ a leaf
+value. Three things still stand between us and a working search.
+
+\subsection{Obstacle 1: a combinatorial (factored) action space}
+A turn commits one allocation simplex $A[s,\cdot]\in\Delta^{E-1}$ per \emph{owned} planet, so even
+after discretizing each $E$-way row into a finite grid of allocations the joint action is the product
+$\prod_{s:\text{owned}}(\text{grid over }\Delta^{E-1})$ --- with $E{=}48$ destinations per source and
+several owned sources this is astronomically large. AlphaZero's enumerate-all-children PUCT is hopeless.
+The fix is the post-MuZero line for large/structured actions:
+\begin{itemize}[nosep]
+\item \textbf{Sampled MuZero} (Hubert et al., 2021, ``Learning and Planning in Complex Action Spaces'')
+samples $m$ actions from a proposal $\beta$ (take $\beta=\pol$, our factored prior --- sampling the joint
+is just sampling each owned source's allocation row) and searches over \emph{only} those $m$.
+To stay unbiased it replaces the
+PUCT prior of a sampled action by $\hat\beta(a)/\beta(a)\cdot\pol(a)$ (with $\hat\beta$ the empirical
+sample frequency; for $\beta=\pol$ this is $\hat\beta$), so the sampled improvement equals the
+full-action improvement \emph{in expectation}.
+\item \textbf{Gumbel MuZero} (Danihelka et al., 2022) samples \emph{without} replacement via the
+Gumbel-Top-$k$ trick, which is strictly more informative than Sampled MuZero's with-replacement draws and
+--- crucially --- gives a \emph{guaranteed} policy improvement at \emph{any} simulation budget
+(Section~\ref{sec:search}.3). This is our recommended root algorithm.
+\item \textbf{Multiagent Gumbel MuZero} treats exactly our case --- a joint action factored over
+``agents'' (here, owned planets) --- by drawing the Gumbel-Top-$k$ \emph{per factor} and evaluating the
+sampled \emph{joint} actions, so cost scales with the number of \emph{samples}, not the size of the
+product space.
+\end{itemize}
+The reachability mask (Section~\ref{sec:dist}) helps here too: it shrinks each source row's
+destination support \emph{before} sampling, so the $m$ sampled joint actions are all legal and
+on-target.
+
+\subsection{Obstacle 2: very few simulations --- Gumbel policy improvement}
+Because the net is deep and each ``simulation'' is a real (batched) env step plus a forward, we can
+afford only a handful of sims per state. Gumbel MuZero is built for exactly this. With prior logits
+$\mathrm{logits}(a)$ and per-action search value $q(a)$:
+\begin{description}[nosep,leftmargin=1.4em]
+\item[Root sampling.] Draw $g\sim\mathrm{Gumbel}(0)$ and take the top-$m$ actions
+$\mathcal A_{\mathrm{top}m}=\operatorname{argtop}_m\!\big(g(a)+\mathrm{logits}(a)\big)$ --- equivalent to
+sampling $m$ distinct actions from $\pol$.
+\item[Budget allocation.] \textbf{Sequential Halving} splits $n$ sims over $\log_2 m$ phases: visit the
+current candidates equally, then drop the worse half by $g+\mathrm{logits}+\sigma(\hat q)$, repeat.
+\item[Action chosen / guarantee.] $A^\star=\arg\max_{a\in\mathcal A_{\mathrm{top}m}}\!\big(g(a)+
+\mathrm{logits}(a)+\sigma(q(a))\big)$, with the monotone scale
+\begin{equation}
+\sigma(\hat q(a)) = \big(c_{\mathrm{visit}} + \max_b N(b)\big)\,c_{\mathrm{scale}}\,\hat q(a),
+\qquad c_{\mathrm{visit}}{=}50,\ c_{\mathrm{scale}}{=}1.
+\end{equation}
+This \emph{provably improves} on the prior at any $n$: $q(A^\star)\ge q(\arg\max_a(g(a)+\mathrm{logits}(a)))$,
+hence $\E[q(A^\star)]\ge\sum_a\pol(a)q(a)$ --- unlike ``act greedily on the top-$n$,'' which can
+\emph{worsen} the policy.
+\item[Improved-policy target (completed $Q$).] Define
+$\mathrm{completedQ}(a)=q(a)$ if $a$ was visited, else $v_\theta$ (the value approximation, with
+$v_\pi=\sum_a\pol(a)q(a)$); then the training target is
+\begin{equation}
+\pi'=\softmax\!\big(\mathrm{logits}+\sigma(\mathrm{completedQ})\big).
+\label{eq:gumbel-target}
+\end{equation}
+This labels \emph{all} actions (not just $A^\star$) and assigns unvisited actions zero advantage.
+\item[Non-root selection.] Inside the tree, descend deterministically by
+$\arg\max_a\big(\pi'(a)-\tfrac{N(a)}{1+\sum_b N(b)}\big)$ (Grill et al., 2020, MCTS as regularized
+policy optimization) --- visit the action whose visit share most lags $\pi'$.
+\end{description}
+Here each $q(a)$ is obtained by stepping the real env to the child and bootstrapping with $V_\phi$ (plus
+the one-step event reward of Section~\ref{sec:reward}), i.e.\ a depth-1 (or shallow $n$-step) search; the
+value head we already train under PPO is the leaf evaluator.
+
+\subsection{Obstacle 3: simultaneous moves and a hidden opponent}
+AlphaZero assumes a \emph{sequential, perfect-information} game; Orbit Wars is \emph{simultaneous}
+(both sides act each tick) and from ego's view the opponent's move is hidden, so the transition
+$s\!\to\!s'$ under ego action $a$ is \emph{stochastic}. Two clean resolutions, both leaning on machinery
+we already have:
+\begin{itemize}[nosep]
+\item \textbf{Opponent-as-chance (recommended).} The Stage-4 opponent is a \emph{frozen league policy}
+$\mu$ we fully control (Section~\ref{sec:league}). Treat its move as a \emph{chance event}: a search node
+is (ego decision) $\to$ (sample $K_o$ opponent actions $a^o\!\sim\!\mu(\cdot\mid s)$) $\to$ (deterministic
+env step), and back up the \emph{expectation} over $a^o$. This is precisely the \emph{afterstate /
+chance-node} construction of \textbf{Stochastic MuZero} (Antonoglou et al., 2022) --- except we need
+\emph{no} learned chance model, because $\mu$ is a known network we can query. Averaging over a PFSP
+\emph{mixture} of league opponents additionally makes $\pi'$ a best response to the \emph{population},
+not to one snapshot (anti-cycling, as in Section~\ref{sec:league}).
+\item \textbf{Simultaneous-move search.} Alternatively, solve the per-node $2$-player \emph{matrix game}
+over the (sampled) joint actions --- decoupled UCB / regret matching at each node (cf.\ ReBeL,
+Brown et al., 2020, for the imperfect-information generalization). Stronger game-theoretically (targets a
+Nash rather than a best response) but materially more complex; the opponent-as-chance route is the
+pragmatic first cut.
+\end{itemize}
+
+\subsection{Targets, loss, and the training-loop change}
+Search converts each visited state into supervised targets, replacing PPO's clipped surrogate:
+\begin{equation}
+\mathcal L_{\mathrm{AZ}}(\theta) = \underbrace{\mathrm{KL}\big(\pi'\,\|\,\pol\big)}_{\text{policy distill, Eq.~\eqref{eq:gumbel-target}}}
+\;+\; c_V\,\big(V_\phi(s)-z\big)^2 \;+\; c_{\mathrm{reg}}\lVert\theta\rVert^2,
+\end{equation}
+where $\pi'$ is the Gumbel improved policy (factorized back to the per-planet heads via the per-factor
+marginals of the sampled joint actions) and the value target $z$ is the search root value (an $n$-step
+return bootstrapped by the backed-up tree value), or the game outcome $O$ for terminal-anchored
+training. Two carry-overs from the family:
+\begin{itemize}[nosep]
+\item \textbf{Reanalyze} (MuZero / EfficientZero, Ye et al., 2021): because the simulator is perfect and
+cheap, stored trajectories can be \emph{re-searched} with the \emph{latest} network to refresh
+$(\pi',z)$, turning the on-policy rollout into reusable, near-on-policy data --- a large sample-efficiency
+win and the main thing EfficientZero contributes that survives having a perfect model (its
+self-supervised consistency loss and value-prefix target are \emph{model-learning} fixes we do not need).
+\item \textbf{The factored actor and both masks are unchanged}; only the \emph{target} the heads chase
+changes (search $\pi'$ instead of the PPO advantage). The value head, reachability/validity masks, GPU
+rollout, and Elo league all transfer as-is --- the league in fact \emph{supplies} the opponent
+distribution that Obstacle~3 plans against.
+\end{itemize}
+
+\subsection{Minimal first cut for Orbit Wars}
+A concrete, low-risk instantiation: \textbf{Gumbel AlphaZero with sampled factored actions and
+opponent-as-chance}, depth-1 (value-bootstrapped) to start. Per training state: (1) sample $m$ joint
+actions from the masked factored prior via per-factor Gumbel-Top-$k$; (2) for each, sample $K_o$ league
+opponent moves, step \texttt{GpuEnv}, and score $q=\bar r + \gamma V_\phi(s')$ averaged over $a^o$;
+(3) pick $A^\star$ and form $\pi'$ by Eq.~\eqref{eq:gumbel-target}; (4) train heads to $\pi'$ and
+$V_\phi$ to the backed-up value. This reuses every existing piece, needs only a state
+snapshot/restore on \texttt{GpuEnv} and a small search loop, and degrades gracefully to current PPO
+when $m{=}1$ (no search). Deepening the tree (multi-ply sequential halving) and upgrading
+opponent-as-chance to a simultaneous-move solve are the follow-ons.
 
 \end{document}

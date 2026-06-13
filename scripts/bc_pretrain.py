@@ -119,7 +119,9 @@ def main():
     args = ap.parse_args()
 
     import os
-    cache = f"runs/_worldcache/bc_data_s{args.seeds}_t{args.steps}_e{args.sample_every}.npz"
+    # Feature count in the key: the cache stores encoded obs, so it must invalidate whenever
+    # the encoder feature layout changes (e.g. the threat features bumped F 15 -> 20).
+    cache = f"runs/_worldcache/bc_data_s{args.seeds}_t{args.steps}_e{args.sample_every}_f{N_ENTITY_FEATURES}.npz"
     if os.path.exists(cache):
         d = np.load(cache)
         ent, em, am, gl, lab, lm = d["ent"], d["em"], d["am"], d["gl"], d["lab"], d["lm"]

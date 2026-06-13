@@ -1,6 +1,15 @@
 # Orbit Wars — experiment log
 
-> **TL;DR of the session.** Built a fast comet-aware arena (the fitness function), found the
+> **UPDATE 2026-06-04 — RL now beats starter without search.** Three changes broke the old
+> "RL plateaus at 0–2% vs starter" wall: (1) **threat-aware obs** (5 incoming-fleet features so a
+> reactive policy can defend), (2) a **GLU/ResNet trunk**, (3) a **properly-trained BC** (800
+> seeds/18 epochs, launch-acc 0.78 — the earlier BC was under-trained). Result: BC *alone* =
+> **99.5% vs random, 52% vs starter**; GRPO with the redesigned **production-only + loss-forfeit**
+> reward then climbs past it (≥55% vs starter, 99.5% vs random, and rising). See
+> "Threat-aware obs + curriculum" below and `rl_math.pdf`. The search agent (next paragraph) remains
+> a deployable fallback / further booster, but a trained policy now clears starter on its own.
+
+> **TL;DR of the earlier cycles.** Built a fast comet-aware arena (the fitness function), found the
 > trained policies were *worse than random*, and traced it through three fixes:
 > production-aware reward → target-based actions → **pointer actor** (the architectural unlock:
 > BC vs random 22%→96%). The remaining wall is **vs starter (~0–2% across all RL configs)**: the
@@ -96,6 +105,58 @@ and put the compute into **inference search on top of the fixed BC policy**.
 3. **BC quality**: launch_acc 0.72; more data/epochs or the attention encoder should raise it,
    giving a stronger warm start (closer to starter before any RL).
 4. **Don't expect plain PPO/self-play to beat starter** with the current encoder — measured flat.
+
+## Threat-aware obs + 3-stage curriculum (2026-06-04)
+
+Directly attacks the documented wall (over-extension / no defense; Open-thread #2 named
+"per-planet threat awareness" as the defensive lever). Two changes on the GRPO stack:
+
+1. **Threat-aware encoder (F 15→20).** Five per-planet incoming-fleet features from a closed-form
+   ray–circle projection of each in-flight fleet (which planet it reaches, ETA): `incoming_enemy_ships`,
+   `enemy_imminence` $=e^{-\tau/8}$, `incoming_ally_ships`, `ally_imminence`, and a `hold_margin`
+   $=\tanh((\text{ships}+\text{prod}\cdot\tau+\text{help}-\text{attack})/100)$. Fleets that hit nothing
+   (or cross the sun first) are filtered. **Parity-exact** C++↔Python (`test_encode_parity`, 0 mismatch).
+   This bakes search's threat-lookahead into the observation, so a *reactive* policy can finally defend.
+2. **Curriculum** (`RolloutConfig::stage`, see `rl_math.pdf` §6): Stage 1 solo expansion (passive
+   opponent, solo potential, $\gamma=0.99$ takeover-time discount) → Stage 2 1v1 vs starter
+   ($\gamma=1$, margin potential + win) → Stage 3 mixed. Each stage warm-starts + KL-anchors from
+   the previous (anchor-and-advance), re-BC'd at F=20 (acc 0.79 / launch-acc 0.41).
+
+| id | change | steps | vs random | vs starter | notes |
+|----|--------|-------|-----------|------------|-------|
+| s1 (weak BC) | Stage-1 solo from an 8-epoch BC | ~0.9M | ~31% | ~0.5% | conquers passive map (ep_len≈265) but the *seed was under-trained* — see below |
+| s2 (weak BC) | Stage-2 vs starter from s1 | ~0.2M | ~29% | ~0.5% | flat — doomed by the weak seed, not the method |
+
+### Two changes after s1/s2: GLU trunk + a properly-trained BC (the unlock)
+
+1. **GLU/ResNet trunk** (`#1/#4`): each encoder = 2-layer MLP **+ one residual GLU block**
+   (`out = x + W_o((W_v x)·σ(W_g x))`), mirrored across the training net, the arena net, and the
+   Python serving net. **Parity-verified**: Python and C++ greedy eval of the same checkpoint agree
+   exactly (both 0.285 vs random for the weak BC — a forward-parity check, not a strength claim).
+2. **BC was under-trained.** 8 epochs gave launch-acc **0.40** → only 28.5% vs random. Re-running
+   at **800 seeds / 18 epochs** lifted launch-acc to **0.78** (peak 0.87).
+
+**Strong GLU BC eval (the breakthrough): 99.5% vs random, 52.0% vs starter** — behavior cloning
+*alone* now beats starter half the time (the prior 15-feat MLP BC was 9.8%). GLU capacity + the
+threat features give the policy enough defensive awareness to hold its own; the earlier 0–2% wall
+was a weak-seed + blind-obs artifact.
+
+### Reward redesign (production-only + launch quality + loss forfeit)
+
+Per the new problem-setup insight: the old margin potential let the agent maximize ships/planets
+yet lose. New reward (rl_math.pdf §5): dense = `w_Π·Δ(own production) + ρ⁺·#launch-hits − ρ⁻·#launch-misses`
+(no planet-count/ship term; a fleet aimed to land nowhere is penalized instantly via the §2
+projection); return **forfeits the accumulated reward on a loss** (`R=−D−w_o`), so "hoard then lose"
+scores strongly negative. Works cleanly now that the BC wins ~52% (groups contain winners, so the
+forfeit separates win-behavior from lose-behavior instead of rewarding passivity).
+
+| id | change | steps | vs random | vs starter | notes |
+|----|--------|-------|-----------|------------|-------|
+| win1 | GRPO vs starter from strong GLU BC, new reward (γ=1, kl_β=0.03, w_o=3) | 5M (cap) | _running_ | _running_ (from **52%**) | push past the 52% BC baseline |
+
+Throughput: episodic GRPO ≈ **530 transitions/s** at 512 envs (full-episode Monte-Carlo, no value
+bootstrap — ~40× costlier/step than the old truncated-GAE PPO, but the only-baseline-is-the-group
+trade GRPO makes). 5M steps ≈ 2.6h; `best.owc` lets a run be stopped early.
 
 ### The pointer-actor breakthrough (Cycle 3)
 The MLP actor maps `[tok_r ++ mean_pooled_core] → logits over target slots`, but that input has

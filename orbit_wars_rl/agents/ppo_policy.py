@@ -55,6 +55,13 @@ class EntityPolicy(nn.Module):
         self.entity_encoder = _mlp([n_entity_features, hidden, hidden])
         self.context_encoder = _mlp([hidden + n_global_features, hidden, hidden])
         self.critic = _mlp([hidden, hidden, 1])
+        # Residual GLU block per encoder: out = x + W_o( (W_v x) * sigmoid(W_g x) ).
+        self.ent_glu_gate = nn.Linear(hidden, hidden)
+        self.ent_glu_val = nn.Linear(hidden, hidden)
+        self.ent_glu_out = nn.Linear(hidden, hidden)
+        self.ctx_glu_gate = nn.Linear(hidden, hidden)
+        self.ctx_glu_val = nn.Linear(hidden, hidden)
+        self.ctx_glu_out = nn.Linear(hidden, hidden)
         if target_mode:
             # Pointer actor: logit(r,t,f) = <q_f(tok_r,core), k(tok_t)>; the score depends
             # on BOTH launcher and target encodings, so target selection (e.g. "nearest
@@ -74,6 +81,7 @@ class EntityPolicy(nn.Module):
         glob = obs["globals"]                      # (B,G)
 
         tok = self.entity_encoder(ent)             # (B,E,h)
+        tok = tok + self.ent_glu_out(self.ent_glu_val(tok) * torch.sigmoid(self.ent_glu_gate(tok)))
 
         # Masked mean over real entities -> board summary.
         m = ent_mask.unsqueeze(-1)                 # (B,E,1)
@@ -81,6 +89,7 @@ class EntityPolicy(nn.Module):
         count = m.sum(dim=1).clamp_min(1.0)
         pooled = summed / count                    # (B,h)
         core = self.context_encoder(torch.cat([pooled, glob], dim=-1))  # (B,h)
+        core = core + self.ctx_glu_out(self.ctx_glu_val(core) * torch.sigmoid(self.ctx_glu_gate(core)))
 
         core_b = core.unsqueeze(1).expand(-1, tok.size(1), -1)          # (B,E,h)
         if self.target_mode:
