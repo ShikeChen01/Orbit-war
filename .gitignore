@@ -13,6 +13,10 @@ submission_kaggle.py
 
 # local scratch / investigation dumps
 _*.py
+# but never ignore package __init__.py (the _*.py rule matches it by accident)
+!__init__.py
+# root-level scratch archive (old logs, superseded monkeypatches, throwaway tests)
+/archive/
 *.log
 out.txt
 err.txt
