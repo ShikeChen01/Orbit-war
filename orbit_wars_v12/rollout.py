@@ -2,7 +2,8 @@
 
 ``collect_ppo`` plays the learner (player 0) against ``seats`` (league members filling pids
 1..n_players-1) across ``cfg.B`` parallel envs, with seat-swap world tiling, potential-based
-reward shaping (or the legacy dense channels), terminal outcome payment, and GPU GAE -- returning
+reward shaping (or the legacy dense channels), terminal outcome payment, and an advantage estimate
+-- GPU GAE for PPO, or a per-group standardized return for GRPO (``cfg.ALGO == "grpo"``) -- returning
 a flattened transition buffer + heartbeat stats. n_players=2 is the v7 path.
 """
 import torch
@@ -47,7 +48,31 @@ def collect_ppo(cfg, env, net, world_pool, cursor, rng, seats, n_players=2, n_en
     # The 4-fold-symmetric board makes k*90deg an EXACT seat remap; sharing each world across the
     # P seat-blocks lets the normalized advantages cancel that world's positional bias.
     P = int(n_players)
-    if cfg.SEAT_SWAP and P in _SEAT_ROT and Bn % P == 0:
+    grpo = (cfg.ALGO == "grpo")
+    phi_value = grpo and cfg.GRPO_PHI_VALUE and cfg.USE_POTENTIAL_SHAPING   # [C] Phi-as-value GAE (needs the potentials)
+    crn = grpo and cfg.GRPO_CRN                                             # [D] common-random-numbers opponent coupling
+    if grpo:
+        # GRPO render: tile nW distinct worlds into contiguous groups of G envs (one group = one
+        # world rolled out G times) so the per-group baseline cancels that world's difficulty. Each
+        # group gets a SINGLE seat geometry, cycling _SEAT_ROT across groups so the ego still trains
+        # on every seat without breaking within-group homogeneity.
+        G = cfg.GRPO_GROUP or cfg.GROUP_SIZE
+        if G <= 0 or Bn % G != 0:
+            G = Bn                                         # fallback: the whole batch is one group
+        nW = Bn // G
+        base = [world_pool[(cursor + i) % len(world_pool)] for i in range(nW)]
+        cursor += nW
+        worlds = [w for w in base for _ in range(G)]       # base[0]xG, base[1]xG, ... (contiguous groups)
+        if cfg.SEAT_SWAP and P in _SEAT_ROT:
+            rots = _SEAT_ROT[P]
+            rk = torch.empty(Bn, 1, dtype=torch.long, device=dev)
+            for g in range(nW):
+                rk[g * G:(g + 1) * G, 0] = rots[g % len(rots)]   # one seat geometry per group
+            env._rot_k = rk; env._rot_aug = True
+        else:
+            env._rot_k = None; env._rot_aug = False
+        _grp = (G, nW)
+    elif cfg.SEAT_SWAP and P in _SEAT_ROT and Bn % P == 0:
         W = Bn // P
         base = [world_pool[(cursor + i) % len(world_pool)] for i in range(W)]
         cursor += W
@@ -56,10 +81,12 @@ def collect_ppo(cfg, env, net, world_pool, cursor, rng, seats, n_players=2, n_en
         for b, kk in enumerate(_SEAT_ROT[P]):
             rk[b * W:(b + 1) * W, 0] = kk                  # block b -> seat rotation kk
         env._rot_k = rk; env._rot_aug = True
+        _grp = None
     else:
         worlds = [world_pool[(cursor + i) % len(world_pool)] for i in range(Bn)]
         cursor += Bn
         env._rot_k = None; env._rot_aug = False
+        _grp = None
     env.reset(worlds, n_players=n_players)
 
     # on-GPU rollout buffers (compute-bound: no host copies, no per-step D2H sync)
@@ -68,6 +95,7 @@ def collect_ppo(cfg, env, net, world_pool, cursor, rng, seats, n_players=2, n_en
     gl_buf = torch.zeros(T, Bn, G_DIM, device=dev); act_buf = torch.zeros(T, Bn, Ec, Ec + 1, device=dev)
     oldlp_buf = torch.zeros(T, Bn, device=dev); valid_buf = torch.zeros(T, Bn, device=dev)
     rew_buf = torch.zeros(T, Bn, device=dev); val_buf = torch.zeros(T, Bn, device=dev); done_buf = torch.zeros(T, Bn, device=dev)
+    phi_buf = torch.zeros(T, Bn, device=dev) if phi_value else None        # [C] Phi(s_t) per step, fed to the V_hat baseline
 
     active = torch.ones(Bn, device=dev); outcome = torch.zeros(Bn, device=dev)
     seat_sc = torch.zeros(len(specs), Bn, device=dev)   # pairwise score vs each seat, frozen at term
@@ -95,6 +123,8 @@ def collect_ppo(cfg, env, net, world_pool, cursor, rng, seats, n_players=2, n_en
     last_t = 0
     for t in range(T):
         last_t = t
+        if phi_value:                       # Phi(s_t): phi_*_prev still holds the current state (s_0, or s_t from the prior step)
+            phi_buf[t] = cfg.SHAPE_SHIP * phi_ship_prev + cfg.SHAPE_PROD * phi_prod_prev
         ent, em, am, gl = env_encode(env, 0)
         a_t, logp, value = act(cfg, net, ent, em, am, gl, greedy=False)
         ent_buf[t] = ent; em_buf[t] = em; am_buf[t] = am; gl_buf[t] = gl
@@ -105,7 +135,10 @@ def collect_ppo(cfg, env, net, world_pool, cursor, rng, seats, n_players=2, n_en
             if "net" in sp:
                 with torch.no_grad():
                     oe, om, oa, og = env_encode(env, sp["pid"])
-                    o_act, _, _ = act(cfg, sp["net"], oe, om, oa, og, greedy=False)
+                    # [D] CRN: share this opponent's sampling noise across the G rollouts of each world-group
+                    # (the ego, sampled above, keeps independent noise -> the group baseline isolates ego variance).
+                    o_act, _, _ = act(cfg, sp["net"], oe, om, oa, og, greedy=False,
+                                      crn_group=(_grp[0] if crn else 0))
                 step_seats.append({"pid": sp["pid"], "action": o_act})
             else:
                 step_seats.append({"pid": sp["pid"], "script": sp["script"]})
@@ -139,7 +172,8 @@ def collect_ppo(cfg, env, net, world_pool, cursor, rng, seats, n_players=2, n_en
             launch_t = torch.minimum(launch_t, launch_room)
             launch_paid = launch_paid + launch_t
         captureR = captureR + cap_t; prodMR = prodMR + mr_t; launchR = launchR + launch_t
-        rew_buf[t] = (cap_t + mr_t + launch_t) / cfg.PPO_REWARD_SCALE
+        dense_t = torch.zeros_like(cap_t) if phi_value else (cap_t + mr_t + launch_t)   # [C] Phi -> value, not reward
+        rew_buf[t] = dense_t / cfg.PPO_REWARD_SCALE
 
         inv_sum = inv_sum + a * out.invalid
         lnch_sum = lnch_sum + a * out.launches
@@ -166,10 +200,12 @@ def collect_ppo(cfg, env, net, world_pool, cursor, rng, seats, n_players=2, n_en
         seat_sc[k] = torch.where(still, scs[k], seat_sc[k])
     outcome = torch.where(still, oc, outcome)
 
-    with torch.no_grad():
-        fe, fm, fa_, fg = env_encode(env, 0)
-        _, _, vT = act(cfg, net, fe, fm, fa_, fg, greedy=False)
-        bootstrap = vT * active
+    bootstrap = torch.zeros(Bn, device=dev)
+    if not grpo:                                           # GRPO has no critic to bootstrap from
+        with torch.no_grad():
+            fe, fm, fa_, fg = env_encode(env, 0)
+            _, _, vT = act(cfg, net, fe, fm, fa_, fg, greedy=False)
+            bootstrap = vT * active
 
     Tu = last_t + 1
     rew = rew_buf[:Tu].clone(); val = val_buf[:Tu]; done = done_buf[:Tu]; alive = valid_buf[:Tu]
@@ -191,17 +227,66 @@ def collect_ppo(cfg, env, net, world_pool, cursor, rng, seats, n_players=2, n_en
     last_idx = (length - 1.0).clamp_min(0.0).long().unsqueeze(0)
     rew.scatter_add_(0, last_idx, Ot.unsqueeze(0))
 
-    # GAE on GPU (no .cpu(), no synchronize)
-    adv = torch.zeros(Tu, Bn, device=dev)
-    A = torch.zeros(Bn, device=dev); nextval = bootstrap.clone()
-    for t in range(Tu - 1, -1, -1):
-        al = alive[t]; notdone = 1.0 - done[t]
-        delta = rew[t] + cfg.GAMMA * nextval * notdone - val[t]
-        A = delta + cfg.GAMMA * cfg.GAE_LAMBDA * notdone * A
-        adv[t] = A * al
-        nextval = val[t]
-        A = A * al
-    ret_full = (adv + val).reshape(-1); adv_full = adv.reshape(-1)
+    if grpo and not phi_value:
+        # ---- flat group-relative advantage: one scalar per rollout, broadcast over its steps ----
+        G, nW = _grp
+        Re = Ot if cfg.GRPO_OUTCOME_ONLY else (rew * alive).sum(0)   # (Bn,) per-env return
+        Rg = Re.view(nW, G)
+        if cfg.GRPO_ANALYTIC_ADV and n_players == 2:
+            # [A] closed-form binary advantage at a Beta(alpha,alpha)-shrunk per-group win-rate p~ (docs/grpo_v12.tex):
+            #     A_win = sqrt((1-p~)/p~),  A_loss = -sqrt(p~/(1-p~)),  draws -> 0.  No divide-by-std, so the
+            #     within-loss-group length signal vanishes and the p~ shrink removes the empty-group corner.
+            og = outcome.view(nW, G)
+            win = (og > 0.5).to(DTYPE); loss = (og < -0.5).to(DTYPE)
+            a0 = cfg.GRPO_ANALYTIC_ALPHA
+            p_hat = (win.sum(1, keepdim=True) + a0) / (G + 2.0 * a0)
+            Ae = (win * torch.sqrt((1.0 - p_hat) / p_hat) - loss * torch.sqrt(p_hat / (1.0 - p_hat))).reshape(Bn)
+        else:
+            # [B] center (optionally leave-one-out RLOO) then optionally divide by the per-group std.
+            sum_g = Rg.sum(1, keepdim=True)
+            mu = (sum_g - Rg) / (G - 1) if (cfg.GRPO_LOO and G > 1) else sum_g / G
+            cen = Rg - mu
+            Ae = (cen / (Rg.std(1, keepdim=True) + cfg.GRPO_ADV_EPS) if cfg.GRPO_STD_NORM else cen).reshape(Bn)
+        adv = Ae.unsqueeze(0).expand(Tu, Bn) * alive
+        ret_full = Re.unsqueeze(0).expand(Tu, Bn).reshape(-1)        # placeholder (no critic target)
+        adv_full = adv.reshape(-1)
+    elif grpo and phi_value:
+        # ---- [C] per-step GAE with a hand-built value V_hat(s_t) = mu_g + a*(Phi(s_t)-Phi(s_0)).
+        # The shared root mu_g (= group baseline) cancels world difficulty; a*dPhi propagates the
+        # sparse outcome to the moves that improved position. a is the OLS slope of outcome on terminal dPhi.
+        G, nW = _grp
+        Re = Ot if cfg.GRPO_OUTCOME_ONLY else (rew * alive).sum(0)
+        Rg = Re.view(nW, G); sum_g = Rg.sum(1, keepdim=True)
+        mu_g = (sum_g - Rg) / (G - 1) if (cfg.GRPO_LOO and G > 1) else (sum_g / G).expand(nW, G)
+        mu = mu_g.reshape(Bn)                                       # V_hat(s_0), one baseline per rollout
+        phi = phi_buf[:Tu]; phi0 = phi[0]
+        dphi = phi - phi0.unsqueeze(0)                              # (Tu,Bn) positional change vs the start state
+        li = (length - 1.0).clamp_min(0.0).long().unsqueeze(0)
+        dphi_T = dphi.gather(0, li).squeeze(0)                       # (Bn,) terminal positional change
+        a_slope = ((((Re - mu) * dphi_T).sum()) / (dphi_T * dphi_T).sum().clamp_min(1e-6)).clamp(0.0, cfg.GRPO_PHI_A_MAX)
+        Vhat = (mu.unsqueeze(0) + a_slope * dphi) * alive           # (Tu,Bn)
+        adv = torch.zeros(Tu, Bn, device=dev)
+        A = torch.zeros(Bn, device=dev)
+        nextval = (mu + a_slope * (phi[Tu - 1] - phi0)) * active     # bootstrap from V_hat (active envs only)
+        for t in range(Tu - 1, -1, -1):
+            al = alive[t]; notdone = 1.0 - done[t]
+            delta = rew[t] + cfg.GAMMA * nextval * notdone - Vhat[t]
+            A = delta + cfg.GAMMA * cfg.GAE_LAMBDA * notdone * A
+            adv[t] = A * al
+            nextval = Vhat[t]; A = A * al
+        ret_full = (adv + Vhat).reshape(-1); adv_full = adv.reshape(-1)
+    else:
+        # GAE on GPU (no .cpu(), no synchronize)
+        adv = torch.zeros(Tu, Bn, device=dev)
+        A = torch.zeros(Bn, device=dev); nextval = bootstrap.clone()
+        for t in range(Tu - 1, -1, -1):
+            al = alive[t]; notdone = 1.0 - done[t]
+            delta = rew[t] + cfg.GAMMA * nextval * notdone - val[t]
+            A = delta + cfg.GAMMA * cfg.GAE_LAMBDA * notdone * A
+            adv[t] = A * al
+            nextval = val[t]
+            A = A * al
+        ret_full = (adv + val).reshape(-1); adv_full = adv.reshape(-1)
     mean_return_log = (rew.sum(0).mean().item()) * cfg.PPO_REWARD_SCALE
 
     keep = valid_buf[:Tu].reshape(-1).nonzero().squeeze(-1)
@@ -214,7 +299,13 @@ def collect_ppo(cfg, env, net, world_pool, cursor, rng, seats, n_players=2, n_en
     tb["action"] = sel(act_buf[:Tu].reshape(Tu * Bn, Ec, Ec + 1))
     tb["old_logp"] = sel(oldlp_buf[:Tu].reshape(Tu * Bn))
     adv_s = sel(adv_full)
-    tb["advantage"] = (adv_s - adv_s.mean()) / (adv_s.std() + 1e-8)
+    # The flat per-group path WITH std-norm is already unit-scaled (leave it). Every other path --
+    # center-only [B], phi-value [C], explicit GRPO_WHITEN, or PPO -- gets ONE global scale, which
+    # (unlike the per-group std) preserves the cross-group p(1-p) gradient weighting (docs/grpo_v12.tex [B]).
+    if grpo and not phi_value and cfg.GRPO_STD_NORM and not cfg.GRPO_WHITEN:
+        tb["advantage"] = adv_s
+    else:
+        tb["advantage"] = (adv_s - adv_s.mean()) / (adv_s.std() + 1e-8)
     tb["returns"] = sel(ret_full)
     tb["n"] = keep.shape[0]
     del ent_buf, em_buf, am_buf, gl_buf, act_buf, oldlp_buf, val_buf, rew_buf, done_buf, valid_buf, adv, adv_full, ret_full

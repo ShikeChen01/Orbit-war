@@ -274,9 +274,11 @@ def _make_dist(cfg, net, ent, em, am, gl):
 
 
 @torch.no_grad()
-def act(cfg, net, ent, em, am, gl, greedy=False):
+def act(cfg, net, ent, em, am, gl, greedy=False, crn_group=0):
     dist, value = _make_dist(cfg, net, ent, em, am, gl)
-    action = dist.greedy() if greedy else dist.sample()
+    # crn_group>1 couples the sampling noise across each contiguous block of crn_group envs (GRPO
+    # common-random-numbers, docs/grpo_v12.tex [D]); 0 = independent draws (the default everywhere else).
+    action = dist.greedy() if greedy else dist.sample(crn_group=crn_group)
     if cfg.USE_POPART and getattr(net, 'popart', None) is not None:
         value = net.popart.denormalize(value)
     return action, dist.log_prob(action), value

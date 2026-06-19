@@ -24,6 +24,7 @@ from .distributions import GatedAllocDist, GatedCatDist
 from .env import GpuEnv, env_encode, env_step, settle, settle_n
 from .league import League, eval_gauntlet, eval_gauntlet4
 from .plotting import plot_training_health
+from .grpo import grpo_update
 from .policy import PolicyNet, act, build_policy, evaluate
 from .ppo import ppo_update
 from .rollout import collect_ppo
@@ -35,7 +36,7 @@ __all__ = [
     "GpuEnv", "env_encode", "env_step", "settle", "settle_n",
     "GatedAllocDist", "GatedCatDist",
     "PolicyNet", "build_policy", "act", "evaluate",
-    "collect_ppo", "ppo_update",
+    "collect_ppo", "ppo_update", "grpo_update",
     "League", "eval_gauntlet", "eval_gauntlet4",
     "Trainer", "train", "anneal_ent_coef", "save_league_agents",
     "bc_pretrain",

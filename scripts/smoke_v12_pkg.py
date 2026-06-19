@@ -6,7 +6,9 @@ Runs a short SMOKE train() and asserts the v12 invariants:
     eviction) without error;
   - measured eviction semantics via a live unit-test with stubbed eval funcs: an unmastered script
     survives, a mastered ordinary script is removed, a mastered keep-kind watchdog retires to DORMANT;
-  - v12.1 OR-gate: mastery in EITHER format alone (2p-only OR 4p-only) evicts; neither survives;
+  - eviction applies the SAME standard to neural league players (snapshots + invited); the rolling
+    self-anchor (Elo reference) and the newest snapshot (current self) are protected;
+  - OR-gate: mastery in EITHER format alone (2p-only OR 4p-only) evicts; neither survives;
   - shared league invariants (one-hot obs F_DIM 104, mixed 2p/4p, dual Elo, gauntlets) + resume.
 
     python scripts/smoke_v12_pkg.py
@@ -14,6 +16,7 @@ Runs a short SMOKE train() and asserts the v12 invariants:
 import glob
 import os
 import sys
+import types
 
 os.environ.setdefault("MPLBACKEND", "Agg")
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -34,7 +37,7 @@ PKG = os.path.join(REPO, "orbit_wars_v12")
 _allsrc = "\n".join(open(p, encoding="utf-8").read() for p in glob.glob(os.path.join(PKG, "*.py")))
 for bad in ["_v9", "_orig_", "League._", "OVERRIDES", "_weak_boost", "evict_dominated", "WEAK_BOOST"]:
     assert bad not in _allsrc, "clean rebuild must not contain %r" % bad
-for need in ["def evict_mastered_anchors(", "def _reground(", "def _ground_ratings(",
+for need in ["def evict_mastered(", "def _eval_winrate4_net(", "def _reground(", "def _ground_ratings(",
              "def validate_watchdogs(", "[evict]", "[recal]"]:
     assert need in _allsrc, "missing expected v12 symbol %r" % need
 
@@ -71,7 +74,7 @@ m_un = dict(net=None, kind="medium", label="medium", anchor=False, elo=1000.0, e
 m_ma = dict(net=None, kind="starter", label="starter", anchor=False, elo=1000.0, elo4=1000.0, n=0, n4=0)
 m_wd = dict(net=None, kind="greedy", label="greedy", anchor=False, elo=1000.0, elo4=1000.0, n=0, n4=0, wd_active=True)
 league.members = [m_un, m_ma, m_wd]
-league.evict_mastered_anchors(net, None, 8)
+league.evict_mastered(net, None, 8)
 assert m_un in league.members, "unmastered script was wrongly evicted (eviction not mastery-gated)"
 assert m_ma not in league.members, "mastered ordinary script was NOT removed (measured eviction broken)"
 assert m_wd in league.members, "keep-kind watchdog must never be removed"
@@ -79,6 +82,29 @@ assert m_wd["wd_active"] is False, "re-mastered active watchdog must retire to D
 league.members = saved
 Lmod._eval_score, Lmod._eval_winrate4 = _orig_s2, _orig_w4
 print("[smoke] measured eviction: unmastered survives | mastered ordinary removed | watchdog -> dormant  OK")
+
+# --- SAME standard for neural league players (snapshots + invited); protect self-anchor + newest ---
+_orig_n2, _orig_n4 = Lmod._score2_vs, Lmod._eval_winrate4_net
+Lmod._score2_vs = lambda cfg, net, opp, worlds, n: getattr(opp, "_evict", 0.5)
+Lmod._eval_winrate4_net = lambda cfg, net, opp, worlds, n: getattr(opp, "_evict", 0.5)
+_nnet = lambda v: types.SimpleNamespace(_evict=v, to=lambda *a, **k: None)
+p_old = dict(net=_nnet(0.99), kind="snapshot", label="it_old", anchor=False, pinned=False, elo=1500.0, elo4=1500.0, n=0, n4=0)
+p_new = dict(net=_nnet(0.99), kind="snapshot", label="it_new", anchor=False, pinned=False, elo=1500.0, elo4=1500.0, n=0, n4=0)
+p_slf = dict(net=_nnet(0.99), kind=Lmod.SELF_KIND, label="selfA0", anchor=True, pinned=True, elo=1500.0, elo4=1500.0, n=0, n4=0)
+p_inv = dict(net=_nnet(0.99), kind="invited", label="inv:x", anchor=True, pinned=True, elo=1500.0, elo4=1500.0, n=0, n4=0)
+league.members = [p_old, p_new, p_slf, p_inv]
+league.evict_mastered(net, None, 8, neural=True)
+assert p_old not in league.members, "mastered league player (snapshot) must be evicted under the same standard"
+assert p_new in league.members, "newest snapshot (current self) must be protected from eviction"
+assert p_slf in league.members, "self-anchor (Elo reference) must never be evicted"
+assert p_inv not in league.members, "mastered invited league player must be evicted"
+# neural eviction is GATED OFF on a cheap learner recal (neural=False) -> nothing removed
+league.members = [p_old, p_inv]
+league.evict_mastered(net, None, 8, neural=False)
+assert p_old in league.members and p_inv in league.members, "neural eviction must be skipped when neural=False"
+league.members = saved
+Lmod._score2_vs, Lmod._eval_winrate4_net = _orig_n2, _orig_n4
+print("[smoke] league-player eviction: snapshot+invited removed | self-anchor & newest protected | gated off on lite recal  OK")
 
 # --- v12.1 OR-gate: mastery in EITHER format ALONE must evict ---
 _S2 = {"starter": 0.99, "medium": 0.10, "intermediate": 0.10}   # starter mastered 2p-only
@@ -89,7 +115,7 @@ m_2p = dict(net=None, kind="starter", label="starter", anchor=False, elo=1000.0,
 m_4p = dict(net=None, kind="medium", label="medium", anchor=False, elo=1000.0, elo4=1000.0, n=0, n4=0)
 m_no = dict(net=None, kind="intermediate", label="intermediate", anchor=False, elo=1000.0, elo4=1000.0, n=0, n4=0)
 league.members = [m_2p, m_4p, m_no]
-league.evict_mastered_anchors(net, None, 8)
+league.evict_mastered(net, None, 8)
 assert m_2p not in league.members, "OR-gate: 2p-only mastery must evict (gate reverted to AND?)"
 assert m_4p not in league.members, "OR-gate: 4p-only mastery must evict (gate reverted to AND?)"
 assert m_no in league.members, "OR-gate: neither-mastered script must survive"

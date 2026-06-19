@@ -52,7 +52,8 @@ class GatedAllocDist:
     def _bundle(self, alloc, fire):
         return torch.cat([alloc, fire.unsqueeze(-1)], -1)                   # (B,E,E+1)
 
-    def sample(self):
+    def sample(self, crn_group=0):    # crn_group accepted for call-site parity; CRN coupling (docs/grpo_v12.tex [D])
+        #                               is implemented for the (default) categorical WHERE, not the Dirichlet
         return self._bundle(self.dist.rsample(), torch.bernoulli(self.p))  # WHERE simplex + Bernoulli fire
 
     def greedy(self):
@@ -109,8 +110,19 @@ class GatedCatDist:
         alloc.scatter_(2, dest.unsqueeze(-1), 1.0)                          # one-hot WHERE row
         return torch.cat([alloc, fire.unsqueeze(-1)], -1)
 
-    def sample(self):
+    def sample(self, crn_group=0):
         B_, E, _ = self.lsm.shape
+        if crn_group and crn_group > 1 and B_ % crn_group == 0:
+            # CRN (docs/grpo_v12.tex [D]): share the WHERE Gumbel + GATE uniform noise across the
+            # crn_group rollouts of one world-group (envs are laid out in contiguous groups), so only
+            # the ACTING agent's own randomness varies within a group -> lower-variance group baseline.
+            G = crn_group; nW = B_ // G
+            u = torch.rand(nW, 1, E, E, device=self.lsm.device).clamp_(1e-9, 1.0)
+            gumbel = -torch.log(-torch.log(u))                              # Gumbel-max == Categorical(lsm)
+            dest = (self.lsm.view(nW, G, E, E) + gumbel).argmax(-1).reshape(B_, E)
+            ug = torch.rand(nW, 1, E, device=self.p.device)
+            fire = (ug < self.p.view(nW, G, E)).to(self.lsm.dtype).reshape(B_, E)
+            return self._bundle(dest, fire)
         dest = torch.distributions.Categorical(logits=self.lsm.reshape(-1, E)).sample().view(B_, E)
         return self._bundle(dest, torch.bernoulli(self.p))
 

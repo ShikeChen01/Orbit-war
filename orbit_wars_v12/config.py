@@ -92,6 +92,30 @@ class Config:
     LOGIT_CLAMP: float = 8.0       # clamp dest_logits before softplus
     ADAM_EPS: float = 1e-5
 
+    # ---- GRPO (group-relative PO; critic-free alternative to PPO+GAE) -----------------------
+    # ALGO selects the optimizer at rollout+update time. "grpo" rolls each world out GRPO_GROUP
+    # times and standardizes each rollout's return WITHIN its group as the advantage (no learned
+    # value baseline) -- same clipped surrogate + entropy, no value loss, optional KL-to-reference.
+    ALGO: str = "ppo"               # "ppo" = PPO+GAE (learned critic) | "grpo" = group baseline (no critic)
+    GRPO_GROUP: int = 0             # rollouts sharing one world for the relative baseline (0 -> GROUP_SIZE)
+    GRPO_ADV_EPS: float = 1e-4      # std floor when standardizing returns within a group
+    GRPO_WHITEN: bool = False       # also batch-whiten advantages on top of the per-group baseline
+    GRPO_OUTCOME_ONLY: bool = False # baseline on the terminal outcome only (else the full shaped return)
+    GRPO_KL_COEF: float = 0.0       # beta: KL(pi||pi_ref) penalty vs a frozen reference (0 -> off, no ref built)
+    # ---- GRPO v12 variance-reduction tricks (docs/grpo_v12.tex). ALL default to the legacy path, so
+    # an existing run is byte-for-byte unchanged until a flag is flipped; ablate one at a time.
+    GRPO_STD_NORM: bool = True      # [B] divide the centered return by the PER-GROUP std (DeepSeek). False ->
+    #                                 center-only + ONE global scale (Dr.GRPO: removes the difficulty-inversion bias)
+    GRPO_LOO: bool = False          # [B] leave-one-out group mean baseline (RLOO: unbiased, decorrelates b from sample i)
+    GRPO_ANALYTIC_ADV: bool = False # [A] 2p binary closed-form advantage at a Beta-shrunk win-rate (kills the
+    #                                 divide-by-eps corner + the within-loss-group length signal); 4p falls back to [B]
+    GRPO_ANALYTIC_ALPHA: float = 1.0  # [A] Beta(alpha,alpha) pseudocount shrinking p_hat off {0,1}
+    GRPO_PHI_VALUE: bool = False    # [C] use the shaping potential Phi as an OLS-fit GAE value (per-step credit);
+    #                                 turns Phi from reward shaping (cancelled by the group mean) into a baseline
+    GRPO_PHI_A_MAX: float = 3.0     # [C] clamp on the fitted Phi->outcome slope (guards a degenerate OLS fit)
+    GRPO_CRN: bool = False          # [D] common random numbers: couple NEURAL-opponent sampling noise within a
+    #                                 world-group so the baseline isolates ego-action variance (lower-variance adv)
+
     # ---- training length (the Elo/PFSP league IS the curriculum) ---------------------------
     TOTAL_ITERS: int = 600
     SELFPLAY_REFRESH: int = 25     # snapshot the learner into the pool every N iters

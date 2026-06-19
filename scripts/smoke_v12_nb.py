@@ -30,7 +30,7 @@ _allsrc = "\n".join("".join(c["source"]) for c in doc["cells"] if c["cell_type"]
 for bad in ["[evict init]", "_v9", "_orig_", "League._", "OVERRIDES", "_weak_boost",
             "evict_dominated", "WEAK_BOOST"]:
     assert bad not in _allsrc, "clean rebuild must not contain %r" % bad
-for need in ["def evict_mastered_anchors(", "def _reground(", "def _ground_ratings(",
+for need in ["def evict_mastered(", "def _reground(", "def _ground_ratings(",
              "def validate_watchdogs(", "[evict]", "[recal]"]:
     assert need in _allsrc, "missing expected v12 symbol %r" % need
 
@@ -83,7 +83,7 @@ m_un = dict(net=None, kind="medium", label="medium", anchor=False, elo=1000.0, e
 m_ma = dict(net=None, kind="starter", label="starter", anchor=False, elo=1000.0, elo4=1000.0, n=0, n4=0)
 m_wd = dict(net=None, kind="greedy", label="greedy", anchor=False, elo=1000.0, elo4=1000.0, n=0, n4=0, wd_active=True)
 lg.members = [m_un, m_ma, m_wd]
-lg.evict_mastered_anchors(ns["net"], None, 8)
+lg.evict_mastered(ns["net"], None, 8)
 assert m_un in lg.members, "unmastered script was wrongly evicted (eviction not mastery-gated)"
 assert m_ma not in lg.members, "mastered ordinary script was NOT removed (measured eviction broken)"
 assert m_wd in lg.members, "keep-kind watchdog must never be removed"
@@ -101,7 +101,7 @@ m_2p = dict(net=None, kind="starter",      label="starter",      anchor=False, e
 m_4p = dict(net=None, kind="medium",       label="medium",       anchor=False, elo=1000.0, elo4=1000.0, n=0, n4=0)
 m_no = dict(net=None, kind="intermediate", label="intermediate", anchor=False, elo=1000.0, elo4=1000.0, n=0, n4=0)
 lg.members = [m_2p, m_4p, m_no]
-lg.evict_mastered_anchors(ns["net"], None, 8)
+lg.evict_mastered(ns["net"], None, 8)
 assert m_2p not in lg.members, "OR-gate: 2p-only mastery must evict (gate reverted to AND?)"
 assert m_4p not in lg.members, "OR-gate: 4p-only mastery must evict (gate reverted to AND?)"
 assert m_no in lg.members,     "OR-gate: neither-mastered script must survive"

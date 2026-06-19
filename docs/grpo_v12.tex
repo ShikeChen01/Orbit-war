@@ -1,0 +1,314 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+\usepackage{xcolor}
+
+% --- macros (shared with rl_math_v9.tex) ---
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Var}{\operatorname{Var}}
+\newcommand{\Cov}{\operatorname{Cov}}
+\newcommand{\Std}{\operatorname{std}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\Adv}{\widehat{A}}
+\newcommand{\pol}{\pi_\theta}
+\newcommand{\polold}{\pi_{\theta_{\mathrm{old}}}}
+\newcommand{\sign}{\operatorname{sign}}
+\newcommand{\clip}{\operatorname{clip}}
+\newcommand{\cd}[1]{\texttt{#1}}
+
+% --- per-section variable reference sheet (identical environment to rl_math_v9.tex) ---
+\newenvironment{varsheet}{%
+  \par\smallskip
+  \begin{center}\small
+  \begin{tabular}{@{}l p{0.70\linewidth}@{}}
+  \toprule
+  \multicolumn{2}{@{}l@{}}{\textit{Variable reference --- this section}}\\
+  \midrule
+}{%
+  \bottomrule
+  \end{tabular}
+  \end{center}
+}
+
+\title{\textbf{Orbit Wars --- Critic-Free RL Math, v12\\[2pt]
+\large Four variance-reduction tricks for the GRPO trainer,\\
+and why the un-patched group baseline collapsed}}
+\author{}
+\date{2026-06-19}
+
+\begin{document}
+\maketitle
+
+\begin{center}\small
+This note specifies the four changes added to the v12 \emph{critic-free} (GRPO) trainer, the math
+behind each, and the failure they fix. It is a companion to \cd{rl\_math\_v9.tex} (the policy,
+reward, league, and PPO\,+\,GAE update are defined there and not repeated). Each trick is gated by
+a \cd{Config} flag and \textbf{defaults to the legacy behaviour}, so a run is bit-for-bit unchanged
+until a flag is flipped; ablate them one at a time. The four:
+\begin{center}\small
+\begin{tabular}{@{}cll@{}}
+\toprule
+tag & flag & idea \\
+\midrule
+\textbf{[A]} & \cd{GRPO\_ANALYTIC\_ADV} & closed-form 2p advantage at a shrunk win-rate (Section~\ref{sec:A}) \\
+\textbf{[B]} & \cd{GRPO\_STD\_NORM}, \cd{GRPO\_LOO} & drop the per-group std; leave-one-out baseline (Section~\ref{sec:B}) \\
+\textbf{[C]} & \cd{GRPO\_PHI\_VALUE} & use the shaping potential as a value, not a reward (Section~\ref{sec:C}) \\
+\textbf{[D]} & \cd{GRPO\_CRN} & common random numbers across a world-group (Section~\ref{sec:D}) \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{center}
+\tableofcontents
+\bigskip
+
+%================================================================
+\section{The critic-free estimator and the collapse it produced}\label{sec:setup}
+\begin{varsheet}
+$B$ & parallel envs per iteration, $B=n_W\!\cdot\!G$ \\
+$G$ & \emph{group size}: rollouts sharing one world (\cd{GRPO\_GROUP}); $n_W$ = groups/iter \\
+$w_g$ & the world (initial planets/seating) shared by all $G$ members of group $g$ \\
+$R_i$ & rollout $i$'s scalar return (full shaped return, or terminal-only if \cd{GRPO\_OUTCOME\_ONLY}) \\
+$O_i$ & terminal outcome of rollout $i$; in 2p $O_i\in\{-1,0,+1\}$, in 4p the placement-linear value \\
+$\mu_g,\sigma_g$ & within-group sample mean / std of $\{R_i\}$ \\
+$\Adv_i$ & the advantage assigned to \emph{every} timestep of rollout $i$ \\
+$\varepsilon$ & \cd{GRPO\_ADV\_EPS}, the std floor ($10^{-4}$) \\
+$\pol$ & the policy; $a^i_t,s^i_t$ the action/state at step $t$ of rollout $i$ \\
+\end{varsheet}
+GRPO replaces PPO's learned value baseline with a \textbf{group baseline}. Each iteration draws
+$n_W$ worlds and rolls each out $G$ times (the rollout lays the $B$ envs out as contiguous blocks of
+$G$, one world per block, so a block is a group). With the return $R_i$ standardized inside its
+group,
+\begin{equation}
+\Adv_i=\frac{R_i-\mu_g}{\sigma_g+\varepsilon},\qquad
+\mu_g=\tfrac1G\!\sum_{j\in g}\!R_j,\quad
+\sigma_g=\sqrt{\tfrac1G\!\sum_{j\in g}\!(R_j-\mu_g)^2},
+\label{eq:grpo}
+\end{equation}
+the gradient is the clipped surrogate of the PPO section applied with $\Adv_i$ \emph{flat over all
+timesteps} of rollout $i$:
+$\;\hat g=\E\big[\sum_t\nabla_\theta\log\pol(a^i_t\mid s^i_t)\,\Adv_i\big]$. There is no critic, no
+GAE, and (with \cd{GRPO\_KL\_COEF}$=0$) no reference anchor.
+
+\paragraph{The collapse.} A warm-started run climbed to $\mathrm{elo2}\approx2110$, then over $\sim$40
+iterations decayed to win-rate $0.09$ with the launch rate sliding $0.80\to0.30$ --- the project's
+familiar \emph{passivity basin}. The trigger was an asymmetric outcome decay (a small ``lose slower''
+term), but the \emph{amplifier} was Eq.~\eqref{eq:grpo} itself: in a group that loses every rollout,
+$\sigma_g$ collapses and the $\varepsilon$-floored division blows a trivial within-group tiebreak up to
+a full-magnitude ``stall'' gradient. Sections~\ref{sec:A}--\ref{sec:B} dissect and remove that
+amplifier; Section~\ref{sec:C} restores the per-step credit assignment GRPO structurally lacks;
+Section~\ref{sec:D} tightens the baseline. All four are properties of \emph{this} MDP: a
+terminal-dominated, near-binary reward evaluated on shared-world groups under self-play.
+
+%================================================================
+\section{[A] The 2p advantage in closed form, and its shrinkage}\label{sec:A}
+\begin{varsheet}
+$B_o$ & outcome magnitude in return units, $B_o=\cd{WIN\_BONUS}/\cd{PPO\_REWARD\_SCALE}$ ($=10$) \\
+$w$ & number of \emph{wins} among the $G$ rollouts of a group \\
+$\hat p$ & empirical group win-rate $w/G$ \\
+$\tilde p$ & Beta-shrunk win-rate, Eq.~\eqref{eq:shrink} \\
+$\alpha$ & \cd{GRPO\_ANALYTIC\_ALPHA}, the Beta pseudocount \\
+$\Adv_{\mathrm{win}},\Adv_{\mathrm{loss}}$ & the two advantage values a 2p group can take \\
+\end{varsheet}
+In 2p the outcome is binary, so (ignoring draws and any decay) every $R_i\in\{+B_o,-B_o\}$. A group
+with $w$ wins, $\hat p=w/G$, has \emph{exact} statistics
+\begin{equation}
+\mu_g=B_o(2\hat p-1),\qquad \sigma_g=2B_o\sqrt{\hat p(1-\hat p)},
+\label{eq:binstats}
+\end{equation}
+and substituting into Eq.~\eqref{eq:grpo} (with $\varepsilon\!\to\!0$) the standardized advantage takes
+\textbf{only two values}, a pure function of the win-rate:
+\begin{equation}
+\boxed{\;\Adv_{\mathrm{win}}=\sqrt{\frac{1-\hat p}{\hat p}},\qquad
+\Adv_{\mathrm{loss}}=-\sqrt{\frac{\hat p}{1-\hat p}}\;}
+\label{eq:binadv}
+\end{equation}
+\emph{Derivation.} $\Adv_{\mathrm{win}}=\dfrac{B_o-\mu_g}{\sigma_g}=\dfrac{2B_o(1-\hat p)}{2B_o\sqrt{\hat p(1-\hat p)}}=\sqrt{\tfrac{1-\hat p}{\hat p}}$,
+and symmetrically for the loss. Two consequences:
+\begin{itemize}[nosep,leftmargin=1.6em]
+\item \textbf{Rare events are up-weighted.} As $\hat p\to0$ (a world you almost always lose) a rare win
+  gets $\Adv_{\mathrm{win}}\to+\infty$ while the common losses get $\Adv_{\mathrm{loss}}\to0^-$: GRPO
+  implicitly chases the rare win. This is a useful exploration prior --- when it is real.
+\item \textbf{Every group carries unit gradient energy.} $\hat p\,\Adv_{\mathrm{win}}^2+(1-\hat p)\,\Adv_{\mathrm{loss}}^2=(1-\hat p)+\hat p=1$ for \emph{all} $\hat p$.
+  A $99\%$ blowout pushes the gradient exactly as hard as a $50/50$ toss-up.
+\end{itemize}
+The collapse lives at $\hat p\!\in\!\{0,1\}$: then $\sigma_g=0$, the division falls back on
+$\varepsilon$, and whatever infinitesimal residual distinguishes the (all-losing) rollouts --- a
+length-dependent decay term, sampling noise --- is renormalised to magnitude $1$. The estimator
+manufactures a confident gradient out of noise.
+
+\paragraph{The fix: evaluate Eq.~\eqref{eq:binadv} at a shrunk $\tilde p$.} Replace the empirical
+$\hat p$ by a Beta$(\alpha,\alpha)$ posterior mean,
+\begin{equation}
+\tilde p=\frac{w+\alpha}{G+2\alpha}\ \in(0,1),
+\label{eq:shrink}
+\end{equation}
+and \emph{assign Eq.~\eqref{eq:binadv} by outcome class} (wins $\to\Adv_{\mathrm{win}}$, losses
+$\to\Adv_{\mathrm{loss}}$, draws $\to0$). This (i) keeps $\tilde p$ strictly inside $(0,1)$, so there is
+no $\varepsilon$-corner; (ii) gives \emph{every win in a group the same advantage and every loss the
+same advantage}, so any within-class tiebreak (the stall signal) is gone by construction; and (iii) is
+a \textbf{Rao--Blackwellisation} --- the outcome class is the sufficient statistic for a binary reward,
+and conditioning on it replaces the noisy per-sample value with its exact conditional advantage, which
+is variance-optimal among unbiased estimators that respect the outcome. In 4p the outcome is graded
+(placement-linear), Eq.~\eqref{eq:binadv} no longer holds, and the code falls back to [B].
+
+%================================================================
+\section{[B] Drop the per-group standard deviation (and use leave-one-out)}\label{sec:B}
+\begin{varsheet}
+$b_g$ & a per-group baseline subtracted from $R_i$ \\
+$\mu_{g,-i}$ & leave-one-out group mean, Eq.~\eqref{eq:loo} \\
+$\mathcal E_g$ & per-group gradient \emph{energy} $\tfrac1G\sum_{i\in g}(\text{advantage})^2$ \\
+$p(1-p)$ & the PFSP-``even'' matchmaking weight (\cd{rl\_math\_v9.tex}, league section) \\
+\end{varsheet}
+For a constant-per-rollout advantage the variance-minimising baseline is the expected return,
+$b_g=\E[R\mid w_g]\approx\mu_g$; subtracting it is correct. \textbf{Dividing by $\sigma_g$ is not part
+of any unbiased estimator} --- it is a per-group reweighting, and Eq.~\eqref{eq:binadv} showed exactly
+what it does: it forces every group to unit energy. Compare the per-group energy with and without it:
+\begin{equation}
+\underbrace{\mathcal E_g^{\,/\sigma}=1}_{\text{current (DeepSeek)}}\quad\text{for all }\hat p;
+\qquad
+\underbrace{\mathcal E_g^{\,\text{center}}=\sigma_g^2=4B_o^2\,\hat p(1-\hat p)}_{\text{center-only (Dr.\ GRPO)}}.
+\label{eq:energy}
+\end{equation}
+The center-only energy is \textbf{peaked at $\hat p=\tfrac12$ and vanishes at the extremes} --- it
+down-weights blowout/hopeless groups (nothing to learn) and concentrates the gradient on contested
+ones. This is precisely the right curriculum, and it is \emph{the same function} $p(1-p)$ that
+PFSP-``even'' uses to choose opponents. The league is already sampling matchups to maximise
+$p(1-p)$; the $/\sigma_g$ term flattens that back out, so matchmaker and update were optimising against
+each other. Removing it aligns them.
+
+\paragraph{Implementation.} \cd{GRPO\_STD\_NORM=False} skips the division and applies \emph{one global
+scale} to the batch (a single $\Std$ over all transitions), which --- unlike the per-group $\sigma_g$
+--- preserves the cross-group $p(1-p)$ weighting while keeping the overall step size $O(1)$.
+
+\paragraph{Leave-one-out baseline (RLOO).} \cd{GRPO\_LOO=True} replaces $\mu_g$ by the mean of the
+\emph{other} $G-1$ rollouts,
+\begin{equation}
+\mu_{g,-i}=\frac1{G-1}\sum_{j\in g,\,j\neq i}R_j
+\quad\Longrightarrow\quad
+R_i-\mu_{g,-i}=\frac{G}{G-1}\,(R_i-\mu_g).
+\label{eq:loo}
+\end{equation}
+The baseline no longer contains sample $i$, removing the $O(1/G)$ self-correlation that biases the
+included-mean estimator; the identity on the right shows the only effect on the \emph{magnitude} is a
+benign $G/(G\!-\!1)$ rescale (here $16/15$), so the value of LOO is the de-biasing, not a scale change.
+
+%================================================================
+\section{[C] The shaping potential is a value, not a reward}\label{sec:C}
+\begin{varsheet}
+$\Phi(s)$ & shaping potential, $\Phi=\cd{SHAPE\_SHIP}\,\varphi_{\text{ship}}+\cd{SHAPE\_PROD}\,\varphi_{\text{prod}}$ \\
+$\varphi_{\text{ship}},\varphi_{\text{prod}}$ & log ship-margin / production-share vs.\ the strongest opponent (Ng potentials) \\
+$\gamma,\lambda$ & discount (\cd{GAMMA}) and GAE trace (\cd{GAE\_LAMBDA}) \\
+$V_t,\widehat V_t$ & a value at $s_t$; the hand-built estimate Eq.~\eqref{eq:vhat} \\
+$a$ & fitted slope of outcome on terminal position change, Eq.~\eqref{eq:phislope} \\
+$\delta_t,\Adv_t$ & TD residual and the per-step (GAE) advantage \\
+$L$ & rollout length; $\Delta\Phi_t=\Phi(s_t)-\Phi(s_0)$ \\
+\end{varsheet}
+GRPO's deepest weakness is that one trajectory-level scalar is smeared over all $T\!=\!500$ steps: no
+\emph{per-step} credit. We already compute a hand-crafted ``who is winning'' signal $\Phi(s)$ and feed
+it as potential-based reward shaping (PBRS). Under the Monte-Carlo return GRPO actually uses, that is
+nearly wasted. Telescoping the shaping increment $\gamma\Phi_{t+1}-\Phi_t$ over a rollout,
+\begin{equation}
+\sum_{t=0}^{L-1}\big(\gamma\Phi_{t+1}-\Phi_t\big)
+=\underbrace{-\,\Phi_0}_{\text{shared in group}}\;+\;(\gamma-1)\!\sum_{t=1}^{L-1}\!\Phi_t\;+\;\gamma\Phi_L .
+\label{eq:telescope}
+\end{equation}
+The leading term $-\Phi_0$ is the world's \emph{initial} imbalance --- identical for all $G$ members of
+a group (they share $w_g$, hence $s_0$) --- so the group mean $\mu_g$ \textbf{cancels it exactly}. What
+survives is a tiny $(\gamma-1)=-0.003$-weighted occupancy integral, not the credit signal we wanted.
+This is the textbook fact (Ng et al.; Wiewiora 2003) that \emph{PBRS is equivalent to initialising the
+value function to $\Phi$, and only does work in the presence of bootstrapping.} With no critic there is
+no bootstrapping, so the shaping is inert.
+
+\paragraph{The fix: bootstrap with $\Phi$.} Use $\Phi$ as the value and run GAE. Anchor the value at the
+group baseline and let position change move it:
+\begin{equation}
+\widehat V_t^{\,i}=\mu_{g(i)}+a\,\big(\Phi(s^i_t)-\Phi(s^i_0)\big)=\mu_{g}+a\,\Delta\Phi_t^{\,i},
+\label{eq:vhat}
+\end{equation}
+with the slope fit once per iteration by closed-form least squares of the group-centred outcome on the
+\emph{terminal} position change $\Delta\Phi_L$ (clamped to $[0,\cd{GRPO\_PHI\_A\_MAX}]$):
+\begin{equation}
+a=\frac{\sum_i (R_i-\mu_{g})\,\Delta\Phi^{\,i}_{L}}{\sum_i(\Delta\Phi^{\,i}_{L})^2}.
+\label{eq:phislope}
+\end{equation}
+Then standard GAE on the (now sparse: terminal-outcome-only) reward $r_t$,
+\begin{equation}
+\delta_t=r_t+\gamma\widehat V_{t+1}-\widehat V_t,\qquad
+\Adv_t=\sum_{l\ge0}(\gamma\lambda)^l\,\delta_{t+l}.
+\end{equation}
+Two things fall out. At the root $\widehat V_0=\mu_g$, so $\delta_0$ subtracts the group baseline:
+\textbf{world difficulty is cancelled by the shared root}, recovering GRPO's whole purpose. And for an
+interior step ($r_t=0$, $\gamma\approx1$),
+\begin{equation}
+\delta_t\approx a\big(\Phi(s_{t+1})-\Phi(s_t)\big),
+\end{equation}
+so the per-step advantage credits exactly the moves that \emph{improve your position}, with the
+terminal outcome propagated back through them by the $(\gamma\lambda)$ trace. Because $\widehat V$ is a
+function of state only, it is an \emph{unbiased baseline} regardless of fit quality (a bad fit costs
+variance, never bias); the $\lambda<1$ trace is the usual bias--variance knob. To avoid double-counting
+$\Phi$, the explicit reward shaping is turned off in this mode (\cd{GRPO\_PHI\_VALUE} routes $\Phi$ to
+the value, and the dense reward is set to zero).
+
+%================================================================
+\section{[D] Common random numbers across a world-group}\label{sec:D}
+\begin{varsheet}
+$\xi_i,\zeta_i$ & the \emph{ego}'s and the \emph{opponent}'s action-sampling noise in rollout $i$ \\
+$w_g$ & the (shared) world; comets are deterministic per world \\
+$u,\,g_u$ & a uniform / Gumbel sample driving the categorical and the gate \\
+$\Cov$ & covariance; the CRN variance identity below \\
+\end{varsheet}
+A rollout's return is a function of three independent noise sources,
+$R_i=f(w_g,\xi_i,\zeta_i)$: the world (shared within a group), the ego's sampling $\xi_i$, and the
+neural opponent's sampling $\zeta_i$. The group baseline is meant to isolate the effect of varying the
+\emph{ego}'s actions, but with independent $\zeta_i$ it also absorbs opponent-sampling noise, inflating
+$\sigma_g$ and loosening the advantage. \textbf{Common random numbers} couple the opponent across the
+group: draw one noise stream $\zeta_g$ and share it among all $G$ members (the ego keeps independent
+$\xi_i$ --- that variation is the signal). By the control-variate identity
+\begin{equation}
+\Var(R_i-R_j)=\Var R_i+\Var R_j-2\,\Cov(R_i,R_j),
+\end{equation}
+raising $\Cov$ between groupmates (via shared $\zeta$) lowers the variance of within-group differences,
+hence of $\Adv_i$. Concretely the categorical \textbf{WHERE} is sampled by Gumbel-max with noise shared
+across the group, and the \textbf{GATE} by a shared uniform:
+\begin{equation}
+d^i_s=\arg\max_{d}\big(\ell^i_{s,d}+g_{u}[g(i),s,d]\big),\qquad
+f^i_s=\mathbb 1\!\big[u[g(i),s]<p^i_s\big],
+\end{equation}
+where $g_u,u$ are indexed by the \emph{group} $g(i)$, not the rollout --- identical within a group,
+independent across groups. Identical-logit groupmates therefore sample identical actions (a clean unit
+test); when logits differ (the ego has diverged the state) the actions differ but the \emph{noise} is
+common, which is the variance reduction. CRN applies only to neural opponents (scripted seats are
+handled in the engine); the world and its comets are already shared by construction.
+
+%================================================================
+\section{Flags, defaults, and interactions}\label{sec:flags}
+\begin{center}\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+flag & default & effect when changed \\
+\midrule
+\cd{GRPO\_STD\_NORM}      & \cd{True}  & \cd{False} $\to$ center-only $+$ global scale (Dr.\ GRPO) \\
+\cd{GRPO\_LOO}            & \cd{False} & \cd{True}  $\to$ leave-one-out group mean (RLOO) \\
+\cd{GRPO\_ANALYTIC\_ADV}  & \cd{False} & \cd{True}  $\to$ closed-form 2p advantage at shrunk $\tilde p$ (4p falls back) \\
+\cd{GRPO\_ANALYTIC\_ALPHA}& \cd{1.0}   & Beta pseudocount in Eq.~\eqref{eq:shrink} \\
+\cd{GRPO\_PHI\_VALUE}     & \cd{False} & \cd{True}  $\to$ $\Phi$-as-value GAE (per-step credit); shaping reward off \\
+\cd{GRPO\_PHI\_A\_MAX}    & \cd{3.0}   & clamp on the fitted slope $a$, Eq.~\eqref{eq:phislope} \\
+\cd{GRPO\_CRN}            & \cd{False} & \cd{True}  $\to$ couple neural-opponent sampling within a group \\
+\bottomrule
+\end{tabular}
+\end{center}
+\noindent\textbf{Interactions.} [A] and [B] both shape the \emph{flat} trajectory advantage and are
+mutually exclusive for the terminal term: with [A] on (2p) the analytic values are used and the
+std/LOO knobs of [B] only toggle the optional global whiten. [C] \emph{replaces} the flat path with the
+GAE path, so [A]'s analytic values do not apply while [C] is on (the group baseline enters [C] through
+$\mu_g$ in Eq.~\eqref{eq:vhat}, and \cd{GRPO\_LOO} still selects $\mu_{g,-i}$ there). [D] is orthogonal
+--- it changes how the \emph{rollout} is sampled, not how the advantage is computed --- and composes
+with any of the above. Recommended first ablations: \textbf{[B] alone} (cheapest, removes the collapse
+amplifier and aligns with PFSP) and \textbf{[C] alone} (the per-step credit, the largest expected
+upside); then [C]+[D].
+
+\end{document}

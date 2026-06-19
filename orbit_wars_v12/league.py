@@ -121,6 +121,40 @@ def _eval_winrate4(cfg, net, kind, worlds, n_envs):
     return float(win.mean().item())
 
 
+def _eval_winrate4_net(cfg, net, opp_net, worlds, n_envs):
+    """4p FFA 1st-place (outright-win) rate of greedy `net` (seat 0) vs THREE copies of the NEURAL
+    `opp_net` (seats 1-3) -- the neural twin of `_eval_winrate4`, so league players are eviction-tested
+    on the identical standard as scripted anchors. Baseline 0.25 when all four are equal."""
+    dev = cfg.device
+    env = GpuEnv(cfg)
+    env.reset([worlds[i % len(worlds)] for i in range(n_envs)], n_players=4)
+    active = torch.ones(n_envs, device=dev); win = torch.zeros(n_envs, device=dev)
+    def _win(s_all):
+        s0 = s_all[:, 0:1]; rest = s_all[:, 1:]
+        return (s0 > rest).all(1).to(s_all.dtype)
+    with torch.no_grad():
+        for _t in range(env.T):
+            ent, em, am, gl = env_encode(env, 0)
+            a_t, _, _ = act(cfg, net, ent, em, am, gl, greedy=True)
+            step_seats = []
+            for pid in (1, 2, 3):
+                oe, om, oa, og = env_encode(env, pid)
+                o_act, _, _ = act(cfg, opp_net, oe, om, oa, og, greedy=True)
+                step_seats.append({"pid": pid, "action": o_act})
+            env_step(cfg, env, a_t, seats=step_seats, step_idx=_t)
+            s_all, alive_all = settle_n(env)
+            n_alive = alive_all.to(DTYPE).sum(1)
+            term = (env.step_ct >= float(env.T - 2)) | (n_alive <= 1.0) | (~alive_all[:, 0])
+            newly = (active > 0.5) & term
+            win = torch.where(newly, _win(s_all), win)
+            active = torch.where(term, torch.zeros_like(active), active)
+            if active.sum().item() == 0:
+                break
+        s_all, _ = settle_n(env)
+        win = torch.where(active > 0.5, _win(s_all), win)
+    return float(win.mean().item())
+
+
 def _eval_pair_scores4(cfg, net, trio, worlds, n_envs):
     """4p FFA with greedy `net` at seat 0 and the scripted `trio` at seats 1..3. Returns
     {(i, j): mean pairwise score of seat i vs seat j} for the pairs among seats 1..3 only
@@ -578,8 +612,9 @@ class League:
 
     def _reground(self, net, worlds, n=None, ground_members=False):
         """One recalibration: ground ratings (blended; first=raw), maybe promote (DUAL-format
-        dominance), then VALIDATE watchdogs and run the MEASURED eviction. Eviction therefore
-        fires at the very first recal (start/resume) and at every recal thereafter."""
+        dominance), then VALIDATE watchdogs and run the MEASURED eviction. Scripted-anchor eviction
+        fires at the very first recal (start/resume) and at every recal thereafter; the neural
+        league-player pass runs only on the first/full recal (``first or ground_members``)."""
         cfg = self.cfg
         n = n or cfg.ELO_RECAL_ENVS
         first = not getattr(self, "_grounded", False)
@@ -605,7 +640,9 @@ class League:
             self._force_resample = True                            # ask the training loop for fresh training worlds
             print("    [promotion] new anchor #%d -> fresh worlds + full league recal" % self._promo_ctr)
         self.validate_watchdogs(net, worlds, n)                    # rating check -> activate failing watchdogs
-        self.evict_mastered_anchors(net, worlds, n)               # measured eviction (start + every recal)
+        # measured eviction: scripted anchors every recal; the heavier neural-player pass only on the
+        # full/first recal (where the league is already being fully re-grounded).
+        self.evict_mastered(net, worlds, n, neural=(first or ground_members))
         return promoted
 
     def recalibrate_elo(self, net, worlds, n_envs=None, all_anchors=False):
@@ -634,30 +671,58 @@ class League:
                 print("    [watchdog] %-8s FAILED validation: 2p %.2f < expected %.2f - %.2f -> ENTERS league"
                       % (m["kind"], actual, expected, cfg.WATCHDOG_TOL))
 
-    def evict_mastered_anchors(self, net, worlds, n=None):
-        """MEASURED eviction (runs at start + every recal): score the learner vs each scripted
-        anchor (2p score s2 + 4p 1st-place rate w4 vs 3 copies) and remove any it has MASTERED
-        (s2 > MASTER_EVICT_2P_WR OR w4 > MASTER_EVICT_4P_WR). Keep-kinds (random/greedy) are
-        never removed; a re-mastered ACTIVE watchdog retires to DORMANT (calibration-only)."""
+    def _newest_snapshot(self):
+        """The most recently frozen learner snapshot (the current self) -- never evicted, so the
+        league always keeps the freshest self-play opponent to train against."""
+        autos = [m for m in self.members if m["kind"] == "snapshot" and not m["pinned"]]
+        return autos[-1] if autos else None
+
+    def _measure_mastery(self, net, m, worlds, n):
+        """(s2, w4) of the learner vs member `m` on ONE standard for scripts and league players:
+        s2 = seat-avg 2p score, w4 = 4p 1st-place rate vs THREE copies (0.0 when 4p is disabled)."""
+        cfg = self.cfg
+        if m["net"] is None:                                        # scripted anchor (on-GPU)
+            s2 = _eval_score(cfg, net, m["kind"], worlds, n)
+            w4 = _eval_winrate4(cfg, net, m["kind"], worlds, n) if cfg.FOURP_ENABLED else 0.0
+        else:                                                       # neural league player (snapshot/invited)
+            m["net"].to(cfg.device)
+            s2 = _score2_vs(cfg, net, m["net"], worlds, n)
+            w4 = _eval_winrate4_net(cfg, net, m["net"], worlds, n) if cfg.FOURP_ENABLED else 0.0
+            m["net"].to("cpu")
+        return s2, w4
+
+    def evict_mastered(self, net, worlds, n=None, neural=True):
+        """MEASURED eviction (start + every recal): remove every league member the learner has
+        MASTERED under ONE standard -- 2p seat-avg score s2 and 4p 1st-place rate w4 vs three copies,
+        mastered when ``s2 > MASTER_EVICT_2P_WR`` OR ``w4 > MASTER_EVICT_4P_WR`` (per-format; the 4p
+        clause is skipped when 4p is disabled). Covers scripted anchors AND neural league players
+        (snapshots + invited) -- the latter only when ``neural`` (gated by the caller to the heavier
+        full-recal/start path). NEVER touched: the rolling self-anchors (the Elo reference) and the
+        newest snapshot (the current self); keep-kinds random/greedy are never removed -- a re-mastered
+        ACTIVE watchdog retires to DORMANT instead."""
         cfg = self.cfg
         n = n or cfg.ELO_RECAL_ENVS
+        keep_newest = self._newest_snapshot()
         for m in list(self.members):
-            if m["net"] is not None or m["kind"] not in _OPP_BY_KIND:
+            is_script = (m["net"] is None and m["kind"] in _OPP_BY_KIND)
+            is_player = (m["net"] is not None and m["kind"] in ("snapshot", "invited"))
+            if not (is_script or (neural and is_player)) or m is keep_newest:
+                continue                                            # self-anchors / freshest self: never
+            s2, w4 = self._measure_mastery(net, m, worlds, n)
+            mastered = (s2 > cfg.MASTER_EVICT_2P_WR) or (cfg.FOURP_ENABLED and w4 > cfg.MASTER_EVICT_4P_WR)
+            m["mastered"] = bool(mastered)
+            if not mastered:
                 continue
-            s2 = _eval_score(cfg, net, m["kind"], worlds, n)
-            w4 = _eval_winrate4(cfg, net, m["kind"], worlds, n) if cfg.FOURP_ENABLED else 1.0
-            m["mastered"] = bool((s2 > cfg.MASTER_EVICT_2P_WR) or (w4 > cfg.MASTER_EVICT_4P_WR))   # v12.1: OR-gate (was AND) -- evict once mastered in EITHER format
-            if not m["mastered"]:
-                continue
-            if m["kind"] in cfg.MASTER_KEEP_KINDS:
+            if m["kind"] in cfg.MASTER_KEEP_KINDS:                  # random/greedy: retire watchdog, never remove
                 if m["kind"] in cfg.WATCHDOG_KINDS and m.get("wd_active", False):
-                    m["wd_active"] = False                          # re-mastered -> retire to calibration-only
+                    m["wd_active"] = False                          # re-mastered -> calibration-only
                     print("    [watchdog] %-8s re-mastered (2p=%.2f 4p_win=%.2f) -> back to DORMANT"
                           % (m["kind"], s2, w4))
             else:
                 self.members.remove(m)
-                print("    [evict] %-12s mastered (2p=%.2f 4p_win=%.2f) -> removed from league"
-                      % (m["kind"], s2, w4))
+                who = "script" if is_script else m["kind"]
+                print("    [evict] %-14s (%-7s) mastered (2p=%.2f 4p_win=%.2f) -> removed from league"
+                      % (m["label"], who, s2, w4))
 
     def _pfsp_weight(self, p):
         cfg = self.cfg

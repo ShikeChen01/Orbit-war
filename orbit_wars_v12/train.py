@@ -6,6 +6,7 @@ measured eviction, and best-by-mixed-gauntlet checkpointing. There are NO hand-c
 league IS the curriculum. The notebook's runtime globals are gone: the annealed entropy coefficient
 and the value-warmup policy coefficient are computed per-iter and passed into ``ppo_update``.
 """
+import copy
 import json
 import os
 import random
@@ -13,8 +14,9 @@ import time
 
 import torch
 
-from .checkpoint import load_train_state, save_ckpt, save_train_state
+from .checkpoint import _freeze_snapshot, load_train_state, save_ckpt, save_train_state
 from .env import GpuEnv
+from .grpo import grpo_update
 from .league import League, eval_gauntlet, eval_gauntlet4
 from .policy import build_policy
 from .ppo import ppo_update
@@ -65,6 +67,12 @@ class Trainer:
             print("resumed from %s -> global iter %d, best_wr %.2f, %d league members"
                   % (resume_from, start_it, best_wr, len(league.members)))
 
+        # GRPO reference policy for the optional KL penalty: freeze the (post-resume/BC) net once.
+        ref_net = None
+        if cfg.ALGO == "grpo" and cfg.GRPO_KL_COEF > 0.0:
+            ref_net = _freeze_snapshot(copy.deepcopy(net))
+            print("  [grpo] KL-to-reference enabled (beta=%.3g) -> froze current policy as reference" % cfg.GRPO_KL_COEF)
+
         hist = {"iter": [], "return": [], "win_rate": [],
                 "lnch_per_step": [], "approx_kl": [], "clipfrac": [], "sigma": [], "grad_norm": [],
                 "r_outcome": [], "r_capture": [], "r_milestone": [], "r_launch": [],
@@ -102,7 +110,8 @@ class Trainer:
             t0 = time.time()
             ent_coef = anneal_ent_coef(cfg, it)   # entropy anneal (anti collapse -> exploit)
             # v7 guardrails: linear LR warmup + critic-only warmup (both per train() CALL, not global iter)
-            policy_coef = 0.0 if step < cfg.VALUE_WARMUP_ITERS else 1.0
+            # GRPO has no critic to warm up -> always full policy weight.
+            policy_coef = 1.0 if cfg.ALGO == "grpo" else (0.0 if step < cfg.VALUE_WARMUP_ITERS else 1.0)
             if cfg.LR_WARMUP_ITERS > 0:
                 wf = min(1.0, (step + 1) / float(cfg.LR_WARMUP_ITERS))
                 for pg in opt.param_groups:
@@ -131,7 +140,10 @@ class Trainer:
 
             tb, rs, cursor = collect_ppo(cfg, env, net_fwd, pool, cursor, rng, seats,
                                          n_players=fmt, n_envs=(cfg.B if fmt == 2 else cfg.B_4P))
-            us = ppo_update(cfg, net_fwd, opt, tb, ent_coef, policy_coef)
+            if cfg.ALGO == "grpo":
+                us = grpo_update(cfg, net_fwd, opt, tb, ent_coef, policy_coef, ref_net=ref_net)
+            else:
+                us = ppo_update(cfg, net_fwd, opt, tb, ent_coef, policy_coef)
 
             # dual Elo: 2p = single update; 4p = pairwise vs every seat (cross-coupled inside)
             if fmt == 2:
