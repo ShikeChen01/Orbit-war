@@ -99,9 +99,10 @@ def play_greedy_vs_neural(cfg, net, opp_net, world, max_steps=None):
 
 
 def make_agent(cfg, net, args):
-    return mcts.MctsAgent(cfg, net, opp_kind=args.opp_model, n_sims=args.sims, c_puct=args.c_puct,
-                          K=args.K, value=args.value, turn_budget_s=args.turn_budget,
-                          crit_budget_s=args.crit_budget, bank_s=args.bank)
+    # flat per-turn budget (schedule=None) -> measures search lift at a FIXED budget; max_sims caps it.
+    return mcts.MctsAgent(cfg, net, opp_kind=args.opp_model, K=args.K, c_puct=args.c_puct,
+                          value=args.value, schedule=None, turn_budget_s=args.turn_budget,
+                          max_sims=args.sims, bank_s=args.bank)
 
 
 def main():

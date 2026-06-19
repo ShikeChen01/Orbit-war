@@ -82,6 +82,8 @@ class Config:
     GAMMA: float = 0.997
     GAE_LAMBDA: float = 0.98
     CLIP: float = 0.2
+    CLIP_HI: float = 0.0           # [D3/DAPO clip-higher] asymmetric UPPER clip 1+CLIP_HI (0 -> symmetric = CLIP)
+    RATIO_LENGTHNORM: bool = False # [D1/GSPO] divide the per-step log-ratio by #owned planets (geom-mean ratio)
     VF_COEF: float = 0.5
     ENT_COEF: float = 0.005
     MINIBATCHES: int = 64
@@ -91,6 +93,15 @@ class Config:
     LOGRATIO_CLAMP: float = 4.0    # clamp log importance-ratio before exp
     LOGIT_CLAMP: float = 8.0       # clamp dest_logits before softplus
     ADAM_EPS: float = 1e-5
+
+    # ---- auxiliary reward-prediction head (UNREAL-style; PPO path) --------------------------
+    # A shallow head off the SHARED trunk regresses the immediate per-step reward r_t as a supervised
+    # aux loss. It does NOT change the reward, the advantage, or the critic -- it only adds gradient to
+    # the trunk representation, which helps when the RL signal is terminal-dominated. Default OFF, so the
+    # net (and every existing checkpoint) is byte-identical until flipped; when on, the head is persisted
+    # in the ckpt config blob and rebuilt per-member, so pre-aux league snapshots still load unchanged.
+    AUX_REWARD_PRED: bool = False   # build + train the reward-prediction head (consumed by ppo_update only)
+    AUX_REWARD_COEF: float = 0.25   # weight of the aux reward MSE loss (shared-trunk regularizer)
 
     # ---- GRPO (group-relative PO; critic-free alternative to PPO+GAE) -----------------------
     # ALGO selects the optimizer at rollout+update time. "grpo" rolls each world out GRPO_GROUP
@@ -115,6 +126,31 @@ class Config:
     GRPO_PHI_A_MAX: float = 3.0     # [C] clamp on the fitted Phi->outcome slope (guards a degenerate OLS fit)
     GRPO_CRN: bool = False          # [D] common random numbers: couple NEURAL-opponent sampling noise within a
     #                                 world-group so the baseline isolates ego-action variance (lower-variance adv)
+    # ---- v12 GRPO advantage-estimator + variance flags (Tier 0-2; docs/grpo_v12.tex). WARNING: these
+    #      "anti-collapse" estimators (rank/cvar/sibling + center-only/Dr.GRPO) all caused PASSIVITY in the
+    #      3070 Ti ablation (docs/grpo_v12.tex Section "Empirical result"); the KEEPER is the LEGACY default
+    #      (GRPO_STD_NORM=True + symmetric decay). The ESTIMATOR flags are MUTUALLY EXCLUSIVE (train.py prints
+    #      the active one + warns); all default off. Re-ablate on the 3070 Ti before any A100 use.
+    ADV_TARGET_RMS: float = 0.0     # [Tier0/D4] pin the (center-only) advantage RMS to this (0 -> legacy whiten).
+    #                                 Stops league-difficulty from becoming a stealth LR schedule via Adam's eps.
+    GRPO_RANK_ADV: bool = False     # [C1] within-group RANK advantage (van der Waerden / NES rank-shaping): bounded
+    #                                 in [-sqrt3,sqrt3] -- but EMPIRICALLY went passive (bounded != good; discards margin)
+    GRPO_RB_GATE: bool = False      # [A1] Rao-Blackwellize the launch gate: de-noise the WHERE gradient with p_i
+    #                                 (expected fire) instead of the sampled 0/1 fire_i (exact, zero extra fwd)
+    GRPO_OPP_BASELINE_W: float = 0.0  # [E1] subtract the league's Elo-expected outcome vs THIS opponent before
+    #                                 centering (a no-op under 1-opponent-per-iter centering; enables E2 stratification)
+    GRPO_CVAR_ALPHA: float = 0.0    # [C2] risk-sensitive: baseline on the worst-alpha quantile (0 -> off). 0.5 = mild
+    GRPO_CVAR_LAMBDA: float = 1.0   # [C2] extra gradient weight on the tail (worst-alpha) rollouts
+    GRPO_AUX_VALUE: bool = False    # [B2/C5] train the (else-unused) value head by MC regression to the return as a
+    #                                 representation aux (does NOT enter the critic-free advantage; weights stay PPO-compat)
+    GRPO_AUX_COEF: float = 0.1      # [B2] weight of the value aux loss (kept small: shared-trunk regularizer)
+    GRPO_SIBLING_BASELINE: bool = False  # [B1] per-step baseline from matched-prefix siblings (shared-root VinePPO):
+    #                                 phi_ship-bucketed group mean at each step -> per-step credit (critic-free GAE)
+    GRPO_SIBLING_BUCKET_DELTA: float = 0.5  # [B1] phi_ship bucket width (log-ship units) for sibling matching
+    GRPO_SIBLING_MIN_PEERS: int = 4         # [B1] fall back to the whole-group mean when a bucket is thinner than this
+    GRPO_OPP_STRATA: int = 1        # [E2] RESERVED (not yet wired): would sample this many opponents/iter, one per
+    #                                 block of groups, so the baseline averages opponent strength. Needs a per-block
+    #                                 opponent rollout (invasive hot-loop change); E1 above is its no-op-until-then companion.
 
     # ---- training length (the Elo/PFSP league IS the curriculum) ---------------------------
     TOTAL_ITERS: int = 600

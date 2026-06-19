@@ -27,7 +27,108 @@ def _potentials(env):
     return phi_ship, (pe - pen) / tot
 
 
-def collect_ppo(cfg, env, net, world_pool, cursor, rng, seats, n_players=2, n_envs=None):
+def _opp_baseline(cfg, Re, opp_exp):
+    """[E1] subtract the league's Elo-expected outcome vs THIS opponent (a constant per iteration).
+    Under one-opponent-per-iter + per-group centering this is a no-op for the centered advantage; it
+    only bites once groups span opponents ([E2] GRPO_OPP_STRATA>1), which is exactly when it's needed."""
+    if cfg.GRPO_OPP_BASELINE_W > 0.0 and opp_exp is not None:
+        return Re - cfg.GRPO_OPP_BASELINE_W * (2.0 * float(opp_exp) - 1.0) * (cfg.WIN_BONUS / cfg.PPO_REWARD_SCALE)
+    return Re
+
+
+def grpo_flat_advantage(cfg, Re, outcome, G, nW, n_players=2, opp_exp=None):
+    """One scalar advantage per rollout (Bn,) + ``unit_scaled`` (already ~unit-variance, so the
+    buffer-level whitening should leave it alone). Selects the active GRPO advantage estimator:
+      [A]  analytic binary (2p) -- closed form at a Beta-shrunk win-rate;
+      [C1] rank -- within-group average rank, bounded in [-sqrt3, sqrt3], scale-INVARIANT (anti-collapse);
+      [C2] CVaR -- centre on the worst-alpha tail (risk-sensitive);
+      [B]  center-only / RLOO / per-group-std (the legacy ladder).
+    Shared by :func:`collect_ppo` and :func:`orbit_wars_v12.grpo_diag` so the run and the proof agree."""
+    Bn = Re.shape[0]
+    Re = _opp_baseline(cfg, Re, opp_exp)
+    Rg = Re.view(nW, G)
+    if cfg.GRPO_ANALYTIC_ADV and n_players == 2 and outcome is not None:
+        og = outcome.view(nW, G)
+        win = (og > 0.5).to(DTYPE); loss = (og < -0.5).to(DTYPE)
+        a0 = cfg.GRPO_ANALYTIC_ALPHA
+        p_hat = (win.sum(1, keepdim=True) + a0) / (G + 2.0 * a0)
+        Ae = (win * torch.sqrt((1.0 - p_hat) / p_hat) - loss * torch.sqrt(p_hat / (1.0 - p_hat))).reshape(Bn)
+        return Ae, True
+    if cfg.GRPO_RANK_ADV:                                            # [C1] van der Waerden average-rank score
+        gt = (Rg.unsqueeze(2) > Rg.unsqueeze(1)).to(DTYPE).sum(2)    # peers strictly below
+        eq = (Rg.unsqueeze(2) == Rg.unsqueeze(1)).to(DTYPE).sum(2)   # ties (incl. self) -> average rank
+        rank = gt + 0.5 * (eq - 1.0)                                 # in [0, G-1]
+        cG = ((G * G - 1.0) / 12.0) ** 0.5 + 1e-8                    # std of uniform ranks -> unit variance
+        Ae = ((rank - (G - 1) / 2.0) / cG).reshape(Bn)
+        return Ae, True
+    if cfg.GRPO_CVAR_ALPHA > 0.0:                                    # [C2] risk-sensitive worst-alpha baseline
+        k = max(1, int(round(cfg.GRPO_CVAR_ALPHA * G)))
+        qa = Rg.kthvalue(k, dim=1, keepdim=True).values
+        tail = (Rg <= qa).to(DTYPE)
+        cvar = (Rg * tail).sum(1, keepdim=True) / tail.sum(1, keepdim=True).clamp_min(1.0)
+        Ae = ((Rg - cvar) * (1.0 + cfg.GRPO_CVAR_LAMBDA * tail)).reshape(Bn)
+        return Ae, False
+    sum_g = Rg.sum(1, keepdim=True)                                  # [B] center (optionally RLOO) +/- per-group std
+    mu = (sum_g - Rg) / (G - 1) if (cfg.GRPO_LOO and G > 1) else sum_g / G
+    cen = Rg - mu
+    if cfg.GRPO_STD_NORM:
+        return (cen / (Rg.std(1, keepdim=True) + cfg.GRPO_ADV_EPS)).reshape(Bn), True
+    return cen.reshape(Bn), False
+
+
+def _grpo_sibling_advantage(cfg, Re, phiship, rew, alive, done, Tu, Bn, grp, opp_exp=None):
+    """[B1] Per-step credit from shared-root siblings (VinePPO-style). The G rollouts of a world-group
+    share s_0 and branch on the ego's actions; bucket them by quantized phi_ship at each step and use
+    the matched-bucket mean terminal return as a per-step value V_hat(s_t) (whole-group mean when a
+    bucket is thinner than GRPO_SIBLING_MIN_PEERS), then GAE(gamma,lambda) on the per-step reward."""
+    dev = Re.device
+    G, nW = grp
+    Re = _opp_baseline(cfg, Re, opp_exp)
+    Reg = Re.view(nW, G).unsqueeze(1)                              # (nW,1,G) peer (j) returns, broadcast over i
+    whole = Re.view(nW, G).mean(1, keepdim=True)                   # (nW,1) group-mean fallback
+    q = torch.round(phiship / cfg.GRPO_SIBLING_BUCKET_DELTA).view(Tu, nW, G)
+    alg = alive.view(Tu, nW, G)
+    Vhat = torch.zeros(Tu, Bn, device=dev)
+    for t in range(Tu):
+        same = (q[t].unsqueeze(2) == q[t].unsqueeze(1)).to(DTYPE) * alg[t].unsqueeze(1)   # (nW,G_i,G_j) alive same-bucket peers
+        cnt = same.sum(2)                                          # (nW,G) bucket occupancy
+        mean_bucket = (same * Reg).sum(2) / cnt.clamp_min(1.0)     # (nW,G) matched-bucket mean peer return
+        use = (cnt >= cfg.GRPO_SIBLING_MIN_PEERS).to(DTYPE)
+        Vhat[t] = (use * mean_bucket + (1.0 - use) * whole).reshape(Bn)
+    Vhat = Vhat * alive
+    adv = torch.zeros(Tu, Bn, device=dev)
+    A = torch.zeros(Bn, device=dev); nextval = torch.zeros(Bn, device=dev)
+    for t in range(Tu - 1, -1, -1):
+        nd = 1.0 - done[t]
+        delta = rew[t] + cfg.GAMMA * nextval * nd - Vhat[t]
+        A = delta + cfg.GAMMA * cfg.GAE_LAMBDA * nd * A
+        adv[t] = A * alive[t]
+        nextval = Vhat[t]; A = A * alive[t]
+    return adv.reshape(-1), (adv + Vhat).reshape(-1)
+
+
+def grpo_adv_mode(cfg, n_players=2):
+    """Resolve which (MUTUALLY EXCLUSIVE) advantage ESTIMATOR collect_ppo will actually use given the
+    flags + their precedence, and which other estimators are enabled-but-IGNORED. The estimator flags do
+    NOT stack -- turning several on silently selects ONE. Precedence (matches collect_ppo):
+        phi-value[C] > sibling[B1] > analytic[A] (2p only) > rank[C1] > cvar[C2] > center/std[B].
+    Orthogonal levers (clip-hi[D3], length-norm[D1], rb-gate[A1], aux-value[B2], opp-baseline[E1],
+    target-rms[D4], std/LOO) COMPOSE and are not part of this resolution. Returns (active, [ignored...])."""
+    if cfg.ALGO != "grpo":
+        return "ppo+gae", []
+    cands = [
+        ("phi-value[C]", bool(cfg.GRPO_PHI_VALUE and cfg.USE_POTENTIAL_SHAPING)),
+        ("sibling[B1]",  bool(cfg.GRPO_SIBLING_BASELINE)),
+        ("analytic[A]",  bool(cfg.GRPO_ANALYTIC_ADV and n_players == 2)),
+        ("rank[C1]",     bool(cfg.GRPO_RANK_ADV)),
+        ("cvar[C2]",     bool(cfg.GRPO_CVAR_ALPHA > 0.0)),
+    ]
+    enabled = [name for name, on in cands if on]
+    active = enabled[0] if enabled else ("drgrpo-center[B]" if not cfg.GRPO_STD_NORM else "legacy-std[B]")
+    return active, enabled[1:]
+
+
+def collect_ppo(cfg, env, net, world_pool, cursor, rng, seats, n_players=2, n_envs=None, opp_exp=None):
     """One PPO iteration (learner = player 0) vs `seats` -- league members filling pids
     1..n_players-1. Scripted anchors run fully on-GPU; neural members act per step (no-grad).
     On-GPU buffers + GPU GAE; reward = potential shaping + outcome. n_players=2 is the v7 path.
@@ -50,6 +151,7 @@ def collect_ppo(cfg, env, net, world_pool, cursor, rng, seats, n_players=2, n_en
     P = int(n_players)
     grpo = (cfg.ALGO == "grpo")
     phi_value = grpo and cfg.GRPO_PHI_VALUE and cfg.USE_POTENTIAL_SHAPING   # [C] Phi-as-value GAE (needs the potentials)
+    sib = grpo and cfg.GRPO_SIBLING_BASELINE and not phi_value             # [B1] per-step shared-root sibling baseline
     crn = grpo and cfg.GRPO_CRN                                             # [D] common-random-numbers opponent coupling
     if grpo:
         # GRPO render: tile nW distinct worlds into contiguous groups of G envs (one group = one
@@ -96,6 +198,7 @@ def collect_ppo(cfg, env, net, world_pool, cursor, rng, seats, n_players=2, n_en
     oldlp_buf = torch.zeros(T, Bn, device=dev); valid_buf = torch.zeros(T, Bn, device=dev)
     rew_buf = torch.zeros(T, Bn, device=dev); val_buf = torch.zeros(T, Bn, device=dev); done_buf = torch.zeros(T, Bn, device=dev)
     phi_buf = torch.zeros(T, Bn, device=dev) if phi_value else None        # [C] Phi(s_t) per step, fed to the V_hat baseline
+    phiship_buf = torch.zeros(T, Bn, device=dev) if sib else None          # [B1] phi_ship(s_t) per step, for sibling buckets
 
     active = torch.ones(Bn, device=dev); outcome = torch.zeros(Bn, device=dev)
     seat_sc = torch.zeros(len(specs), Bn, device=dev)   # pairwise score vs each seat, frozen at term
@@ -181,6 +284,8 @@ def collect_ppo(cfg, env, net, world_pool, cursor, rng, seats, n_players=2, n_en
         step_sum = step_sum + a
 
         s_all, alive_all = settle_n(env)
+        if sib:                             # [B1] ship-margin position s_{t} for matched-prefix sibling buckets
+            phiship_buf[t] = ship_log_t(s_all[:, 0]) - ship_log_t(s_all[:, 1:].max(1).values)
         step_now = env.step_ct
         n_alive = alive_all.to(DTYPE).sum(1)
         term = (step_now >= float(T - 2)) | (n_alive <= 1.0) | (~alive_all[:, 0])   # ego dead -> decided
@@ -227,26 +332,15 @@ def collect_ppo(cfg, env, net, world_pool, cursor, rng, seats, n_players=2, n_en
     last_idx = (length - 1.0).clamp_min(0.0).long().unsqueeze(0)
     rew.scatter_add_(0, last_idx, Ot.unsqueeze(0))
 
-    if grpo and not phi_value:
+    Re = (Ot if cfg.GRPO_OUTCOME_ONLY else (rew * alive).sum(0)) if grpo else None   # (Bn,) per-env return
+    adv = None; unit_scaled = False
+    if grpo and sib:
+        # ---- [B1] per-step credit from matched-prefix shared-root siblings (critic-free GAE) ----
+        adv_full, ret_full = _grpo_sibling_advantage(cfg, Re, phiship_buf[:Tu], rew, alive, done, Tu, Bn, _grp, opp_exp)
+    elif grpo and not phi_value:
         # ---- flat group-relative advantage: one scalar per rollout, broadcast over its steps ----
         G, nW = _grp
-        Re = Ot if cfg.GRPO_OUTCOME_ONLY else (rew * alive).sum(0)   # (Bn,) per-env return
-        Rg = Re.view(nW, G)
-        if cfg.GRPO_ANALYTIC_ADV and n_players == 2:
-            # [A] closed-form binary advantage at a Beta(alpha,alpha)-shrunk per-group win-rate p~ (docs/grpo_v12.tex):
-            #     A_win = sqrt((1-p~)/p~),  A_loss = -sqrt(p~/(1-p~)),  draws -> 0.  No divide-by-std, so the
-            #     within-loss-group length signal vanishes and the p~ shrink removes the empty-group corner.
-            og = outcome.view(nW, G)
-            win = (og > 0.5).to(DTYPE); loss = (og < -0.5).to(DTYPE)
-            a0 = cfg.GRPO_ANALYTIC_ALPHA
-            p_hat = (win.sum(1, keepdim=True) + a0) / (G + 2.0 * a0)
-            Ae = (win * torch.sqrt((1.0 - p_hat) / p_hat) - loss * torch.sqrt(p_hat / (1.0 - p_hat))).reshape(Bn)
-        else:
-            # [B] center (optionally leave-one-out RLOO) then optionally divide by the per-group std.
-            sum_g = Rg.sum(1, keepdim=True)
-            mu = (sum_g - Rg) / (G - 1) if (cfg.GRPO_LOO and G > 1) else sum_g / G
-            cen = Rg - mu
-            Ae = (cen / (Rg.std(1, keepdim=True) + cfg.GRPO_ADV_EPS) if cfg.GRPO_STD_NORM else cen).reshape(Bn)
+        Ae, unit_scaled = grpo_flat_advantage(cfg, Re, outcome, G, nW, n_players, opp_exp)   # [A]/[B]/[C1]/[C2]/[E1]
         adv = Ae.unsqueeze(0).expand(Tu, Bn) * alive
         ret_full = Re.unsqueeze(0).expand(Tu, Bn).reshape(-1)        # placeholder (no critic target)
         adv_full = adv.reshape(-1)
@@ -255,7 +349,7 @@ def collect_ppo(cfg, env, net, world_pool, cursor, rng, seats, n_players=2, n_en
         # The shared root mu_g (= group baseline) cancels world difficulty; a*dPhi propagates the
         # sparse outcome to the moves that improved position. a is the OLS slope of outcome on terminal dPhi.
         G, nW = _grp
-        Re = Ot if cfg.GRPO_OUTCOME_ONLY else (rew * alive).sum(0)
+        Re = _opp_baseline(cfg, Re, opp_exp)
         Rg = Re.view(nW, G); sum_g = Rg.sum(1, keepdim=True)
         mu_g = (sum_g - Rg) / (G - 1) if (cfg.GRPO_LOO and G > 1) else (sum_g / G).expand(nW, G)
         mu = mu_g.reshape(Bn)                                       # V_hat(s_0), one baseline per rollout
@@ -299,16 +393,22 @@ def collect_ppo(cfg, env, net, world_pool, cursor, rng, seats, n_players=2, n_en
     tb["action"] = sel(act_buf[:Tu].reshape(Tu * Bn, Ec, Ec + 1))
     tb["old_logp"] = sel(oldlp_buf[:Tu].reshape(Tu * Bn))
     adv_s = sel(adv_full)
-    # The flat per-group path WITH std-norm is already unit-scaled (leave it). Every other path --
-    # center-only [B], phi-value [C], explicit GRPO_WHITEN, or PPO -- gets ONE global scale, which
-    # (unlike the per-group std) preserves the cross-group p(1-p) gradient weighting (docs/grpo_v12.tex [B]).
-    if grpo and not phi_value and cfg.GRPO_STD_NORM and not cfg.GRPO_WHITEN:
+    # An already ~unit-variance path ([B] per-group std, [C1] rank, [A] analytic) is left as-is. Every
+    # other path -- center-only [B], CVaR [C2], phi-value [C], sibling [B1], explicit GRPO_WHITEN, or PPO --
+    # gets ONE GLOBAL scale, preserving the cross-group p(1-p) weighting (docs/grpo_v12.tex [B]). [Tier0/D4]
+    # ADV_TARGET_RMS pins that scale to a constant so league difficulty can't drift the effective LR via Adam.
+    if grpo and unit_scaled and not cfg.GRPO_WHITEN:
         tb["advantage"] = adv_s
+    elif grpo and cfg.ADV_TARGET_RMS > 0.0:
+        rms = adv_s.pow(2).mean().sqrt().clamp_min(1e-8)
+        tb["advantage"] = (adv_s - adv_s.mean()) * (cfg.ADV_TARGET_RMS / rms)
     else:
         tb["advantage"] = (adv_s - adv_s.mean()) / (adv_s.std() + 1e-8)
     tb["returns"] = sel(ret_full)
+    if cfg.AUX_REWARD_PRED:                                 # aux reward-prediction target: the per-step reward r_t
+        tb["reward"] = sel(rew.reshape(-1))                # (the same signal GAE consumes; includes the terminal payment)
     tb["n"] = keep.shape[0]
-    del ent_buf, em_buf, am_buf, gl_buf, act_buf, oldlp_buf, val_buf, rew_buf, done_buf, valid_buf, adv, adv_full, ret_full
+    del ent_buf, em_buf, am_buf, gl_buf, act_buf, oldlp_buf, val_buf, rew_buf, done_buf, valid_buf, adv_full, ret_full
 
     step_total = step_sum.sum().item()
     stats = {
@@ -326,5 +426,9 @@ def collect_ppo(cfg, env, net, world_pool, cursor, rng, seats, n_players=2, n_en
         "r_capture": captureR.mean().item(),      # = ship-margin shaping when USE_POTENTIAL_SHAPING
         "r_launch": launchR.mean().item(),
         "r_milestone": prodMR.mean().item(),      # = production-share shaping when USE_POTENTIAL_SHAPING
+        # advantage-health diagnostics (anti-collapse proof): the FINAL advantage fed to the surrogate.
+        # The legacy per-group-std path can explode on near-degenerate groups; rank/Dr.GRPO stay bounded.
+        "adv_absmax": float(tb["advantage"].abs().max().item()) if tb["n"] > 0 else 0.0,
+        "adv_std": float(tb["advantage"].std().item()) if tb["n"] > 1 else 0.0,
     }
     return tb, stats, cursor

@@ -1,0 +1,384 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+\usepackage{xcolor}
+
+% inline code identifier that prints underscores literally (no manual escaping)
+\newcommand{\cd}[1]{\texttt{\detokenize{#1}}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+
+\setlist{itemsep=2pt,topsep=3pt}
+
+\title{\textbf{Orbit Wars --- v12 Network \& Representation Reference}\\[3pt]
+\large Observation encoding, the two trunk architectures (legacy ResNet-MLP and the\\
+stacked transformer), the actor/critic heads, and the gated-allocation action space}
+\author{Source of truth: the \texttt{orbit\_wars\_v12/} package}
+\date{2026-06-19}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent This is the \emph{architecture and representation} reference for the v12 stack: what the
+policy sees (observation encoding), how it processes it (the two interchangeable trunks), and what it
+emits (the gated-allocation action and its distributions). Every number here is read directly from
+the package modules \cd{constants.py}, \cd{config.py}, \cd{env.py}, \cd{policy.py}, and
+\cd{distributions.py}, and parameter counts are taken from instantiated nets. It documents only what
+is wired and operational. The separate document \cd{grpo_v12.tex} covers the critic-free RL
+\emph{update} and a family of variance-reduction tricks --- many of which are experimental or have
+been ruled out --- and should \emph{not} be read as a description of the shipped architecture.
+\end{abstract}
+
+\tableofcontents
+\bigskip
+
+%==================================================================================================
+\section{Fixed dimensions}
+These never vary between runs (\cd{constants.py}); they are game/representation physics, not config.
+
+\begin{center}
+\begin{tabular}{@{}llL{0.52\linewidth}@{}}
+\toprule
+Symbol & Value & Meaning \\
+\midrule
+\cd{PLANET_CAP} ($E$)    & 48  & planet/comet slots per env = destination-categorical size \\
+\cd{F_DIM} ($F$)         & 104 & per-planet feature width = 14 body $+$ 90 threat \\
+\cd{N_BODY_FEATURES}     & 14  & per-planet body features (v9: 4-channel seat one-hot ownership) \\
+\cd{N_THREAT_FLEETS}     & 30  & inbound-fleet slots/planet = \cd{N_SOON} 15 $+$ \cd{N_BIG} 15 \\
+\cd{G_DIM} ($G$)         & 10  & board-global features \\
+\cd{BOARD_SIZE}          & 100 & square board; \cd{CENTER}$=50$, \cd{SUN_RADIUS}$=10$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Tensor shapes for a batch of $B$ envs ($B=\cd{NUM_GROUPS}\times\cd{GROUP_SIZE}$):
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Tensor & Shape & Notes \\
+\midrule
+\cd{entities}     & $(B, 48, 104)$   & per-planet features, dead slots zeroed \\
+\cd{entity_mask}  & $(B, 48)$        & $1$ = a live planet/comet slot ($=\cd{p_alive}$) \\
+\cd{action_mask}  & $(B, 48)$        & $1$ = legal launch source (own, alive, ships$>0$) \\
+\cd{globals}      & $(B, 10)$        & board summary, ego-relative \\
+action            & $(B, 48, 49)$    & gated allocation: $[{:}48]$ WHERE row, $[48]$ fire $\in\{0,1\}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%==================================================================================================
+\section{Observation encoding (\texttt{env\_encode})}
+All features are computed \emph{ego-relative} (relative to the acting seat \cd{ego}), so the same
+network plays any seat. Ownership is a \textbf{4-channel ego-relative seat one-hot} (v9): for body $b$
+with owner $o$, channel $r=(o-\text{ego})\bmod n_{\text{players}}$ fires; neutral bodies are all-zero.
+Channel 0 is always ``me''; in 2p only channels 0--1 ever fire, so 4p reuses the identical input
+space.
+
+\subsection{Per-planet body features (14)}
+\begin{center}
+\begin{tabular}{@{}clL{0.56\linewidth}@{}}
+\toprule
+idx & expr & meaning (normalization) \\
+\midrule
+0  & \cd{p_x / BOARD_SIZE}        & x position $\in[0,1]$ \\
+1  & \cd{p_y / BOARD_SIZE}        & y position $\in[0,1]$ \\
+2  & \cd{vmag / THREAT_MAX_SPEED} & orbital tangential speed $|\omega|\cdot d$ if rotating, else 0 (\,/6) \\
+3  & \cd{cw}                      & rotation sense: $+1$ CCW, $-1$ CW, $0$ if static/comet \\
+4  & \cd{p_radius / 3}            & planet radius \\
+5  & \cd{p_prod / 5}              & production rate \\
+6  & \cd{ship_log_t(p_ships)}     & garrison, log-compressed $\log_{1p}(n)/\log 1000$ \\
+7--10 & seat one-hot $[b_{7a..d}]$ & ownership [self, enemy$+1$, enemy$+2$, enemy$+3$]; neutral all-0 \\
+11 & \cd{dist / DIAG_HALF}        & distance from sun/centre (\,/ half-diagonal) \\
+12 & \cd{comet}                   & 1 if this slot is a comet \\
+13 & \cd{actable}                 & 1 if own $\wedge$ alive $\wedge$ ships$>0$ ($=\cd{action_mask}$) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Per-planet threat features (90 $=3\times30$)}
+For each planet slot, among all in-flight fleets \emph{currently targeting it} (analytic aim from
+\cd{fleet_target_batch}), select the \cd{N_SOON}$=15$ smallest-ETA fleets and the \cd{N_BIG}$=15$
+largest fleets (size key $|\text{ships}|\cdot2^{20}-\text{seq}$ for a stable tie-break), giving up to
+30 inbound-fleet descriptors; missing slots are zero-padded. Each descriptor is 3 features:
+\begin{itemize}
+  \item \cd{sgn} --- $+1$ if the fleet is the ego's, $-1$ if an opponent's;
+  \item \cd{etf} --- $\text{ETA}/\cd{THREAT_ETA_SCALE}$ (\,/100);
+  \item \cd{slg} --- $\cd{ship_log_t}(|\text{ships}|)$, log-compressed fleet size.
+\end{itemize}
+Stacked as $(\,\cd{sgn},\cd{etf},\cd{slg}\,)\times 30 = 90$. Final
+$\cd{entities}=[\text{body}\,\Vert\,\text{threat}]$ is multiplied by \cd{p_alive} so dead slots are 0.
+
+\subsection{Board globals (10)}
+\begin{center}
+\begin{tabular}{@{}clL{0.56\linewidth}@{}}
+\toprule
+idx & expr & meaning \\
+\midrule
+0 & \cd{step_ct / T}              & game progress (time fraction) \\
+1 & \cd{ang_vel * 10}            & board rotation angular velocity \\
+2 & \cd{ship_log_t(my_ships)}    & my total garrison (log) \\
+3 & \cd{ship_log_t(en_ships)}    & all-opponents garrison, pooled (log) \\
+4 & \cd{my_pl / total}           & fraction of live bodies I own \\
+5 & \cd{en_pl / total}           & fraction opponents own \\
+6 & \cd{neu_pl / total}          & fraction neutral \\
+7 & \cd{ship_log_t(my_fleet)}    & my in-flight fleet ships (log) \\
+8 & \cd{ship_log_t(en_fleet)}    & opponents' in-flight fleet ships (log) \\
+9 & \cd{min(npl,40)/40}          & live-body count, scaled \\
+\bottomrule
+\end{tabular}
+\end{center}
+The per-planet ownership is a one-hot \emph{per opponent}, but the global enemy aggregates (idx 3, 5,
+8) pool \emph{all} opponents (an everyone-vs-me summary).
+
+%==================================================================================================
+\section{Trunk architectures (\texttt{policy.py})}
+The trunk maps \cd{entities} $(B,E,F)$ to per-planet feature tokens $(B,E,h)$ with $h=\cd{HIDDEN}$.
+\cd{cfg.ARCH} selects one of two interchangeable trunks; everything downstream (heads, action,
+checkpoint format) is identical. The activation in every ResNet-MLP block is \cd{cfg.ACT_FN}
+(default \texttt{tanh}).
+
+\subsection{Legacy ResNet-MLP trunk (\texttt{ARCH="trunk"}, the default)}
+\begin{verbatim}
+  entities (B,E,104)
+     -> proj:  Linear(104 -> 512)
+     -> [optional] cross-planet single-head self-attention   (USE_ATTENTION, default OFF)
+            pre-LN: x = x + attn_o( softmax(QK^T/sqrt h, dead-key masked) V )
+     -> [optional] GLU:  x = x + glu_out( glu_val(x) * sigmoid(glu_gate(x)) )   (USE_GLU, ON)
+     -> N_RES_BLOCKS x  pre-LN ResNet-MLP block:
+            x = x + res_b[i]( act( res_a[i]( LN(x) ) ) )      (N_RES_BLOCKS = 86)
+     -> ln_out: LayerNorm(512)
+\end{verbatim}
+\textbf{Block used:} pre-LayerNorm residual MLP (two $h\times h$ linears with a pointwise activation
+between, added back as a skip). At the default width/depth this is the ``\textbf{512$\times$86}''
+trunk. With \cd{GRAD_CHECKPOINT} (default \emph{on}) the residual blocks are activation-checkpointed
+(recomputed in the backward pass) so the deep stack fits in VRAM.
+
+\textbf{Important:} \cd{USE_ATTENTION} defaults to \emph{False}, so at the shipped defaults the legacy
+trunk has \emph{no cross-planet mixing inside the trunk} --- each planet token is processed
+independently; planets only interact later, at the masked-mean value pool and the bilinear WHERE head.
+The transformer trunk (below) restores per-layer cross-planet attention.
+
+\subsection{Stacked transformer trunk (\texttt{ARCH="transformer"})}
+\begin{verbatim}
+  entities (B,E,104)
+     -> proj:   Linear(104 -> 512)
+     -> stem:   N_STEM_RES x pre-LN ResNet-MLP block   (=1, blocks PRE-attention)
+     -> stack:  N_TX_LAYERS x TxEncoderLayer           (=6)
+     -> head:   N_HEAD_RES x pre-LN ResNet-MLP block   (=4, blocks POST-attention)
+     -> ln_out: LayerNorm(512)
+\end{verbatim}
+So the "pre / post attention" blocks the question asks about are the \textbf{stem} (\cd{N_STEM_RES},
+before the encoder stack) and the \textbf{head} (\cd{N_HEAD_RES}, after it) --- both are the same
+pre-LN ResNet-MLP block as the legacy trunk. The attention itself lives in \cd{N_TX_LAYERS} encoder
+layers.
+
+\paragraph{One \texttt{TxEncoderLayer} (pre-LN encoder block).}
+\[
+  x \leftarrow x + \mathrm{MHA}\big(\mathrm{LN}_1(x)\big),
+  \qquad
+  x \leftarrow x + \mathrm{MLP}\big(\mathrm{LN}_2(x)\big).
+\]
+\begin{itemize}
+  \item \textbf{Multi-head attention:} \cd{N_HEADS} heads (head dim $=h/\cd{N_HEADS}$), separate
+        \cd{q},\cd{k},\cd{v},\cd{o} linears, computed with
+        \cd{F.scaled_dot_product_attention} (flash / mem-efficient). Dead-planet \emph{keys} are
+        masked with an additive $-10^9$, matching the legacy single-head mask.
+  \item \textbf{MLP:} \cd{mlp_in}: Linear($h\to\cd{TX_MLP_RATIO}\cdot h$), activation,
+        \cd{mlp_out}: Linear back to $h$. Default ratio 4 $\Rightarrow$ hidden 2048.
+\end{itemize}
+
+\paragraph{Heads-divide-width footgun.} \cd{N_HEADS} must divide \cd{HIDDEN}
+(\texttt{assert h \% n\_heads == 0}). The config \emph{defaults} pair \cd{HIDDEN}$=512$ with
+\cd{N_HEADS}$=12$, which is \emph{invalid} ($512/12$ is not integer); building a 512-wide transformer
+requires overriding \cd{N_HEADS} (e.g.\ 8, head dim 64 --- the value \cd{INVITE_CFG} uses). The
+numbers below use 8 heads at width 512.
+
+%==================================================================================================
+\section{Heads (shared by both trunks)}
+Trunk tokens $\cd{tok}\in\R^{B\times E\times h}$ and a board-globals embedding
+$\cd{gp}=\mathrm{relu}(\cd{g_embed}(\cd{globals}))\in\R^{B\times d_g}$ ($d_g=\cd{D_G}=32$) feed all
+heads; per planet the head input is $hh=[\cd{tok}\,\Vert\,\cd{gp}]\in\R^{h+d_g}$ ($=544$).
+
+\begin{itemize}
+  \item \textbf{WHERE head} (\cd{DEST_HEAD}, default \texttt{bilinear}): pointer scores
+        $\cd{dest_logits}[b,s,d]=\langle \cd{dest_q}(hh_s),\,\cd{dest_k}(hh_d)\rangle/\sqrt h$,
+        a $(B,E,E)$ source$\times$destination matrix. (\texttt{linear} alternative: one
+        Linear($544\to E$).)
+  \item \textbf{GATE head:} \cd{gate_head} Linear($544\to1$) $\Rightarrow$ per-source launch logit
+        $(B,E)$.
+  \item \textbf{VALUE head (critic):} masked-mean pool of \cd{tok} over live planets, concat
+        \cd{gp}, then \cd{val_in} Linear($544\to h$) $\to$ \cd{VALUE_RES_BLOCKS} pre-LN ResNet-MLP
+        blocks ($=4$) $\to$ \cd{val_out} Linear($h\to1$). Targets are normalized by \textbf{PopArt}
+        (output-preserving running mean/var; the head predicts normalized values, raw
+        $V=\text{denorm}$).
+  \item \textbf{AUX reward head} (optional, \cd{AUX_REWARD_PRED}, default off): a shallow
+        \cd{rew_in}$\to$act$\to$\cd{rew_out} off the \emph{same} pooled features, regressing the
+        per-step reward $r_t$ as a representation auxiliary. Built only when enabled, so checkpoints
+        are byte-identical when off.
+\end{itemize}
+
+%==================================================================================================
+\section{Action space \& distributions (\texttt{distributions.py})}
+The actor is a \textbf{gated per-source allocation}. For every owned source planet it emits a WHERE
+distribution over destinations and a launch GATE. \emph{On fire, the planet dispatches its full
+garrison routed by the WHERE row; on no-fire it holds.} The action bundle is $(B,E,E{+}1)$:
+$[\,{:}E\,]$ is the allocation row, $[\,E\,]$ is fire $\in\{0,1\}$. Log-prob and entropy \emph{sum
+over owned sources} (the WHERE term only counts when firing).
+
+\subsection{Destination masking}
+WHERE logits are clamped to $\pm\cd{LOGIT_CLAMP}$ ($=8$) and then masked to $-10^9$ on: the diagonal
+(self), dead destinations (\cd{alive}$<0.5$), and sun-blocked destinations (\cd{reach}$<0.5$, a
+straight shot absorbed by the sun, recovered geometrically in both rollout and update). So the WHERE
+support is exactly the legal, reachable targets.
+
+\subsection{The gate (both variants)}
+$g=\sigma(\cd{gate_logit})$. \textbf{Train:} $p=g$ (smooth, full-support gradient --- the deadzone
+clamp used to zero it and vanish the gate gradient). \textbf{Deploy:} hard deadzone
+$p=\mathrm{clip}\!\big((g-\cd{GATE_TRIM_LO})/(\cd{GATE_TRIM_HI}-\cd{GATE_TRIM_LO}),0,1\big)$. Then
+$p\leftarrow\mathrm{clip}(p,\cd{GATE_EPS},1-\cd{GATE_EPS})$ and $\text{fire}\sim\text{Bernoulli}(p)$.
+The gate is a \emph{logistic} (sigmoid), not a softmax.
+
+\subsection{\texttt{GatedCatDist} --- categorical WHERE (v7 default, \texttt{WHERE\_DIST="categorical"})}
+This is where the per-source \textbf{softmax} lives. After masking,
+\[
+  \cd{lsm}=\log\mathrm{softmax}(\cd{glogits},\,\text{dim}={-}1)\in\R^{B\times E\times E},
+\]
+a log-probability over destinations \emph{for each source planet}. Then:
+\begin{itemize}
+  \item \textbf{sample:} dest $\sim$ Categorical(\cd{lsm}); fire $\sim$ Bernoulli($p$). (With
+        \cd{GRPO_CRN} the WHERE Gumbel-max noise and the gate uniform are shared across a world-group
+        --- common random numbers.)
+  \item \textbf{log-prob (per source):}
+        $\ell = \underbrace{\text{fire}\log p+(1-\text{fire})\log(1-p)}_{\text{gate}}
+        + \text{fire}\cdot \cd{lsm}[\,\text{dest}\,]$, summed over owned sources. (Optionally the
+        WHERE term is Rao-Blackwellized over the gate Bernoulli, \cd{GRPO_RB_GATE}.)
+  \item \textbf{entropy:} Bernoulli gate entropy $+\;\cd{ENT_DIR_COEF}\cdot p\cdot H_{\text{cat}}$,
+        where $H_{\text{cat}}\le\ln E$ is bounded. \cd{ENT_DIR_COEF} defaults to 0, so the bonus is
+        \emph{gate-only} (the categorical entropy would blur a BC-sharpened WHERE head).
+  \item \textbf{greedy / deploy:} dest $=\arg\max\cd{glogits}$; fire sampled at the trained rate.
+\end{itemize}
+The bounded-sensitivity $\log\mathrm{softmax}$ log-prob is what makes PPO-after-BC stable.
+
+\subsection{\texttt{GatedAllocDist} --- Dirichlet WHERE (v6 A/B alternative)}
+$\alpha=\mathrm{softplus}(\text{logits})\cdot\cd{ALLOC_KAPPA}+10^{-3}$, rows $\sim$
+Dirichlet($\alpha$); the full garrison is split across destinations by the sampled simplex. Its
+greedy decode uses a \emph{temperature-sharpened} softmax ($\tau=\cd{GREEDY_TAU}=0.5$) over the masked
+logits, because the Dirichlet mean spreads the garrison too thin to land a concentrated strike.
+
+%==================================================================================================
+\section{Parameter counts}
+From instantiated nets (fp32). ``trunk'' = representation only; ``heads'' = g\_embed + WHERE + gate +
+value (aux head off). $E=48$, $F=104$, $G=10$, $d_g=32$, \cd{VALUE_RES_BLOCKS}$=4$ throughout.
+
+\subsection{Legacy ResNet-MLP trunk}
+\begin{center}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+config & trunk & heads & \textbf{total} & fp32 / fp16 \\
+\midrule
+\textbf{512$\times$86} (default) & 46.11\,M & 2.94\,M & \textbf{49.05\,M} & 196 / 98\,MB \\
+512$\times$32                    & 17.69\,M & 2.94\,M & \textbf{20.63\,M} & 82 / 41\,MB \\
+256$\times$32                    & 4.62\,M  & 0.59\,M & \textbf{5.20\,M}  & 21 / 10\,MB \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Component breakdown of the default \textbf{512$\times$86}:
+\begin{center}
+\begin{tabular}{@{}lr@{}}
+\toprule
+component & params \\
+\midrule
+\cd{proj} ($104\to512$)                        & 53{,}760 \\
+GLU (\cd{glu_gate}+\cd{glu_val}+\cd{glu_out})   & 787{,}968 \\
+86 ResNet-MLP blocks (\cd{res_a}+\cd{res_b})    & 45{,}176{,}832 \\
+\cd{ln_res}+\cd{ln_out}                         & 89{,}088 \\
+\cd{g_embed} ($10\to32$)                        & 352 \\
+WHERE (\cd{dest_q}+\cd{dest_k})                 & 558{,}080 \\
+GATE                                            & 545 \\
+VALUE (in + 4 res + ln + out)                   & 2{,}384{,}897 \\
+\midrule
+\textbf{total}                                  & \textbf{49{,}051{,}522} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Stacked transformer trunk (8 heads, head dim 64 at width 512)}
+\begin{center}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+config & trunk & heads & \textbf{total} & fp32 / fp16 \\
+\midrule
+512h / 6L / 8-head (current cfg, heads fixed)  & 21.60\,M & 2.94\,M & \textbf{24.54\,M} & 98 / 49\,MB \\
+512h / 12L / 8-head (it426-class)              & 40.52\,M & 2.94\,M & \textbf{43.46\,M} & 174 / 87\,MB \\
+256h / 4L / 8-head (\cd{INVITE_CFG} canonical) & 3.60\,M  & 0.34\,M & \textbf{3.94\,M}  & 16 / 8\,MB \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Component breakdown of \textbf{512h / 6L / 8-head} (per-encoder-layer $=3{,}152{,}384$):
+\begin{center}
+\begin{tabular}{@{}lr@{}}
+\toprule
+component & params \\
+\midrule
+\cd{proj} ($104\to512$)                                  & 53{,}760 \\
+stem (\cd{N_STEM_RES}$=1$ pre-attn ResNet-MLP)           & 526{,}336 \\
+6$\times$ MHA (\cd{q},\cd{k},\cd{v},\cd{o})              & 6{,}303{,}744 \\
+6$\times$ MLP (\cd{mlp_in}+\cd{mlp_out}, ratio 4)        & 12{,}598{,}272 \\
+6$\times$ LayerNorm (LN$_1$,LN$_2$)                      & 12{,}288 \\
+head (\cd{N_HEAD_RES}$=4$ post-attn ResNet-MLP)          & 2{,}105{,}344 \\
+\cd{ln_out}                                              & 1{,}024 \\
+heads (g\_embed + WHERE + gate + value)                  & 2{,}943{,}874 \\
+\midrule
+\textbf{total}                                           & \textbf{24{,}544{,}642} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Submission size ceiling.} The Kaggle 100\,MB cap implies $\le 26$\,M params at fp32; the
+default 512$\times$86 (49\,M) and the 512h/12L transformer (43\,M) only fit at fp16. The 512$\times$32
+trunk and the 512h/6L transformer are the largest fp32-shippable configs.
+
+%==================================================================================================
+\section{Config-knob map}
+The architecture is fully determined by these \cd{Config} fields (\cd{config.py}); defaults shown.
+
+\begin{center}
+\begin{tabular}{@{}llL{0.45\linewidth}@{}}
+\toprule
+field & default & controls \\
+\midrule
+\cd{ARCH}            & \texttt{"trunk"}     & legacy ResNet-MLP vs \texttt{"transformer"} \\
+\cd{HIDDEN}          & 512                  & trunk width $h$ \\
+\cd{N_RES_BLOCKS}    & 86                   & [trunk] residual MLP blocks \\
+\cd{USE_GLU}         & True                 & [trunk] GLU mixing block \\
+\cd{USE_ATTENTION}   & False                & [trunk] cross-planet self-attention \\
+\cd{N_TX_LAYERS}     & 6                    & [tx] encoder layers \\
+\cd{N_HEADS}         & 12                   & [tx] attention heads (must divide \cd{HIDDEN}!) \\
+\cd{TX_MLP_RATIO}    & 4                    & [tx] per-layer MLP expansion \\
+\cd{N_STEM_RES}      & 1                    & [tx] ResNet-MLP blocks \emph{before} the stack \\
+\cd{N_HEAD_RES}      & 4                    & [tx] ResNet-MLP blocks \emph{after} the stack \\
+\cd{VALUE_RES_BLOCKS}& 4                    & critic-head residual blocks \\
+\cd{D_G}             & 32                   & board-globals embedding dim \\
+\cd{ACT_FN}          & \texttt{"tanh"}      & ResNet-MLP activation \\
+\cd{DEST_HEAD}       & \texttt{"bilinear"}  & WHERE head: pointer vs linear \\
+\cd{WHERE_DIST}      & \texttt{"categorical"} & actor: \cd{GatedCatDist} vs Dirichlet \\
+\cd{USE_POPART}      & True                 & value-target normalization \\
+\cd{GRAD_CHECKPOINT} & True                 & activation-checkpoint trunk blocks \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\end{document}

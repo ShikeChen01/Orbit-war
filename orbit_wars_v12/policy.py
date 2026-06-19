@@ -128,7 +128,7 @@ class PolicyNet(nn.Module):
     def __init__(self, cfg, F, G, hidden, d_g, max_entities, n_res_blocks, use_glu, init_gate_bias,
                  use_attention=True,
                  value_res_blocks=2, arch="trunk", n_heads=8, n_tx_layers=4, tx_mlp_ratio=4,
-                 n_stem_res=1, n_head_res=1, act='relu'):
+                 n_stem_res=1, n_head_res=1, act='relu', aux_reward_pred=False):
         super().__init__()
         self.F, self.G, self.h, self.d_g, self.E = F, G, hidden, d_g, max_entities
         self.use_glu = use_glu
@@ -165,6 +165,14 @@ class PolicyNet(nn.Module):
         self.val_res_b = nn.ModuleList([nn.Linear(h, h) for _ in range(value_res_blocks)])
         self.val_ln = nn.ModuleList([nn.LayerNorm(h) for _ in range(value_res_blocks)])
         self.val_out = nn.Linear(h, 1)
+        # auxiliary reward-prediction head (UNREAL): a SHALLOW head off the same pooled trunk features
+        # regresses the immediate per-step reward r_t. Deliberately shallow -- the point is to pressure
+        # the TRUNK, not to fit r_t with a deep head. Built only when enabled, so the state_dict (and every
+        # existing checkpoint) is unchanged when off; this flag is persisted in the ckpt config blob.
+        self.aux_reward_pred = bool(aux_reward_pred)
+        if self.aux_reward_pred:
+            self.rew_in = nn.Linear(h + d_g, h)
+            self.rew_out = nn.Linear(h, 1)
         # calm init: few planets fire at start (negative gate bias); WHERE small-init -> ~uniform
         with torch.no_grad():
             self.gate_head.bias.fill_(init_gate_bias)
@@ -217,7 +225,10 @@ class PolicyNet(nn.Module):
         for i in range(len(self.val_res_a)):                           # residual blocks (skip per block)
             vh = vh + self.val_res_b[i](self.act_fn(self.val_res_a[i](self.val_ln[i](vh))))
         value = self.val_out(vh).squeeze(-1)                           # (B,)
-        return dest_logits, gate_logits, value
+        reward_pred = None                                             # aux reward head (UNREAL): predict r_t
+        if self.aux_reward_pred:                                       # from the SAME pooled trunk features as the critic
+            reward_pred = self.rew_out(self.act_fn(self.rew_in(torch.cat([pooled, gp], -1)))).squeeze(-1)  # (B,)
+        return dest_logits, gate_logits, value, reward_pred
 
 
 def build_policy(cfg):
@@ -226,7 +237,7 @@ def build_policy(cfg):
                      value_res_blocks=cfg.VALUE_RES_BLOCKS,
                      arch=cfg.ARCH, n_heads=cfg.N_HEADS, n_tx_layers=cfg.N_TX_LAYERS,
                      tx_mlp_ratio=cfg.TX_MLP_RATIO, n_stem_res=cfg.N_STEM_RES,
-                     n_head_res=cfg.N_HEAD_RES).to(cfg.device)
+                     n_head_res=cfg.N_HEAD_RES, aux_reward_pred=cfg.AUX_REWARD_PRED).to(cfg.device)
     _net.popart = PopArt(cfg.POPART_BETA)
     return _net
 
@@ -264,18 +275,18 @@ def _make_dist(cfg, net, ent, em, am, gl):
     alive = valid destination slots (= entity_mask), reach = sun-reachability mask.'''
     reach = compute_reach(ent, em) if cfg.REACH_MASK else None
     with _amp_ctx(cfg):
-        dest_logits, gate_logits, value = net(ent, em, am, gl)
+        dest_logits, gate_logits, value, reward_pred = net(ent, em, am, gl)
     if cfg.WHERE_DIST == 'categorical':
         dist = GatedCatDist(cfg, dest_logits.float(), gate_logits.float(), owned=am, alive=em, reach=reach)
     else:
         dist = GatedAllocDist(cfg, dest_logits.float(), gate_logits.float(), owned=am, alive=em,
                               reach=reach, kappa=cfg.ALLOC_KAPPA)
-    return dist, value.float()
+    return dist, value.float(), (reward_pred.float() if reward_pred is not None else None)
 
 
 @torch.no_grad()
 def act(cfg, net, ent, em, am, gl, greedy=False, crn_group=0):
-    dist, value = _make_dist(cfg, net, ent, em, am, gl)
+    dist, value, _ = _make_dist(cfg, net, ent, em, am, gl)   # reward_pred unused while ACTING (update only)
     # crn_group>1 couples the sampling noise across each contiguous block of crn_group envs (GRPO
     # common-random-numbers, docs/grpo_v12.tex [D]); 0 = independent draws (the default everywhere else).
     action = dist.greedy() if greedy else dist.sample(crn_group=crn_group)
@@ -285,5 +296,5 @@ def act(cfg, net, ent, em, am, gl, greedy=False, crn_group=0):
 
 
 def evaluate(cfg, net, ent, em, am, gl, action):
-    dist, value = _make_dist(cfg, net, ent, em, am, gl)
-    return dist.log_prob(action), dist.entropy(), value
+    dist, value, reward_pred = _make_dist(cfg, net, ent, em, am, gl)
+    return dist.log_prob(action), dist.entropy(), value, reward_pred

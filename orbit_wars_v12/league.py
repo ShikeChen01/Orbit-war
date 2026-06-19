@@ -819,7 +819,7 @@ class League:
         ent, em, am, gl = self._probe_obs()
         dev = next(net.parameters()).device
         with torch.no_grad():
-            dest_logits, gate_logits, _ = net(ent.to(dev), em.to(dev), am.to(dev), gl.to(dev))
+            dest_logits, gate_logits, _, _ = net(ent.to(dev), em.to(dev), am.to(dev), gl.to(dev))
             dest = torch.softmax(dest_logits, -1).reshape(-1, dest_logits.shape[-1]).mean(0)  # (E,)
             gp = torch.sigmoid(gate_logits).reshape(-1).float().mean()                         # mean fire-prob
             gate = torch.stack([gp, 1.0 - gp])                                                 # (2,) fire/hold

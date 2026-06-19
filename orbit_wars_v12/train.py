@@ -20,7 +20,7 @@ from .grpo import grpo_update
 from .league import League, eval_gauntlet, eval_gauntlet4
 from .policy import build_policy
 from .ppo import ppo_update
-from .rollout import collect_ppo
+from .rollout import collect_ppo, grpo_adv_mode
 from .worldgen import make_world_pool
 
 
@@ -73,10 +73,25 @@ class Trainer:
             ref_net = _freeze_snapshot(copy.deepcopy(net))
             print("  [grpo] KL-to-reference enabled (beta=%.3g) -> froze current policy as reference" % cfg.GRPO_KL_COEF)
 
+        if cfg.ALGO == "grpo":   # report the ACTIVE advantage estimator (the flags are mutually exclusive!)
+            a2, ignored = grpo_adv_mode(cfg, 2)
+            line = "  [grpo] advantage estimator = %s" % a2
+            if cfg.FOURP_ENABLED and grpo_adv_mode(cfg, 4)[0] != a2:
+                line += "  (2p) / %s (4p)" % grpo_adv_mode(cfg, 4)[0]
+            comp = [t for t, on in (("clip-hi", cfg.CLIP_HI > 0), ("len-norm", cfg.RATIO_LENGTHNORM),
+                                    ("rb-gate", cfg.GRPO_RB_GATE), ("aux-value", cfg.GRPO_AUX_VALUE),
+                                    ("opp-base", cfg.GRPO_OPP_BASELINE_W > 0), ("target-rms", cfg.ADV_TARGET_RMS > 0),
+                                    ("LOO", cfg.GRPO_LOO), ("KL-ref", cfg.GRPO_KL_COEF > 0), ("CRN", cfg.GRPO_CRN)) if on]
+            print(line + ("  + " + ",".join(comp) if comp else ""))
+            if ignored:
+                print("  [grpo] !! WARNING: estimators [%s] are ALSO enabled but IGNORED (mutually exclusive) -- "
+                      "ONLY %s is active. Enable exactly ONE advantage estimator." % (", ".join(ignored), a2))
+
         hist = {"iter": [], "return": [], "win_rate": [],
-                "lnch_per_step": [], "approx_kl": [], "clipfrac": [], "sigma": [], "grad_norm": [],
+                "lnch_per_step": [], "approx_kl": [], "clipfrac": [], "sigma": [], "grad_norm": [], "auxr": [],
                 "r_outcome": [], "r_capture": [], "r_milestone": [], "r_launch": [],
-                "learner_elo": [], "learner_elo4": [], "share_4p": [], "fmt": []}
+                "learner_elo": [], "learner_elo4": [], "share_4p": [], "fmt": [],
+                "adv_absmax": [], "adv_std": []}   # anti-collapse advantage-health curves
 
         pool, pool_round = None, -1
         # held-out gauntlet worlds: FIXED seed range never touched by training rounds, so the
@@ -138,8 +153,12 @@ class Trainer:
                 if m["net"] is not None:
                     m["net"].to(cfg.device)
 
+            opp_exp = None
+            if cfg.ALGO == "grpo" and cfg.GRPO_OPP_BASELINE_W > 0.0:   # [E1] league Elo-expected outcome vs this foe
+                opp_exp = (league._p_beat(seats[0], 2) if fmt == 2
+                           else sum(league._p_beat(m, 4) for m in seats) / max(1, len(seats)))
             tb, rs, cursor = collect_ppo(cfg, env, net_fwd, pool, cursor, rng, seats,
-                                         n_players=fmt, n_envs=(cfg.B if fmt == 2 else cfg.B_4P))
+                                         n_players=fmt, n_envs=(cfg.B if fmt == 2 else cfg.B_4P), opp_exp=opp_exp)
             if cfg.ALGO == "grpo":
                 us = grpo_update(cfg, net_fwd, opt, tb, ent_coef, policy_coef, ref_net=ref_net)
             else:
@@ -167,12 +186,13 @@ class Trainer:
             hist["iter"].append(it + 1)
             hist["return"].append(rs["mean_return"]); hist["win_rate"].append(rs["win_rate"])
             hist["lnch_per_step"].append(rs["lnch_per_step"]); hist["approx_kl"].append(us["approx_kl"])
-            hist["clipfrac"].append(us["clipfrac"]); hist["sigma"].append(us["sigma"]); hist["grad_norm"].append(us["grad_norm"])
+            hist["clipfrac"].append(us["clipfrac"]); hist["sigma"].append(us["sigma"]); hist["grad_norm"].append(us["grad_norm"]); hist["auxr"].append(us.get("auxr", 0.0))
             hist["r_outcome"].append(rs["r_outcome"]); hist["r_capture"].append(rs["r_capture"])
             hist["r_milestone"].append(rs["r_milestone"]); hist["r_launch"].append(rs["r_launch"])
             hist["learner_elo"].append(league.learner_elo)
             hist["learner_elo4"].append(league.learner_elo4)
             hist["share_4p"].append(s4); hist["fmt"].append(fmt)
+            hist["adv_absmax"].append(rs.get("adv_absmax", 0.0)); hist["adv_std"].append(rs.get("adv_std", 0.0))
 
             # v7 tripwire: gate-collapse detector (launch rate decaying under healthy-looking KL)
             _l = hist["lnch_per_step"]
@@ -186,12 +206,12 @@ class Trainer:
                 # heartbeat: R[o c p ln] = outcome, capture, prod-milestone, launch (real units)
                 opp_lab = "+".join(m["label"] for m in seats)
                 print("it%4d %dp | ret %8.2f wr %.2f sc %.2f | R[o %7.1f c %6.1f p %5.1f ln %5.1f] | "
-                      "lnch/st %.2f | kl %.3f cf %.2f gn %.1f | loss %7.3f (pol %.3f vf %.3f) | "
+                      "lnch/st %.2f | kl %.3f cf %.2f gn %.1f aMx %5.1f | loss %7.3f (pol %.3f vf %.3f%s) | "
                       "elo2 %5.0f elo4 %5.0f s4 %.2f vs %-22s | sps %5.0f"
                       % (it + 1, fmt, rs["mean_return"], rs["win_rate"], rs["score"],
                          rs["r_outcome"], rs["r_capture"], rs["r_milestone"], rs["r_launch"],
-                         rs["lnch_per_step"], us["approx_kl"], us["clipfrac"], us["grad_norm"],
-                         us["total"], us["policy"], us["vf"],
+                         rs["lnch_per_step"], us["approx_kl"], us["clipfrac"], us["grad_norm"], rs["adv_absmax"],
+                         us["total"], us["policy"], us["vf"], (" ar %.3f" % us["auxr"] if cfg.AUX_REWARD_PRED else ""),
                          league.learner_elo, league.learner_elo4, s4, opp_lab[:22], sps))
 
             # checkpoint: periodic + best-by-MIXED-GAUNTLET (2p + 4p; fixed opponents, held-out worlds)

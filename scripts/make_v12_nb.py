@@ -33,6 +33,7 @@ PKG_DIR = os.path.join(REPO, "orbit_wars_v12")
 DEFAULT_OUT = os.path.join(REPO, "notebooks", "setup1_v12_a100.ipynb")
 MCTS_OUT = os.path.join(REPO, "notebooks", "setup1_v12_mcts_a100.ipynb")
 GRPO_OUT = os.path.join(REPO, "notebooks", "setup1_v12_grpo_a100.ipynb")
+GRPO_SMOKE_OUT = os.path.join(REPO, "notebooks", "setup1_v12_grpo_anticollapse.ipynb")
 
 # Topological order: every module imports only from modules earlier in this list (verified against
 # the import graph). Flattening in this order means every top-level name a module references is
@@ -77,6 +78,10 @@ OVERRIDES   = dict(
     GRAD_CHECKPOINT=True, USE_COMPILE=True, AMP_DTYPE=torch.bfloat16,   # H100: native bf16
     NUM_GROUPS=16, GROUP_SIZE=16,        # B=256 (H100 can push 24x16=384 / 32x16=512 if VRAM allows)
     TOTAL_ITERS=2000, BC_ENABLED=True,   # BC warm-start (clone medium) then PPO league
+    # auxiliary reward-prediction head (UNREAL): a shallow head off the SHARED trunk regresses the
+    # immediate per-step reward as a representation aux. Does NOT change reward / advantage / critic --
+    # only adds trunk gradient, which helps under the terminal-dominated reward. (heartbeat: `ar`.)
+    AUX_REWARD_PRED=False, AUX_REWARD_COEF=0.25,   # True -> turn the aux head on
 )
 """ + _SETTINGS_PRINT
 
@@ -87,26 +92,70 @@ GRPO_SETTINGS = """# ============================= RUN SETTINGS ================
 # entropy as PPO; optional KL-to-reference via GRPO_KL_COEF (beta>0 freezes the post-BC net as ref).
 # Weights are interchangeable with the PPO nb (same Policy net) -- only the critic head goes unused,
 # so a PPO-trained .pt warm-starts a GRPO run directly (RESUME_FROM=...), and vice-versa.
-# GPU: Colab H100 (native bf16). BC warm-start -> dual-Elo league curriculum are UNCHANGED.
+# GPU: Colab A100 / H100 (both native bf16). Colab gotcha: USE_COMPILE=True can hit a torch<->triton crash ->
+# `pip install triton==3.6.0` then RESTART (or set USE_COMPILE=False). BC warm-start -> dual-Elo league UNCHANGED.
+#
+# ADVANTAGE ESTIMATOR = legacy per-group std-norm [B], the BATTLE-TESTED v9/v12 default. A controlled local
+# 3070 Ti A/B (scripts/_gpu_ab*.py; shared BC init, h256 trunk, 2p, 100 iters) found that the Tier 0-2
+# "anti-collapse" estimators -- rank[C1] AND drgrpo center-only[B] -- and clip-higher[D3] ALL drove the agent
+# into the PASSIVITY basin (launch-rate -> 0.03-0.34, elo DECLINED), while legacy std-norm stayed STABLE and
+# improving (elo 1497->1576). Bounded != good: rank discards win-MAGNITUDE, so it stops rewarding decisive
+# aggression. The std rare-win amplification the proof flagged is double-edged -- it is also what keeps the
+# agent aggressive. The it426->it526 collapse was a TRIGGER (an asymmetric "lose-slower" outcome decay) x that
+# amplifier, NOT the estimator; the default keeps WIN_DECAY=LOSS_DECAY=1.0 (symmetric, no trigger). The
+# estimator flags below are MUTUALLY EXCLUSIVE (precedence phi>sibling>analytic>rank>cvar>std silently picks ONE
+# if several are on -- that was the "all flags on" A100 collapse: it ran sibling/phi-value, NOT rank). train.py
+# now PRINTS the active estimator + WARNS on conflicts. Enable AT MOST ONE and re-ablate on the 3070 Ti (NOT A100).
 SMOKE       = False     # True -> tiny net + few iters (sanity run; OVERRIDES ignored)
-RESUME_FROM = None      # path to a *_train_state.pt to resume from, else None
+RESUME_FROM = None      # path to a *_train_state.pt to resume from (e.g. a prior GRPO/PPO ckpt), else None
 OVERRIDES   = dict(
     ALGO="grpo", GRPO_GROUP=16, GRPO_KL_COEF=0.0, GRPO_OUTCOME_ONLY=False, GRPO_WHITEN=False,
-    # --- v12 critic-free variance-reduction knobs (docs/grpo_v12.tex). All default to the legacy
-    #     path; flip ONE at a time for the ablation matrix:
-    GRPO_STD_NORM=True,       # [B] False -> center-only + global scale (Dr.GRPO; removes difficulty inversion)
-    GRPO_LOO=False,           # [B] True  -> leave-one-out group mean (RLOO)
-    GRPO_ANALYTIC_ADV=False,  # [A] True  -> 2p binary closed-form advantage at a Beta-shrunk win-rate
-    GRPO_PHI_VALUE=False,     # [C] True  -> use the shaping potential as an OLS-fit GAE value (per-step credit)
-    GRPO_CRN=False,           # [D] True  -> common-random-numbers coupling of neural-opponent sampling
+    GRPO_STD_NORM=True, GRPO_LOO=False,    # [B] legacy per-group std-norm: the STABLE, battle-tested default
+    # --- estimator flags: MUTUALLY EXCLUSIVE, ALL OFF. Local A/B: rank/drgrpo/clip-hi -> PASSIVITY. Do NOT
+    #     enable for a real run without re-ablating on the 3070 Ti (train.py prints/warns which one is active). ---
+    GRPO_RANK_ADV=False, GRPO_ANALYTIC_ADV=False, GRPO_PHI_VALUE=False, GRPO_SIBLING_BASELINE=False, GRPO_CVAR_ALPHA=0.0,
+    # --- orthogonal levers (compose), also OFF pending ablation ---
+    CLIP_HI=0.0, ADV_TARGET_RMS=0.0, GRPO_RB_GATE=False, RATIO_LENGTHNORM=False, GRPO_AUX_VALUE=False, GRPO_CRN=False,
     VALUE_WARMUP_ITERS=0,                  # no critic to warm up under GRPO
     ARCH="transformer", HIDDEN=512, N_TX_LAYERS=12, N_HEADS=16, TX_MLP_RATIO=4,
     N_STEM_RES=2, N_HEAD_RES=4, VALUE_RES_BLOCKS=4,
-    GRAD_CHECKPOINT=True, USE_COMPILE=True, AMP_DTYPE=torch.bfloat16,   # H100: native bf16
-    NUM_GROUPS=16, GROUP_SIZE=16,          # B=256 -> 16 worlds x 16 group samples per iter
+    GRAD_CHECKPOINT=True, USE_COMPILE=True, AMP_DTYPE=torch.bfloat16,   # A100/H100: native bf16
+    NUM_GROUPS=16, GROUP_SIZE=16,          # B=256 = 16 worlds x 16 group samples/iter (A100 80GB can push 24-32 groups)
     TOTAL_ITERS=2000, BC_ENABLED=True,     # BC warm-start (clone medium) then GRPO league
 )
 """ + _SETTINGS_PRINT
+
+GRPO_SMOKE_SETTINGS = '''# ===================== RUN SETTINGS: ANTI-COLLAPSE SMOKE EXPERIMENT =====================
+# Proves the v12 anti-collapse fix (Tier 0-2) WITHOUT a GPU. The legacy GRPO path (GRPO_STD_NORM=True)
+# death-spirals in self-play: as the snapshot pool strengthens the learner faces LOPSIDED losing groups
+# where a rare win's advantage ~ sqrt((1-p)/p) is unbounded -> it chases lucky wins, launch-rate ratchets
+# down, and it loses to its own snapshots and to `greedy` (the it426->it526 log). The fix bounds /
+# re-weights the advantage. This notebook runs:
+#   (1) advantage_bound_probe   -- DETERMINISTIC: the new [C1] rank advantage is bounded by sqrt3 for EVERY
+#                                  group; legacy std/analytic grow with lopsidedness. Plus a difficulty-
+#                                  inversion demo (legacy equalizes group energy; Dr.GRPO keeps p(1-p)).
+#   (2) run_anticollapse_compare -- short A/B train(): legacy vs rank[C1] vs drgrpo[B], logging the
+#                                  advantage-health / launch-rate / return curves.
+# To REPRODUCE the real death-spiral: set RESUME_FROM to a strong *_train_state.pt (e.g. it426) and raise
+# EXP_ITERS (~80) on a GPU; the legacy arm bends down while the anti-collapse arms hold.
+SMOKE        = True       # tiny net (HIDDEN=64); CPU-friendly. False -> full-size net (needs a GPU)
+RESUME_FROM  = None       # set to a *_train_state.pt to reproduce the real collapse from a strong ckpt
+EXP_ITERS    = 30         # A/B iters per arm (bump to ~80 on a GPU to watch the legacy arm bend down)
+EXP_OVERRIDES = dict(     # smoke-scale env (CPU-friendly). On a GPU, raise B / EPISODE_STEPS / N_WORLDS.
+    GRPO_GROUP=16, EPISODE_STEPS=120, N_WORLDS=64, B=64, B_4P=64, FLEET_CAP=512,
+    SELFPLAY_REFRESH=5, LEAGUE_MAX_SNAPSHOTS=4, ELO_RECAL_ENVS=16, FOURP_ENABLED=True,
+)
+print("ANTI-COLLAPSE SMOKE | SMOKE=%s iters/arm=%d resume=%s" % (SMOKE, EXP_ITERS, RESUME_FROM))'''
+
+GRPO_EXP_CELL = '''# (1) DETERMINISTIC proof: the new advantage cannot blow up (+ difficulty-inversion demo)
+probe = advantage_bound_probe(Config(ALGO="grpo"), G=16)
+
+# (2) short A/B train(): legacy (collapsing path) vs rank[C1] vs drgrpo[B], same init, smoke scale
+res = run_anticollapse_compare(base_overrides=EXP_OVERRIDES, iters=EXP_ITERS, smoke=SMOKE,
+                               resume_from=RESUME_FROM, log_every=max(1, EXP_ITERS // 10))
+
+# (3) plot the proof: advantage-bound curve + per-iter advantage-health / launch-rate / return
+plot_anticollapse(probe, res, path="anticollapse.png")'''
 
 SMALL_SETTINGS = """# ============================= RUN SETTINGS =============================
 # PRESET: SMALL net + MCTS -- the "small model, search-amplified" lineage.
@@ -260,12 +309,14 @@ def _code(text):
             "outputs": [], "source": _src_lines(text)}
 
 
-def build_notebook(with_mcts=False, with_grpo=False):
+def build_notebook(with_mcts=False, with_grpo=False, with_grpo_smoke=False):
     module_order = list(BASE_MODULES)
     if with_mcts:
         module_order.insert(module_order.index("plotting"), "mcts")
-    if with_grpo:
+    if with_grpo or with_grpo_smoke:
         module_order.insert(module_order.index("rollout"), "grpo")   # after ppo, before train
+    if with_grpo_smoke:
+        module_order.insert(module_order.index("plotting"), "grpo_diag")   # after train, before plotting
     seen, imports = set(), []
     bodies = {}
     for name in module_order:
@@ -285,13 +336,21 @@ def build_notebook(with_mcts=False, with_grpo=False):
             head += "\n\n" + doc.strip()
         cells += [_md(head), _code(body)]
 
+    if with_grpo_smoke:
+        cells += [_md("## Anti-collapse smoke experiment"), _code(GRPO_SMOKE_SETTINGS),
+                  _md("## Prove the reward will not collapse (bound probe + A/B train)"), _code(GRPO_EXP_CELL)]
+        return _wrap(cells)
+
     settings = GRPO_SETTINGS if with_grpo else (SMALL_SETTINGS if with_mcts else BIG_SETTINGS)
     cells += [_md("## Run training"), _code(settings), _code(BC_CELL), _code(TRAIN_CELL),
               _md("## Save every league agent as weights"), _code(SAVE_CELL),
               _md("## Plot training-health curves"), _code(PLOT_CELL)]
     if with_mcts:
         cells += [_md("## MCTS inference-search (proof of concept)"), _code(MCTS_CELL)]
+    return _wrap(cells)
 
+
+def _wrap(cells):
     return {
         "cells": cells,
         "metadata": {
@@ -408,6 +467,19 @@ def check(nb_path):
         assert len(ghist["learner_elo"]) == 4
         print("[check] GRPO tiny train ran: %d iters (critic-free group baseline + KL-to-ref)" % len(ghist["fmt"]))
 
+    if "advantage_bound_probe" in ns:            # anti-collapse smoke nb: bound probe + tiny 3-arm A/B
+        ns["advantage_bound_probe"](ns["Config"](ALGO="grpo"), G=16, verbose=False)
+        _res = ns["run_anticollapse_compare"](
+            base_overrides=dict(GRPO_GROUP=4, EPISODE_STEPS=48, N_WORLDS=24, B=8, B_4P=8, FLEET_CAP=256,
+                                ELO_RECAL_ENVS=8, SELFPLAY_REFRESH=2, LEAGUE_MAX_SNAPSHOTS=3,
+                                LEARNER_RECAL_EVERY=0, ELO_RECAL_EVERY=0, N_HEADS=8, N_TX_LAYERS=2,
+                                N_HEAD_RES=1, FOURP_ENABLED=False, device=torch.device("cpu")),
+            iters=2, smoke=True, log_every=99)
+        assert set(_res["_arms"]) == {"legacy", "rank[C1]", "drgrpo[B]"}, "anti-collapse arms changed unexpectedly"
+        for _a in _res["_arms"]:
+            assert max(_res[_a]["adv_absmax"]) < 50.0, "%s advantage blew up in the A/B smoke" % _a
+        print("[check] anti-collapse: bound probe PASS + 3-arm A/B ran, all advantages bounded")
+
     print("\nCHECK OK: generated notebook execs, trains, and evicts faithfully.")
 
 
@@ -416,28 +488,32 @@ def main():
     ap.add_argument("-o", "--out", default=None, help="output .ipynb path (default depends on --mcts/--grpo)")
     ap.add_argument("--mcts", action="store_true", help="include the MCTS module + inference-search demo")
     ap.add_argument("--grpo", action="store_true", help="critic-free GRPO variant (setup1_v12_grpo_a100.ipynb)")
+    ap.add_argument("--grpo-smoke", dest="grpo_smoke", action="store_true",
+                    help="GRPO anti-collapse smoke experiment (setup1_v12_grpo_anticollapse.ipynb)")
     ap.add_argument("--both", action="store_true", help="generate BOTH the base v12 and v12-mcts notebooks")
-    ap.add_argument("--all", action="store_true", help="generate the base, MCTS, and GRPO notebooks")
+    ap.add_argument("--all", action="store_true", help="generate the base, MCTS, GRPO, and anti-collapse notebooks")
     ap.add_argument("--check", action="store_true", help="exec the generated nb(s) (SMOKE) to verify")
     args = ap.parse_args()
-    if args.mcts and args.grpo:
-        ap.error("--mcts and --grpo are mutually exclusive")
+    if sum([args.mcts, args.grpo, args.grpo_smoke]) > 1:
+        ap.error("--mcts / --grpo / --grpo-smoke are mutually exclusive")
 
     if args.all:
-        variants = [(False, False, DEFAULT_OUT), (True, False, MCTS_OUT), (False, True, GRPO_OUT)]
+        variants = [(False, False, False, DEFAULT_OUT), (True, False, False, MCTS_OUT),
+                    (False, True, False, GRPO_OUT), (False, False, True, GRPO_SMOKE_OUT)]
     elif args.both:
-        variants = [(False, False, DEFAULT_OUT), (True, False, MCTS_OUT)]
+        variants = [(False, False, False, DEFAULT_OUT), (True, False, False, MCTS_OUT)]
     else:
-        default_out = GRPO_OUT if args.grpo else (MCTS_OUT if args.mcts else DEFAULT_OUT)
-        variants = [(args.mcts, args.grpo, args.out or default_out)]
-    for with_mcts, with_grpo, out in variants:
-        nb = build_notebook(with_mcts=with_mcts, with_grpo=with_grpo)
+        default_out = (GRPO_SMOKE_OUT if args.grpo_smoke else GRPO_OUT if args.grpo
+                       else MCTS_OUT if args.mcts else DEFAULT_OUT)
+        variants = [(args.mcts, args.grpo, args.grpo_smoke, args.out or default_out)]
+    for with_mcts, with_grpo, with_grpo_smoke, out in variants:
+        nb = build_notebook(with_mcts=with_mcts, with_grpo=with_grpo, with_grpo_smoke=with_grpo_smoke)
         os.makedirs(os.path.dirname(out), exist_ok=True)
         with open(out, "w", encoding="utf-8") as f:
             json.dump(nb, f, indent=1, ensure_ascii=False)
             f.write("\n")
-        n_modules = len(BASE_MODULES) + (1 if with_mcts else 0) + (1 if with_grpo else 0)
-        tag = ", +MCTS" if with_mcts else (", +GRPO" if with_grpo else "")
+        n_modules = len(BASE_MODULES) + with_mcts + (with_grpo or with_grpo_smoke) + with_grpo_smoke
+        tag = ", +MCTS" if with_mcts else (", +GRPO+diag" if with_grpo_smoke else ", +GRPO" if with_grpo else "")
         print("wrote %s  (%d cells from %d modules%s)"
               % (os.path.relpath(out, REPO), len(nb["cells"]), n_modules, tag))
         if args.check:

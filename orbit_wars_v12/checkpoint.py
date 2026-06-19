@@ -77,6 +77,11 @@ def _cfg_from(cfg, blob_cfg, fallback=None):
             out[k] = _live(cfg, k)
     # activation: missing in OLD checkpoints -> they were trained with relu, so rebuild as relu
     out["ACT_FN"] = (blob_cfg or {}).get("ACT_FN", (fallback or {}).get("ACT_FN", "relu"))
+    # aux reward head: an ARCHITECTURE-changing flag absent from pre-aux blobs. Unlike the dims above it
+    # must NOT fall back to the live cfg -- that would build a head the member's .pt has no weights for and
+    # break the strict load. Default OFF so pre-aux snapshots (and invited members) rebuild unchanged.
+    out["AUX_REWARD_PRED"] = bool((blob_cfg or {}).get("AUX_REWARD_PRED",
+                                                       (fallback or {}).get("AUX_REWARD_PRED", False)))
     return out
 
 
@@ -87,7 +92,8 @@ def build_from_cfg(cfg, member_cfg):
                      value_res_blocks=member_cfg["VALUE_RES_BLOCKS"], arch=member_cfg["ARCH"],
                      n_heads=member_cfg["N_HEADS"], n_tx_layers=member_cfg["N_TX_LAYERS"],
                      tx_mlp_ratio=member_cfg["TX_MLP_RATIO"], n_stem_res=member_cfg["N_STEM_RES"],
-                     n_head_res=member_cfg["N_HEAD_RES"], act=member_cfg.get("ACT_FN", "relu"))
+                     n_head_res=member_cfg["N_HEAD_RES"], act=member_cfg.get("ACT_FN", "relu"),
+                     aux_reward_pred=member_cfg.get("AUX_REWARD_PRED", False))
 
 
 def load_snapshot(cfg, path, fallback_cfg=None):
@@ -140,7 +146,10 @@ def save_ckpt(cfg, net, path, meta=None):
                        "ARCH": cfg.ARCH, "N_TX_LAYERS": cfg.N_TX_LAYERS, "N_HEADS": cfg.N_HEADS,
                        "TX_MLP_RATIO": cfg.TX_MLP_RATIO, "N_STEM_RES": cfg.N_STEM_RES, "N_HEAD_RES": cfg.N_HEAD_RES,
                        "USE_GLU": cfg.USE_GLU, "USE_ATTENTION": cfg.USE_ATTENTION, "VALUE_RES_BLOCKS": cfg.VALUE_RES_BLOCKS,
-                       "ACT_FN": cfg.ACT_FN, "target_actor": True}}
+                       "ACT_FN": cfg.ACT_FN, "target_actor": True,
+                       # persist the ACTUAL net's head state (not cfg) -- members built without the head
+                       # (invited / legacy-wrapped) must round-trip as AUX_REWARD_PRED=False.
+                       "AUX_REWARD_PRED": bool(getattr(net, "aux_reward_pred", False))}}
     if meta:
         blob.update(meta)
     # league snapshots can be SMALLER than the live config (invited dims): persist the true dims

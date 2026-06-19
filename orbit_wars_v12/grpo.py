@@ -15,10 +15,11 @@ accumulators) is shared with PPO. ``policy_coef`` is accepted for call-site pari
 is no critic to warm up, so the policy is always trained at full weight.
 """
 import torch
+import torch.nn.functional as F
 
 from .constants import DTYPE
 from .policy import evaluate
-from .ppo import policy_surrogate
+from .ppo import _surrogate_logratio, policy_surrogate
 
 
 def grpo_update(cfg, net, opt, tb, ent_coef, policy_coef, ref_net=None):
@@ -48,15 +49,22 @@ def grpo_update(cfg, net, opt, tb, ent_coef, policy_coef, ref_net=None):
             oldlp = tb["old_logp"].index_select(0, mi)
             adv = tb["advantage"].index_select(0, mi)
 
-            logp, entropy, _value = evaluate(cfg, net, ent, em, am, gl, act_mb)   # value head ignored
-            pol = policy_surrogate(cfg, logp, oldlp, adv, cfg.CLIP)
+            logp, entropy, value, _ = evaluate(cfg, net, ent, em, am, gl, act_mb)   # value used only by GRPO_AUX_VALUE; rew-pred unused
             n_owned = am.sum(1).clamp_min(1.0)                # per-owned-source mean entropy (scale-correct)
+            pol = policy_surrogate(cfg, logp, oldlp, adv, cfg.CLIP, n_owned)
             ent_b = (entropy / n_owned).mean()
             loss = pol - ent_coef * ent_b
+            vloss = torch.zeros((), device=dev)
+            ret_mb = None
+            if cfg.GRPO_AUX_VALUE:                            # [B2/C5] aux: value head -> MC return (NOT in the advantage)
+                ret_mb = tb["returns"].index_select(0, mi)
+                vtgt = net.popart.normalize(ret_mb) if (cfg.USE_POPART and getattr(net, "popart", None) is not None) else ret_mb
+                vloss = F.mse_loss(value, vtgt)
+                loss = loss + cfg.GRPO_AUX_COEF * vloss
             kl_ref = torch.zeros((), device=dev)
             if beta > 0.0:                                    # KL(pi || pi_ref), unbiased k3 estimator
                 with torch.no_grad():
-                    rlp, _, _ = evaluate(cfg, ref_net, ent, em, am, gl, act_mb)
+                    rlp, _, _, _ = evaluate(cfg, ref_net, ent, em, am, gl, act_mb)
                 logr = (rlp - logp).clamp(-cfg.LOGRATIO_CLAMP, cfg.LOGRATIO_CLAMP)   # log(pi_ref/pi)
                 kl_ref = (torch.exp(logr) - logr - 1.0).mean()                       # >= 0, grad flows via logp
                 loss = loss + beta * kl_ref
@@ -66,13 +74,16 @@ def grpo_update(cfg, net, opt, tb, ent_coef, policy_coef, ref_net=None):
             gnorm = torch.nn.utils.clip_grad_norm_(net.parameters(), cfg.MAX_GRAD_NORM)
             if torch.isfinite(gnorm):
                 opt.step()
+            if cfg.GRPO_AUX_VALUE and cfg.USE_POPART and getattr(net, "popart", None) is not None:
+                net.popart.update(ret_mb, net.val_out)        # output-preserving stats update (aux value head)
 
             with torch.no_grad():
-                lr = (logp - oldlp); lrc = lr.clamp(-cfg.LOGRATIO_CLAMP, cfg.LOGRATIO_CLAMP)
+                lr = _surrogate_logratio(cfg, logp, oldlp, n_owned)   # match the surrogate (length-norm aware)
+                lrc = lr.clamp(-cfg.LOGRATIO_CLAMP, cfg.LOGRATIO_CLAMP)
                 ratio = torch.exp(lrc)
                 mb_kl = ((ratio - 1.0) - lrc).mean().item()   # k3 KL(old||new) for the early-stop branch
                 _acc["total"] += loss.detach(); _acc["policy"] += pol.detach()
-                _acc["vf"] += kl_ref.detach()                 # no critic: surface KL-to-ref in the vf slot
+                _acc["vf"] += (kl_ref + vloss).detach()       # no critic: surface KL-to-ref (+ aux vloss) in the vf slot
                 _acc["entropy"] += ent_b.detach(); _acc["sigma"] += ent_b.detach()
                 s["approx_kl"] += mb_kl
                 _acc["clipfrac"] += (torch.abs(ratio - 1.0) > cfg.CLIP).to(DTYPE).mean()

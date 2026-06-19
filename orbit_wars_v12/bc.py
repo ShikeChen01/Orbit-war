@@ -83,7 +83,7 @@ def bc_pretrain(cfg, net=None, rounds=None, epochs=None, lr=None, log=True):
                 mi = perm[b:b + mbs]
                 ent_d, em_d, am_d, gl_d = (x[mi].to(cfg.device) for x in (ent, em, am, gl))
                 fire_d, tgt_d = fire[mi].to(cfg.device), tgt[mi].to(cfg.device)
-                dist, _ = _make_dist(cfg, net, ent_d, em_d, am_d, gl_d)
+                dist, _, _ = _make_dist(cfg, net, ent_d, em_d, am_d, gl_d)
                 own = am_d > 0.5
                 f = fire_d.to(DTYPE)
                 p = dist.p                                     # smooth fire-prob (post-fix)

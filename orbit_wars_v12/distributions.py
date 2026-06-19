@@ -15,6 +15,19 @@ import torch
 import torch.nn.functional as F
 
 
+def _rb_gate_where(cfg, fire, where_lp, p):
+    """[A1] The WHERE term of the per-planet log-prob. Default = sampled ``fire * where_lp``.
+    With ``cfg.GRPO_RB_GATE`` it is Rao-Blackwellized over the launch Bernoulli: a straight-through
+    that keeps the FORWARD value at ``fire * where_lp`` (so the importance ratio stays an honest
+    on-policy ratio) while routing the GRADIENT through ``p.detach() * where_lp`` -- the conditional
+    expectation of the WHERE score over the gate, removing the gate's 0/1 sampling variance exactly
+    (E[fire]=p) without injecting any spurious gate-direction gradient."""
+    if not cfg.GRPO_RB_GATE:
+        return fire * where_lp
+    pc = p.detach()
+    return (fire * where_lp).detach() + pc * where_lp - (pc * where_lp).detach()
+
+
 class GatedAllocDist:
     """Gated per-source Dirichlet ALLOCATION actor (v6).
       WHERE  dest_logits (B,E,E) -> alpha = softplus(logits)*kappa + eps -> Dirichlet rows over dests.
@@ -67,7 +80,7 @@ class GatedAllocDist:
         fire = a[..., E]                                                   # (B,E) in {0,1}
         where_lp = self.dist.log_prob(alloc)                              # (B,E)
         gate_lp = fire * torch.log(self.p.clamp_min(1e-8)) + (1.0 - fire) * torch.log((1.0 - self.p).clamp_min(1e-8))
-        lp = gate_lp + fire * where_lp                                    # WHERE only counts when firing
+        lp = gate_lp + _rb_gate_where(self.cfg, fire, where_lp, self.p)   # [A1] Rao-Blackwell de-noise (or fire*where_lp)
         return (lp * self.owned).sum(1)                                   # (B,)
 
     def entropy(self):
@@ -136,7 +149,7 @@ class GatedCatDist:
         fire = a[..., E]
         where_lp = self.lsm.gather(2, dest.unsqueeze(-1)).squeeze(-1)
         gate_lp = fire * torch.log(self.p.clamp_min(1e-8)) + (1.0 - fire) * torch.log((1.0 - self.p).clamp_min(1e-8))
-        lp = gate_lp + fire * where_lp
+        lp = gate_lp + _rb_gate_where(self.cfg, fire, where_lp, self.p)    # [A1] Rao-Blackwell de-noise (or fire*where_lp)
         return (lp * self.owned).sum(1)
 
     def entropy(self):
