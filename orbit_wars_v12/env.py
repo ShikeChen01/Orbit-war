@@ -300,10 +300,16 @@ def env_encode(env, ego=0):
     torch.compile trace it -- dynamo cannot follow the env object's getattr-with-default accesses."""
     na = float(getattr(env, "n_players", 2))
     p_x_prev = getattr(env, "p_x_prev", env.p_x); p_y_prev = getattr(env, "p_y_prev", env.p_y)
-    return _ENCODE_CORE(int(ego), na, int(env.T), env.vmax, env.p_alive, env.p_owner, env.p_x, env.p_y,
-                        env.p_radius, env.p_is_comet, env.ang_vel, env.p_prod, env.p_ships, env.f_x,
-                        env.f_y, env.f_angle, env.f_ships, env.f_alive, env.f_owner, env.f_seq,
-                        env.step_ct, p_x_prev, p_y_prev)
+    # The encoder never needs grad (its output is stored into the rollout buffers as constants; the
+    # update re-runs net(...) on those, not on this output). Forcing no_grad at the dispatch boundary
+    # keeps grad_mode CONSTANT across every caller (rollout ego/opp, league recal, eval, MCTS) so the
+    # torch.compile'd _encode_core never recompiles on a grad_mode guard flip (was thrashing the
+    # recompile_limit when the ungated ego encode ran grad-on between no_grad opponent encodes).
+    with torch.no_grad():
+        return _ENCODE_CORE(int(ego), na, int(env.T), env.vmax, env.p_alive, env.p_owner, env.p_x, env.p_y,
+                            env.p_radius, env.p_is_comet, env.ang_vel, env.p_prod, env.p_ships, env.f_x,
+                            env.f_y, env.f_angle, env.f_ships, env.f_alive, env.f_owner, env.f_seq,
+                            env.step_ct, p_x_prev, p_y_prev)
 
 
 def maybe_compile_encode(cfg):
