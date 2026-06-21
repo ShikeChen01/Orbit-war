@@ -242,12 +242,16 @@ class MctsAgent:
     wall-clock budget inside a phase is ``phase_seconds / phase_length`` (so :data:`DEFAULT_SCHEDULE`
     spends 1.5 / 0.5 / 0.25 s per turn over steps 0-20 / 20-60 / 60-80). Past the last phase -- or
     once ``bank_s - reserve_s`` is spent -- it plays PURE greedy (one forward, ``base_budget_s``).
+    Alternatively ``crit_schedule=(every, until, secs)`` runs a SPARSE critical-step budget -- a deep
+    ``secs``-second search only on steps that are a multiple of ``every`` and ``< until`` (e.g.
+    ``(10, 50, 10.0)`` -> 10 s on steps 0/10/20/30/40, ~50 s of the bank), greedy on every other turn;
+    it takes precedence over ``schedule``.
     ``reserve_s`` is never spent by the schedule: it absorbs inference turbulence (latency spikes) so
     one slow turn can't blow the game's total time. ``schedule=None`` -> a flat ``turn_budget_s`` every
     turn (eval/measurement). Reuses one work env; binds the static official-comet arrays on first use."""
 
     def __init__(self, cfg, net, opp_kind="greedy", K=6, c_puct=1.5, value="heuristic",
-                 schedule=DEFAULT_SCHEDULE, turn_budget_s=0.9, base_budget_s=0.05,
+                 schedule=DEFAULT_SCHEDULE, crit_schedule=None, turn_budget_s=0.9, base_budget_s=0.05,
                  bank_s=60.0, reserve_s=5.0, max_sims=4096, n_sims=None,
                  crit_budget_s=None, crit_sims=None, crit_thresh=None):   # last 3: deprecated, ignored
         self.cfg = cfg
@@ -255,6 +259,7 @@ class MctsAgent:
         self.opp_code = _OPP_BY_KIND[opp_kind]
         self.K, self.c_puct, self.value = K, c_puct, value
         self.schedule = tuple(schedule) if schedule else None
+        self.crit_schedule = tuple(crit_schedule) if crit_schedule else None   # (every, until, secs): deep search only on step%every==0 & step<until
         self.turn_budget_s, self.base_budget_s = turn_budget_s, base_budget_s
         self.bank_s, self.reserve_s = bank_s, reserve_s
         self.max_sims = int(n_sims) if n_sims is not None else int(max_sims)   # n_sims = compat alias for the cap
@@ -266,7 +271,10 @@ class MctsAgent:
     def _turn_budget(self, step):
         """Scheduled per-turn wall-clock budget at ``step``, clamped so the schedule never dips into
         the turbulence reserve; ``base_budget_s`` past the schedule or once the bank is spent."""
-        if self.schedule is None:
+        if self.crit_schedule is not None:               # SPARSE critical-step mode: deep search only on
+            every, until, secs = self.crit_schedule      # steps that are a multiple of `every` and < `until`,
+            per_turn = secs if (step < until and step % every == 0) else self.base_budget_s   # greedy elsewhere
+        elif self.schedule is None:
             per_turn = self.turn_budget_s
         else:
             per_turn, lo = self.base_budget_s, 0

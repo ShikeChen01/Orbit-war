@@ -40,7 +40,13 @@ def _checksum(net):
 # ===================== notebook side =====================
 NB = os.path.join("notebooks", "setup1_v12_a100.ipynb")
 doc = json.load(open(NB, encoding="utf-8"))
-ns = {"__name__": "nb"}
+# Register a real "nb" module so dataclasses exec'd from notebook cells can resolve cls.__module__
+# (Config uses `from __future__ import annotations` -> string field types; without a registered
+# module, sys.modules.get("nb") is None and dataclass KW_ONLY detection crashes).
+import sys as _sys, types as _types
+_nbmod = _types.ModuleType("nb"); _sys.modules["nb"] = _nbmod
+ns = _nbmod.__dict__
+ns["__name__"] = "nb"
 
 
 def _skip(src):

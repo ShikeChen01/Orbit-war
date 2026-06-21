@@ -14,8 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as _ckpt
 
-from .constants import (BOARD_SIZE, CENTER, DTYPE, F_DIM, G_DIM, PLANET_CAP, SHIP_LOG_DENOM,
-                        SUN_RADIUS)
+from .constants import BOARD_SIZE, CENTER, DTYPE, F_DIM, G_DIM, PLANET_CAP, SUN_RADIUS
 from .distributions import GatedAllocDist, GatedCatDist
 
 
@@ -113,6 +112,84 @@ class TransformerTrunk(nn.Module):
         return self.ln_out(tok)
 
 
+def parse_trunk_spec(spec):
+    """'res16,attn1,res64' -> [('res',16),('attn',1),('res',64)]. Block kinds: 'res' (pre-LN
+    ResNet-MLP) and 'attn' (PURE cross-planet multi-head self-attention, no MLP)."""
+    out = []
+    for tok in str(spec).replace(" ", "").split(","):
+        if not tok:
+            continue
+        i = 0
+        while i < len(tok) and tok[i].isalpha():
+            i += 1
+        kind, n = tok[:i], int(tok[i:])
+        assert kind in ("res", "attn", "seq"), "unknown block %r in TRUNK_SPEC (use res/attn/seq)" % kind
+        out.append((kind, n))
+    return out
+
+
+class ResMLPBlock(nn.Module):
+    '''One pre-LN ResNet-MLP block: x = x + W2(act(W1(LN(x)))). entity_mask arg ignored (uniform call).'''
+    def __init__(self, h, act='relu'):
+        super().__init__()
+        self.ln = nn.LayerNorm(h); self.a = nn.Linear(h, h); self.b = nn.Linear(h, h)
+        self.act = _resolve_act(act)
+
+    def forward(self, x, entity_mask=None):
+        return x + self.b(self.act(self.a(self.ln(x))))
+
+
+class CrossAttnBlock(nn.Module):
+    '''PURE cross-planet multi-head self-attention (pre-LN, residual, NO MLP). Masks dead-planet keys.'''
+    def __init__(self, h, n_heads):
+        super().__init__()
+        assert h % n_heads == 0, "HIDDEN (%d) not divisible by N_HEADS (%d)" % (h, n_heads)
+        self.h, self.nh, self.hd = h, n_heads, h // n_heads
+        self.ln = nn.LayerNorm(h)
+        self.q = nn.Linear(h, h); self.k = nn.Linear(h, h); self.v = nn.Linear(h, h); self.o = nn.Linear(h, h)
+
+    def forward(self, x, entity_mask):
+        B, E, _ = x.shape
+        xn = self.ln(x)
+        q = self.q(xn).view(B, E, self.nh, self.hd).transpose(1, 2)        # (B,nh,E,hd)
+        k = self.k(xn).view(B, E, self.nh, self.hd).transpose(1, 2)
+        v = self.v(xn).view(B, E, self.nh, self.hd).transpose(1, 2)
+        am = (entity_mask < 0.5).view(B, 1, 1, E).to(q.dtype) * (-1e9)     # additive key mask
+        ctx = F.scaled_dot_product_attention(q, k, v, attn_mask=am)
+        ctx = ctx.transpose(1, 2).reshape(B, E, self.h)
+        return x + self.o(ctx)
+
+
+class BlockSeqTrunk(nn.Module):
+    '''proj -> an arbitrary ordered SEQUENCE of blocks (parsed from TRUNK_SPEC) -> LN. Block kinds:
+    'res' = pre-LN ResNet-MLP; 'attn' = PURE cross-planet MHA (no MLP); 'seq' = full transformer
+    encoder layer (MHA + MLP, TX_MLP_RATIO). Emits per-planet features (B,E,h); drop-in trunk.'''
+    def __init__(self, F, h, spec, n_heads, act='relu', grad_checkpoint=False, mlp_ratio=4):
+        super().__init__()
+        self.proj = nn.Linear(F, h)
+        self.grad_checkpoint = bool(grad_checkpoint)
+        blocks = []
+        for kind, count in spec:
+            for _ in range(count):
+                if kind == 'res':
+                    blocks.append(ResMLPBlock(h, act))
+                elif kind == 'attn':
+                    blocks.append(CrossAttnBlock(h, n_heads))
+                else:                                   # 'seq' = transformer encoder layer (MHA + MLP)
+                    blocks.append(TxEncoderLayer(h, n_heads, mlp_ratio, act))
+        self.blocks = nn.ModuleList(blocks)
+        self.ln_out = nn.LayerNorm(h)
+
+    def forward(self, entities, entity_mask):
+        tok = self.proj(entities)
+        for blk in self.blocks:
+            if self.grad_checkpoint and tok.requires_grad:
+                tok = _ckpt.checkpoint(blk, tok, entity_mask, use_reentrant=False)
+            else:
+                tok = blk(tok, entity_mask)
+        return self.ln_out(tok)
+
+
 class PolicyNet(nn.Module):
     '''v5 TARGET actor-critic (mirrors model/policy_net.cpp, target_actor branch).
 
@@ -128,7 +205,8 @@ class PolicyNet(nn.Module):
     def __init__(self, cfg, F, G, hidden, d_g, max_entities, n_res_blocks, use_glu, init_gate_bias,
                  use_attention=True,
                  value_res_blocks=2, arch="trunk", n_heads=8, n_tx_layers=4, tx_mlp_ratio=4,
-                 n_stem_res=1, n_head_res=1, act='relu', aux_reward_pred=False):
+                 n_stem_res=1, n_head_res=1, act='relu', aux_reward_pred=False, aux_win_bet=False,
+                 trunk_spec=""):
         super().__init__()
         self.F, self.G, self.h, self.d_g, self.E = F, G, hidden, d_g, max_entities
         self.use_glu = use_glu
@@ -139,6 +217,9 @@ class PolicyNet(nn.Module):
         h = hidden
         if arch == "transformer":
             self.trunk = TransformerTrunk(F, h, n_heads, n_tx_layers, tx_mlp_ratio, n_stem_res, n_head_res, act)
+        elif arch == "blockseq":                            # ordered res/attn block sequence from TRUNK_SPEC
+            self.trunk = BlockSeqTrunk(F, h, parse_trunk_spec(trunk_spec), n_heads, act,
+                                       self.grad_checkpoint, tx_mlp_ratio)
         else:
             self.proj = nn.Linear(F, h)
             if use_attention:                               # cross-planet self-attention (toggleable)
@@ -170,9 +251,10 @@ class PolicyNet(nn.Module):
         # the TRUNK, not to fit r_t with a deep head. Built only when enabled, so the state_dict (and every
         # existing checkpoint) is unchanged when off; this flag is persisted in the ckpt config blob.
         self.aux_reward_pred = bool(aux_reward_pred)
-        if self.aux_reward_pred:
-            self.rew_in = nn.Linear(h + d_g, h)
-            self.rew_out = nn.Linear(h, 1)
+        self.aux_win_bet = bool(aux_win_bet)
+        if self.aux_reward_pred or self.aux_win_bet:      # ONE shallow scalar head, two possible objectives:
+            self.rew_in = nn.Linear(h + d_g, h)           #   reward-pred (raw -> MSE to r_t) OR
+            self.rew_out = nn.Linear(h, 1)                #   win-bet (raw logit -> bet=tanh, maximize bet*outcome)
         # calm init: few planets fire at start (negative gate bias); WHERE small-init -> ~uniform
         with torch.no_grad():
             self.gate_head.bias.fill_(init_gate_bias)
@@ -186,7 +268,7 @@ class PolicyNet(nn.Module):
         return tok + self.res_b[i](self.act_fn(self.res_a[i](self.ln_res[i](tok))))
 
     def forward(self, entities, entity_mask, action_mask, globals_):
-        if self.arch == "transformer":
+        if self.arch in ("transformer", "blockseq"):
             tok = self.trunk(entities, entity_mask)
         else:
             tok = self.proj(entities)                       # (B,E,d)
@@ -225,10 +307,10 @@ class PolicyNet(nn.Module):
         for i in range(len(self.val_res_a)):                           # residual blocks (skip per block)
             vh = vh + self.val_res_b[i](self.act_fn(self.val_res_a[i](self.val_ln[i](vh))))
         value = self.val_out(vh).squeeze(-1)                           # (B,)
-        reward_pred = None                                             # aux reward head (UNREAL): predict r_t
-        if self.aux_reward_pred:                                       # from the SAME pooled trunk features as the critic
-            reward_pred = self.rew_out(self.act_fn(self.rew_in(torch.cat([pooled, gp], -1)))).squeeze(-1)  # (B,)
-        return dest_logits, gate_logits, value, reward_pred
+        reward_pred = None                                             # aux scalar head off the SAME pooled features:
+        if self.aux_reward_pred or self.aux_win_bet:                   # raw output -> MSE to r_t (reward-pred), or the
+            reward_pred = self.rew_out(self.act_fn(self.rew_in(torch.cat([pooled, gp], -1)))).squeeze(-1)  # bet logit
+        return dest_logits, gate_logits, value, reward_pred            # (win-bet: bet = tanh(reward_pred) in the loss)
 
 
 def build_policy(cfg):
@@ -237,7 +319,8 @@ def build_policy(cfg):
                      value_res_blocks=cfg.VALUE_RES_BLOCKS,
                      arch=cfg.ARCH, n_heads=cfg.N_HEADS, n_tx_layers=cfg.N_TX_LAYERS,
                      tx_mlp_ratio=cfg.TX_MLP_RATIO, n_stem_res=cfg.N_STEM_RES,
-                     n_head_res=cfg.N_HEAD_RES, aux_reward_pred=cfg.AUX_REWARD_PRED).to(cfg.device)
+                     n_head_res=cfg.N_HEAD_RES, aux_reward_pred=cfg.AUX_REWARD_PRED,
+                     aux_win_bet=cfg.AUX_WIN_BET, trunk_spec=getattr(cfg, "TRUNK_SPEC", "")).to(cfg.device)
     _net.popart = PopArt(cfg.POPART_BETA)
     return _net
 
@@ -266,8 +349,8 @@ def compute_reach(ent, em):
 
 
 def recover_ships(ent):
-    """Integer ship count per planet, recovered from feature b6 = log1p(ships)/log(1000)."""
-    return torch.round(torch.expm1((ent[..., 6] * SHIP_LOG_DENOM).clamp_min(0.0)))
+    """Integer ship count per planet, read directly from feature b6 (now the RAW garrison)."""
+    return torch.round(ent[..., 6].clamp_min(0.0))
 
 
 def _make_dist(cfg, net, ent, em, am, gl):

@@ -28,13 +28,13 @@ def grpo_update(cfg, net, opt, tb, ent_coef, policy_coef, ref_net=None):
     logged in the ``vf`` slot (there is no critic) so the training heartbeat prints unchanged."""
     N = tb["n"]; mb = cfg.MINIBATCHES; mbsize = N // mb
     s = {"total": 0.0, "policy": 0.0, "vf": 0.0, "entropy": 0.0, "sigma": 0.0,
-         "approx_kl": 0.0, "clipfrac": 0.0, "grad_norm": 0.0}
+         "approx_kl": 0.0, "clipfrac": 0.0, "grad_norm": 0.0, "auxr": 0.0}
     if mbsize == 0:
         return s
     nsteps = 0
     dev = tb["entities"].device
     _acc = {k: torch.zeros((), device=dev) for k in            # GPU-side stat accumulators: flush ONCE
-            ("total", "policy", "vf", "entropy", "sigma", "clipfrac", "grad_norm")}   # at the end
+            ("total", "policy", "vf", "entropy", "sigma", "clipfrac", "grad_norm", "auxr")}   # at the end
     beta = cfg.GRPO_KL_COEF if ref_net is not None else 0.0
     for epoch in range(cfg.UPDATE_EPOCHS):
         perm = torch.randperm(N, device=dev)
@@ -49,7 +49,7 @@ def grpo_update(cfg, net, opt, tb, ent_coef, policy_coef, ref_net=None):
             oldlp = tb["old_logp"].index_select(0, mi)
             adv = tb["advantage"].index_select(0, mi)
 
-            logp, entropy, value, _ = evaluate(cfg, net, ent, em, am, gl, act_mb)   # value used only by GRPO_AUX_VALUE; rew-pred unused
+            logp, entropy, value, rpred = evaluate(cfg, net, ent, em, am, gl, act_mb)   # value: GRPO_AUX_VALUE; rpred: aux head
             n_owned = am.sum(1).clamp_min(1.0)                # per-owned-source mean entropy (scale-correct)
             pol = policy_surrogate(cfg, logp, oldlp, adv, cfg.CLIP, n_owned)
             ent_b = (entropy / n_owned).mean()
@@ -61,6 +61,16 @@ def grpo_update(cfg, net, opt, tb, ent_coef, policy_coef, ref_net=None):
                 vtgt = net.popart.normalize(ret_mb) if (cfg.USE_POPART and getattr(net, "popart", None) is not None) else ret_mb
                 vloss = F.mse_loss(value, vtgt)
                 loss = loss + cfg.GRPO_AUX_COEF * vloss
+            auxr_mb = torch.zeros((), device=dev)
+            if cfg.AUX_WIN_BET:                               # win-bet aux head (same as PPO): maximize bet*outcome
+                z = tb["outcome"].index_select(0, mi)         #   bet = tanh(rpred) in [-1,1]; representation aux only
+                bet_payoff = (torch.tanh(rpred) * z).mean()   #   >0 = betting in the right direction on the outcome
+                loss = loss + cfg.AUX_WIN_BET_COEF * (-bet_payoff)
+                auxr_mb = bet_payoff.detach()                 #   logged as 'ar' in the heartbeat
+            elif cfg.AUX_REWARD_PRED:                         # UNREAL reward-prediction aux head (MSE to r_t)
+                aux_mse = F.mse_loss(rpred, tb["reward"].index_select(0, mi))
+                loss = loss + cfg.AUX_REWARD_COEF * aux_mse
+                auxr_mb = aux_mse.detach()
             kl_ref = torch.zeros((), device=dev)
             if beta > 0.0:                                    # KL(pi || pi_ref), unbiased k3 estimator
                 with torch.no_grad():
@@ -85,6 +95,7 @@ def grpo_update(cfg, net, opt, tb, ent_coef, policy_coef, ref_net=None):
                 _acc["total"] += loss.detach(); _acc["policy"] += pol.detach()
                 _acc["vf"] += (kl_ref + vloss).detach()       # no critic: surface KL-to-ref (+ aux vloss) in the vf slot
                 _acc["entropy"] += ent_b.detach(); _acc["sigma"] += ent_b.detach()
+                _acc["auxr"] += auxr_mb
                 s["approx_kl"] += mb_kl
                 _acc["clipfrac"] += (torch.abs(ratio - 1.0) > cfg.CLIP).to(DTYPE).mean()
                 _acc["grad_norm"] += gnorm.detach()

@@ -53,7 +53,7 @@ print("[smoke] config: SMOKE B=%d EPISODE_STEPS=%d TOTAL_ITERS=%d" % (cfg.B, cfg
 net, hist, league = ow.Trainer(cfg).train()
 
 # --- shared league invariants ---
-assert constants.F_DIM == 104, "v12 keeps the one-hot obs (F_DIM 104), got %r" % constants.F_DIM
+assert constants.F_DIM == 194, "v12 per-opponent threat one-hot obs (F_DIM 194), got %r" % constants.F_DIM
 n2, n4 = hist["fmt"].count(2), hist["fmt"].count(4)
 print("\n[smoke] iterations: %d x 2p, %d x 4p" % (n2, n4))
 assert n4 >= 1 and n2 >= 1, "expected BOTH formats in the mix"

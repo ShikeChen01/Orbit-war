@@ -49,7 +49,10 @@ class Config:
     COMPILE_MODE: str = "default"  # "default" = fuse, low VRAM | "reduce-overhead" = CUDA graphs
     ACT_FN: str = "tanh"           # ResNet-MLP activation: 'relu'|'tanh'|'gelu'|'silu'
     # ---- trunk architecture (stacked transformer w/ ResNet-MLP ends) -----------------------
-    ARCH: str = "trunk"            # "trunk" = legacy (1x attn + N res-MLP) | "transformer" = stack
+    ARCH: str = "trunk"            # "trunk" = legacy (1x attn + N res-MLP) | "transformer" = stack |
+    #                                "blockseq" = arbitrary ordered res/attn sequence from TRUNK_SPEC
+    TRUNK_SPEC: str = ""           # [blockseq] e.g. "res16,attn1,res64": res = pre-LN ResNet-MLP block,
+    #                                attn = PURE cross-planet multi-head self-attention (uses N_HEADS)
     N_TX_LAYERS: int = 6           # [transformer] encoder layers
     N_HEADS: int = 12              # [transformer] attention heads (HIDDEN must divide by this)
     TX_MLP_RATIO: int = 4          # [transformer] per-layer MLP hidden = ratio x HIDDEN
@@ -102,12 +105,23 @@ class Config:
     # in the ckpt config blob and rebuilt per-member, so pre-aux league snapshots still load unchanged.
     AUX_REWARD_PRED: bool = False   # build + train the reward-prediction head (consumed by ppo_update only)
     AUX_REWARD_COEF: float = 0.25   # weight of the aux reward MSE loss (shared-trunk regularizer)
+    # ---- auxiliary WIN-BET head (replaces the naive reward predictor; PPO path) -----------------
+    # The SAME shallow scalar head instead bets b_t = tanh(head) in [-1,1] on the eventual game outcome
+    # z in [-1,1] (2p: +-1 win/loss; 4p: placement). The bet earns b_t * z (bet +1 & win -> +1; bet +1 &
+    # lose -> -1; bet -1 & lose -> +1), so the trunk is pressured to discriminate winning vs losing states
+    # -- a far more decision-relevant aux than predicting the immediate reward. Pure representation aux:
+    # NOT in the reward / advantage / critic. Mutually exclusive with AUX_REWARD_PRED (win-bet takes
+    # precedence). Default OFF; flag persisted in the ckpt blob so league members rebuild correctly.
+    AUX_WIN_BET: bool = False        # build + train the win-bet head (maximize bet*outcome; ppo_update only)
+    AUX_WIN_BET_COEF: float = 0.25   # weight of the win-bet aux loss (shared-trunk regularizer)
 
     # ---- GRPO (group-relative PO; critic-free alternative to PPO+GAE) -----------------------
     # ALGO selects the optimizer at rollout+update time. "grpo" rolls each world out GRPO_GROUP
     # times and standardizes each rollout's return WITHIN its group as the advantage (no learned
     # value baseline) -- same clipped surrogate + entropy, no value loss, optional KL-to-reference.
-    ALGO: str = "ppo"               # "ppo" = PPO+GAE (learned critic) | "grpo" = group baseline (no critic)
+    ALGO: str = "ppo"               # "ppo" = PPO+GAE (learned critic) | "grpo" = group baseline (no critic) |
+    #                                 "mc" = critic-free, advantage = discounted Monte-Carlo return-to-go G_t
+    #                                 (no GAE, no value loss; whitened; uses the grpo clipped-surrogate update)
     GRPO_GROUP: int = 0             # rollouts sharing one world for the relative baseline (0 -> GROUP_SIZE)
     GRPO_ADV_EPS: float = 1e-4      # std floor when standardizing returns within a group
     GRPO_WHITEN: bool = False       # also batch-whiten advantages on top of the per-group baseline
@@ -211,7 +225,8 @@ class Config:
     WIN_BONUS: float = 1000.0
     LOSS_PENALTY: float = 1000.0
     WIN_DECAY: float = 1.0
-    LOSS_DECAY: float = 1.0
+    LOSS_DECAY: float = 0.9995     # asymmetric "lose-slower": a late loss is penalized slightly less than an
+    #                                early one (a survival incentive); winning is undecayed (WIN_DECAY=1.0)
     DECAY_START_STEP: float = 100.0
     CAPTURE_REWARD: float = 30.0
     CAPTURE_LOSS_FRAC: float = 0.9
@@ -219,6 +234,11 @@ class Config:
     PROD_MILESTONE_REWARD: float = 20.0
     PROD_MILESTONE_BASE: float = 100.0
     PPO_REWARD_SCALE: float = 100.0
+    DENSE_REWARD_SCALE: float = 1.0   # multiplier on the capture + prod-milestone channels ONLY (launch is EXEMPT
+    #   -- it is the anti-passivity activity floor). <1 makes the terminal W/L (+-WIN_BONUS) dominate the
+    #   integrated return. CAUTION under critic-free ALGO mc/grpo: too low (e.g. 0.2) starves per-step credit
+    #   assignment (no critic baseline -> every step of a losing game gets the same advantage) and triggers the
+    #   passivity ratchet. ~0.5 keeps enough dense signal; watch lnch/st as the canary. Use ppo for true sparse-W/L.
 
     # ---- v6: compute-bound A100 + gate/entropy/popart/shaping ------------------------------
     USE_AMP: bool = True
@@ -233,7 +253,9 @@ class Config:
     KL_EARLYSTOP: bool = True
     USE_POPART: bool = True
     POPART_BETA: float = 3e-4
-    USE_POTENTIAL_SHAPING: bool = True
+    USE_POTENTIAL_SHAPING: bool = False   # default = legacy SMALL dense reward (capture + prod-milestone +
+    #   launch) so the terminal W/L (+-10 after PPO_REWARD_SCALE) dominates. True -> policy-invariant
+    #   potential shaping (ship-margin + prod-share, Ng et al.) via SHAPE_SHIP/SHAPE_PROD.
     SHAPE_SHIP: float = 25.0
     SHAPE_PROD: float = 25.0
 

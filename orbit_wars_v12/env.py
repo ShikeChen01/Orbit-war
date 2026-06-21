@@ -12,9 +12,9 @@ import numpy as np
 import torch
 
 from .constants import (BIG, BOARD_SIZE, CENTER, COMET_PRODUCTION, COMET_RADIUS, DIAG_HALF, DTYPE,
-                        N_BIG, N_SOON, N_THREAT_FLEETS, PI, PLANET_CAP, ROTATION_RADIUS_LIMIT,
-                        SHIP_SPEED, SUN_RADIUS, THREAT_ETA_SCALE, THREAT_MAX_SPEED, fleet_speed_t,
-                        ship_log_t)
+                        N_THREAT_FEATS, N_THREAT_FLEETS, PI, PLANET_CAP,
+                        ROTATION_RADIUS_LIMIT, SHIP_SPEED, SUN_RADIUS, THREAT_ETA_SCALE,
+                        THREAT_MAX_SPEED, fleet_speed_t, ship_log_t)
 
 # opponent_action codes by league "kind" (the two notebook names are the same mapping).
 _OPP_BY_KIND = {"random": 0, "starter": 1, "noop": 2, "medium": 3, "greedy": 4, "intermediate": 5}
@@ -101,6 +101,7 @@ class GpuEnv:
         self.done = torch.zeros(B, dtype=DTYPE, device=dev)
         if getattr(self, '_rot_aug', False):       # seat-swap aug (training env only); set by collect_ppo
             _apply_rot_aug(self)
+        self.p_x_prev = self.p_x.clone(); self.p_y_prev = self.p_y.clone()   # one-step prev pos -> finite-diff body velocity
 
 
 # ---- seat-swap augmentation helpers (training env only) --------------------------------------
@@ -133,55 +134,76 @@ def _apply_rot_aug(env):
         env.c_paths = torch.stack([rx, ry], dim=-1)
 
 
-def fleet_target_batch(env, fx, fy, fang, fships, vmax):
-    '''fx,fy,fang,fships: (B,M). Returns tgt (B,M) long (planet slot or -1), eta (B,M).'''
-    dx = torch.cos(fang).unsqueeze(2)           # (B,M,1)
-    dy = torch.sin(fang).unsqueeze(2)
-    pxr = env.p_x.unsqueeze(1)                  # (B,1,Ec)
-    pyr = env.p_y.unsqueeze(1)
-    rr = (env.p_radius * env.p_radius).unsqueeze(1)
-    alive = (env.p_alive > 0.5).unsqueeze(1)
-    ox = fx.unsqueeze(2) - pxr                  # (B,M,Ec)
-    oy = fy.unsqueeze(2) - pyr
-    tca = -(ox * dx + oy * dy)
-    perp2 = ox * ox + oy * oy - tca * tca
-    hit = (tca >= 0.0) & (perp2 <= rr) & alive
-    t_int = (tca - torch.sqrt((rr - perp2).clamp_min(0.0))).clamp_min(0.0)
-    tvals = torch.where(hit, t_int, torch.full_like(t_int, BIG))
-    best_t, best_e = tvals.min(2)               # (B,M)
+def _fleet_target_core(fx, fy, fang, fships, vmax, p_x, p_y, p_radius, p_alive, p_x_prev, p_y_prev):
+    '''Pure-tensor core of fleet_target_batch (NO env object) -> torch.compile-friendly. Identical
+    math; the planet state + previous positions (for the finite-diff planet velocity) arrive as
+    tensor args instead of being read off the env (which dynamo cannot trace through cleanly).'''
+    spd = fleet_speed_t(fships, vmax)                            # (B,M) fleet speed
+    fvx = (torch.cos(fang) * spd).unsqueeze(2)                   # (B,M,1) fleet velocity vector
+    fvy = (torch.sin(fang) * spd).unsqueeze(2)
+    pxr = p_x.unsqueeze(1); pyr = p_y.unsqueeze(1)               # (B,1,Ec) planet position
+    pvx = (p_x - p_x_prev).unsqueeze(1); pvy = (p_y - p_y_prev).unsqueeze(1)   # (B,1,Ec) planet velocity (finite diff)
+    rr = (p_radius * p_radius).unsqueeze(1)
+    alive = (p_alive > 0.5).unsqueeze(1)
+    rx = fx.unsqueeze(2) - pxr                  # (B,M,Ec) relative position (fleet - planet)
+    ry = fy.unsqueeze(2) - pyr
+    wx = fvx - pvx; wy = fvy - pvy              # (B,M,Ec) relative velocity (fleet - planet)
+    a = wx * wx + wy * wy
+    b = 2.0 * (rx * wx + ry * wy)
+    c = rx * rx + ry * ry - rr
+    disc = b * b - 4.0 * a * c
+    sq = torch.sqrt(disc.clamp_min(0.0))
+    t_hit = (-b - sq) / (2.0 * a).clamp_min(1e-9)               # first contact = smaller root (TICKS)
+    t_hit = torch.where(c <= 0.0, torch.zeros_like(t_hit), t_hit)   # fleet already inside the disk -> now
+    hit = (disc >= 0.0) & (t_hit >= 0.0) & alive & (a > 1e-9)
+    tvals = torch.where(hit, t_hit, torch.full_like(t_hit, BIG))
+    best_t, best_e = tvals.min(2)               # (B,M) earliest contact TIME + planet
     any_hit = best_t < BIG
-    # sun occlusion
+    # sun occlusion: is the (static) sun reached BEFORE the target? compare in TICKS
     sx = fx - CENTER; sy = fy - CENTER
     dxx = torch.cos(fang); dyy = torch.sin(fang)
     tcs = -(sx * dxx + sy * dyy)
     sperp2 = sx * sx + sy * sy - tcs * tcs
     sr = SUN_RADIUS * SUN_RADIUS
-    t_sun = tcs - torch.sqrt((sr - sperp2).clamp_min(0.0))
+    t_sun = (tcs - torch.sqrt((sr - sperp2).clamp_min(0.0))) / spd.clamp_min(1e-6)   # ticks to sun entry
     sun_block = (tcs >= 0.0) & (sperp2 <= sr) & (t_sun >= 0.0) & (t_sun < best_t)
     valid = any_hit & (~sun_block)
-    tgt = torch.where(valid, best_e, torch.full_like(best_e, -1))
-    eta = best_t / fleet_speed_t(fships, vmax)
-    eta = torch.where(valid, eta, torch.zeros_like(eta))
-    return tgt, eta
+    tgt = torch.where(valid, best_e, torch.full_like(best_e, -1))             # SUN-AWARE (sun-blocked -> -1)
+    eta = torch.where(valid, best_t, torch.zeros_like(best_t))                # best_t already in TICKS
+    app_tgt = torch.where(any_hit, best_e, torch.full_like(best_e, -1))       # APPARENT target (ignores the sun)
+    app_eta = torch.where(any_hit, best_t, torch.zeros_like(best_t))          # -> sun-bound fleets still attributed here
+    return tgt, eta, app_tgt, app_eta
 
 
-def env_encode(env, ego=0):
-    """v9: ownership is a 4-channel EGO-RELATIVE seat ONE-HOT [self, enemy seat+1, seat+2,
-    seat+3] (neutral = all-zero), so the policy can tell WHICH opponent owns a body with no
-    ordinal fake-magnitude. In 2p only the first two channels ever fire, so 4p generalizes the
-    same input space; a dead seat's channel simply stops firing. The GLOBAL enemy aggregates
-    still pool ALL opponents (everyone-vs-me totals)."""
-    B, Ec, Fc = env.B, env.Ec, env.Fc
-    na = float(getattr(env, "n_players", 2))
-    dev = env.dev
-    alive = env.p_alive > 0.5
-    av = env.p_alive
-    owner = env.p_owner
-    dxc = env.p_x - CENTER; dyc = env.p_y - CENTER
+def fleet_target_batch(env, fx, fy, fang, fships, vmax):
+    '''fx,fy,fang,fships: (B,M). Returns (tgt, eta, app_tgt, app_eta), each (B,M): tgt/eta = the
+    SUN-AWARE target (a fleet whose path is absorbed by the sun -> -1); app_tgt/app_eta = the APPARENT
+    target ignoring the sun (the planet the ray points at) -- the threat encoder uses the apparent
+    target so a sun-bound fleet still SHOWS UP in the threat list of the planet it is aimed at.
+    Thin env wrapper around _fleet_target_core (resolves the previous-position finite-diff fallback).'''
+    p_x_prev = getattr(env, "p_x_prev", env.p_x); p_y_prev = getattr(env, "p_y_prev", env.p_y)
+    return _fleet_target_core(fx, fy, fang, fships, vmax, env.p_x, env.p_y, env.p_radius, env.p_alive,
+                              p_x_prev, p_y_prev)
+
+
+def _encode_core(ego, na, T, vmax, p_alive, p_owner, p_x, p_y, p_radius, p_is_comet, ang_vel,
+                 p_prod, p_ships, f_x, f_y, f_angle, f_ships, f_alive, f_owner, f_seq, step_ct,
+                 p_x_prev, p_y_prev):
+    """Pure-tensor core of env_encode (NO env object) -> torch.compile-friendly. ``ego``/``na``/``T``/
+    ``vmax`` are python scalars (compile specializes one graph per distinct value -- a tiny, fixed set:
+    ego in 0..3, na in {2,4}, T in {200,500}); everything else is a tensor. Identical math to the
+    wrapper below; shapes + device are read off the tensors instead of the env object."""
+    B, Ec = p_owner.shape
+    Fc = f_owner.shape[1]
+    dev = p_owner.device
+    alive = p_alive > 0.5
+    av = p_alive
+    owner = p_owner
+    dxc = p_x - CENTER; dyc = p_y - CENTER
     dist = torch.sqrt(dxc * dxc + dyc * dyc)
-    comet = env.p_is_comet > 0.5
-    rotating = (~comet) & ((dist + env.p_radius) < ROTATION_RADIUS_LIMIT)
-    angv = env.ang_vel.unsqueeze(1)
+    comet = p_is_comet > 0.5
+    rotating = (~comet) & ((dist + p_radius) < ROTATION_RADIUS_LIMIT)
+    angv = ang_vel.unsqueeze(1)
     vmag = torch.where(rotating, angv.abs() * dist, torch.zeros_like(dist))
     cw = torch.where(rotating,
                      torch.where(angv >= 0.0, torch.ones_like(dist), -torch.ones_like(dist)),
@@ -193,45 +215,47 @@ def env_encode(env, ego=0):
     rel = rel - na * torch.floor(rel / na)
     _owned = owner >= 0.0
     own_oh = [(_owned & (rel == float(k))).to(DTYPE) for k in range(4)]
-    b0 = env.p_x / BOARD_SIZE
-    b1 = env.p_y / BOARD_SIZE
+    b0 = p_x / BOARD_SIZE
+    b1 = p_y / BOARD_SIZE
     b2 = vmag / THREAT_MAX_SPEED
     b3 = cw
-    b4 = env.p_radius / 3.0
-    b5 = env.p_prod / 5.0
-    b6 = ship_log_t(env.p_ships)
+    b4 = p_radius / 3.0
+    b5 = p_prod / 5.0
+    b6 = p_ships  # RAW garrison (per-planet ship-log compression removed; un-normalized integer count)
     b7a, b7b, b7c, b7d = own_oh   # [self, enemy+1, enemy+2, enemy+3]; neutral all-zero
     b8 = dist / DIAG_HALF
     b9 = comet.to(DTYPE)
-    actable = (owner == float(ego)) & alive & (env.p_ships > 0.0)
+    actable = (owner == float(ego)) & alive & (p_ships > 0.0)
     b10 = actable.to(DTYPE)
     body = torch.stack([b0, b1, b2, b3, b4, b5, b6, b7a, b7b, b7c, b7d, b8, b9, b10], 2)  # (B,Ec,14)
 
-    # threat: per planet, N_SOON soonest + N_BIG largest inbound fleets
-    ftgt, feta = fleet_target_batch(env, env.f_x, env.f_y, env.f_angle, env.f_ships, env.vmax)
-    falive = env.f_alive > 0.5
-    fsign = torch.where(env.f_owner == float(ego), torch.ones_like(env.f_ships),
-                        -torch.ones_like(env.f_ships))
-    fslog = ship_log_t(env.f_ships.abs())
+    # threat: per planet, the TOP N_THREAT_FLEETS inbound fleets BY SIZE. Attribution uses the APPARENT
+    # target (the planet the ray points at, IGNORING the sun), so a fleet that will be absorbed by the sun
+    # still SHOWS UP in its target's threat list (it is genuinely aimed here).
+    _t, _e, app_tgt, app_eta = _fleet_target_core(f_x, f_y, f_angle, f_ships, vmax, p_x, p_y, p_radius,
+                                                  p_alive, p_x_prev, p_y_prev)
+    falive = f_alive > 0.5
+    # fleet ownership = 4-channel EGO-RELATIVE seat ONE-HOT [self, enemy+1, +2, +3] (rotation-equivariant;
+    # 2p only lights channels 0..1; empty/dead slots all-zero, masked by `valid` below).
+    frel = f_owner - float(ego)
+    frel = frel - na * torch.floor(frel / na)               # (B,Fc) ego-relative seat
+    fraw = f_ships.abs()                                    # RAW inbound-fleet size (log compression is legacy)
     slot = torch.arange(Ec, dtype=DTYPE, device=dev).view(1, Ec, 1)
-    tgtf = ftgt.to(DTYPE).unsqueeze(1)                       # (B,1,Fc)
-    targeting = (tgtf == slot) & (ftgt >= 0).unsqueeze(1) & falive.unsqueeze(1)  # (B,Ec,Fc)
+    tgtf = app_tgt.to(DTYPE).unsqueeze(1)                    # (B,1,Fc) APPARENT target (sun-bound fleets included)
+    targeting = (tgtf == slot) & (app_tgt >= 0).unsqueeze(1) & falive.unsqueeze(1)  # (B,Ec,Fc)
     W = float(1 << 20)
-    eta_mat = torch.where(targeting, feta.unsqueeze(1), torch.full((1,), BIG, device=dev))
-    absf = env.f_ships.abs().unsqueeze(1)
-    seqf = env.f_seq.unsqueeze(1)
+    absf = f_ships.abs().unsqueeze(1)
+    seqf = f_seq.unsqueeze(1)
     key_big = torch.where(targeting, absf * W - seqf, torch.full((1,), -BIG, device=dev))
-    eta_top_v, eta_top_i = torch.topk(eta_mat, N_SOON, 2, largest=False)
-    big_top_v, big_top_i = torch.topk(key_big, N_BIG, 2, largest=True)
-    idx = torch.cat([eta_top_i, big_top_i], 2)              # (B,Ec,7)
-    valid = torch.cat([eta_top_v < BIG * 0.5, big_top_v > -BIG * 0.5], 2)
+    big_top_v, idx = torch.topk(key_big, N_THREAT_FLEETS, 2, largest=True)   # TOP 30 BY SIZE (seq tie-break)
+    valid = big_top_v > -BIG * 0.5
     def pick(src):
         return src.unsqueeze(1).expand(B, Ec, Fc).gather(2, idx)
     zt = torch.zeros(B, Ec, N_THREAT_FLEETS, device=dev)
-    sgn = torch.where(valid, pick(fsign), zt)
-    etf = torch.where(valid, pick(feta) / THREAT_ETA_SCALE, zt)
-    slg = torch.where(valid, pick(fslog), zt)
-    threat = torch.stack([sgn, etf, slg], 3).reshape(B, Ec, 3 * N_THREAT_FLEETS)  # (B,Ec,21)
+    own_ch = [torch.where(valid, pick((frel == float(k)).to(DTYPE)), zt) for k in range(4)]  # [self,e+1,e+2,e+3]
+    etf = torch.where(valid, pick(app_eta) / THREAT_ETA_SCALE, zt)
+    slg = torch.where(valid, pick(fraw), zt)
+    threat = torch.stack(own_ch + [etf, slg], 3).reshape(B, Ec, N_THREAT_FEATS * N_THREAT_FLEETS)  # (B,Ec,180)
 
     entities = torch.cat([body, threat], 2) * av.unsqueeze(2)   # zero dead slots
     entity_mask = av
@@ -239,24 +263,78 @@ def env_encode(env, ego=0):
 
     # globals (B,10)
     def psum(mask):
-        return (env.p_ships * mask.to(DTYPE)).sum(1)
+        return (p_ships * mask.to(DTYPE)).sum(1)
     mine = (owner == float(ego)) & alive
     en = (owner >= 0.0) & (owner != float(ego)) & alive    # ALL opponents pooled
     neu = (owner < 0.0) & alive
     my_ships = psum(mine); en_ships = psum(en)
     my_pl = mine.to(DTYPE).sum(1); en_pl = en.to(DTYPE).sum(1); neu_pl = neu.to(DTYPE).sum(1)
     npl = av.sum(1); total = npl.clamp_min(1.0)
-    my_fleet = (env.f_ships * (env.f_owner == float(ego)).to(DTYPE) * falive.to(DTYPE)).sum(1)
-    en_fleet = (env.f_ships * (env.f_owner != float(ego)).to(DTYPE) * falive.to(DTYPE)).sum(1)
+    my_fleet = (f_ships * (f_owner == float(ego)).to(DTYPE) * falive.to(DTYPE)).sum(1)
+    en_fleet = (f_ships * (f_owner != float(ego)).to(DTYPE) * falive.to(DTYPE)).sum(1)
     ME = 40.0
-    g0 = env.step_ct / max(1, env.T)
-    g1 = env.ang_vel * 10.0
+    g0 = step_ct / max(1, T)
+    g1 = ang_vel * 10.0
     g2 = ship_log_t(my_ships); g3 = ship_log_t(en_ships)
     g4 = my_pl / total; g5 = en_pl / total; g6 = neu_pl / total
     g7 = ship_log_t(my_fleet); g8 = ship_log_t(en_fleet)
     g9 = torch.minimum(npl, torch.full_like(npl, ME)) / ME
     globals_ = torch.stack([g0, g1, g2, g3, g4, g5, g6, g7, g8, g9], 1)
     return entities, entity_mask, action_mask, globals_
+
+
+# The compiled handle is installed by maybe_compile_encode(cfg) at train start (USE_COMPILE); until
+# then env_encode runs _encode_core EAGERLY -- so eval/league/MCTS paths are unaffected unless compiled.
+_ENCODE_CORE = _encode_core
+
+
+def env_encode(env, ego=0):
+    """v9: ownership is a 4-channel EGO-RELATIVE seat ONE-HOT [self, enemy seat+1, seat+2,
+    seat+3] (neutral = all-zero), so the policy can tell WHICH opponent owns a body with no
+    ordinal fake-magnitude. In 2p only the first two channels ever fire, so 4p generalizes the
+    same input space; a dead seat's channel simply stops firing. The GLOBAL enemy aggregates
+    still pool ALL opponents (everyone-vs-me totals).
+
+    Thin env wrapper: unpacks the env tensors + scalars and calls _encode_core (compiled in place by
+    maybe_compile_encode, else eager). Keeping the heavy math in a pure-tensor function is what lets
+    torch.compile trace it -- dynamo cannot follow the env object's getattr-with-default accesses."""
+    na = float(getattr(env, "n_players", 2))
+    p_x_prev = getattr(env, "p_x_prev", env.p_x); p_y_prev = getattr(env, "p_y_prev", env.p_y)
+    return _ENCODE_CORE(int(ego), na, int(env.T), env.vmax, env.p_alive, env.p_owner, env.p_x, env.p_y,
+                        env.p_radius, env.p_is_comet, env.ang_vel, env.p_prod, env.p_ships, env.f_x,
+                        env.f_y, env.f_angle, env.f_ships, env.f_alive, env.f_owner, env.f_seq,
+                        env.step_ct, p_x_prev, p_y_prev)
+
+
+def maybe_compile_encode(cfg):
+    """Install a torch.compile'd _encode_core as the handle env_encode dispatches to (idempotent,
+    called once at train start when cfg.USE_COMPILE). The pure core has only tensor args + a few
+    python scalars (ego/na/T/vmax), so it traces with NO graph breaks -- fusing the ~50-op encoder the
+    launch-bound rollout calls 2-4x/step. Robust: torch.compile is LAZY, so a backend failure surfaces
+    on the FIRST call, not at compile() time -- a one-shot guard catches it and permanently reverts to
+    eager, so an absent/broken compiler can never kill a training run."""
+    global _ENCODE_CORE
+    if not getattr(cfg, "USE_COMPILE", False) or getattr(_ENCODE_CORE, "_ow_compiled", False):
+        return _ENCODE_CORE
+    try:
+        compiled = torch.compile(_encode_core, mode=getattr(cfg, "COMPILE_MODE", "default"))
+    except Exception as e:
+        print("  [compile] env_encode not compiled (%r) -> eager" % e)
+        return _ENCODE_CORE
+
+    def _guard(*a, **k):                  # first call triggers the (lazy) backend; fall back on failure
+        global _ENCODE_CORE
+        try:
+            out = compiled(*a, **k)
+            _ENCODE_CORE = compiled       # success -> dispatch straight to the bare compiled core thereafter
+            return out
+        except Exception as e:
+            print("  [compile] env_encode failed at runtime (%r) -> reverting to eager" % e)
+            _ENCODE_CORE = _encode_core
+            return _encode_core(*a, **k)
+    _guard._ow_compiled = True
+    _ENCODE_CORE = _guard
+    return _ENCODE_CORE
 
 
 def launch_fleets(env, owner, from_slot, angle, ships, commit, seq):
@@ -392,8 +470,8 @@ def opponent_action(cfg, env, opponent, pid=1):
         d = torch.sqrt((sx - tx) ** 2 + (sy - ty) ** 2)                # (B,src,dst)
         srcrange = torch.arange(Ec, device=dev).view(1, Ec, 1)
         # capture (in-flight aware): per target, needed = garrison + enemy_inbound - friendly_inbound + margin
-        ftgt, _feta = fleet_target_batch(env, env.f_x, env.f_y, env.f_angle, env.f_ships, env.vmax)
-        f_ok = (env.f_alive > 0.5) & (ftgt >= 0)
+        ftgt, _feta, *_ = fleet_target_batch(env, env.f_x, env.f_y, env.f_angle, env.f_ships, env.vmax)
+        f_ok = (env.f_alive > 0.5) & (ftgt >= 0)            # SUN-AWARE target: sun-bound fleets don't arrive
         tslot_f = ftgt.clamp(0, Ec - 1)
         in_fr = torch.zeros(B, Ec, device=dev, dtype=DTYPE)            # friendly ships already inbound per planet
         in_en = torch.zeros(B, Ec, device=dev, dtype=DTYPE)            # enemy ships inbound per planet
@@ -755,6 +833,7 @@ def env_step(cfg, env, ego_action, opponent=None, opp_action=None, step_idx=None
     env.p_owner = torch.where(flips, surv_owner, env.p_owner)
 
     # --- apply planet positions; clear removed fleets ---
+    env.p_x_prev = old_px; env.p_y_prev = old_py   # one-step prev pos for finite-diff body velocity (threat lead)
     env.p_x = nx; env.p_y = ny
     if cfg.COMETS_ENABLED:                               # comet expiry: official = path end; legacy = swept past the inner region
         if _comet_expired is not None:
@@ -794,16 +873,18 @@ def env_step(cfg, env, ego_action, opponent=None, opp_action=None, step_idx=None
 
 
 def settle_n(env):
-    """Per-player settle: ships (B,N) = planets+fleets per player; alive (B,N) bool."""
+    """Per-player settle: ships (B,N) = planets+fleets per player; alive (B,N) bool.
+
+    Vectorized over players (one-hot owner broadcast on a trailing player axis) -- a few large kernels
+    instead of the per-player Python loop's ~6N small launches, which matters because this runs every
+    rollout step. Bit-identical to the loop (same masks, same per-player sums)."""
     N = int(getattr(env, "n_players", 2))
-    pa = env.p_alive > 0.5; fa = env.f_alive > 0.5
-    s, alive = [], []
-    for p in range(N):
-        op = (env.p_owner == float(p)) & pa
-        gp = (env.f_owner == float(p)) & fa
-        s.append((env.p_ships * op.to(DTYPE)).sum(1) + (env.f_ships * gp.to(DTYPE)).sum(1))
-        alive.append(op.any(1) | gp.any(1))
-    return torch.stack(s, 1), torch.stack(alive, 1)
+    pid = torch.arange(N, device=env.p_owner.device, dtype=env.p_owner.dtype)    # (N,)
+    op = (env.p_owner.unsqueeze(-1) == pid) & (env.p_alive > 0.5).unsqueeze(-1)  # (B,E,N)
+    gp = (env.f_owner.unsqueeze(-1) == pid) & (env.f_alive > 0.5).unsqueeze(-1)  # (B,Fc,N)
+    s = (env.p_ships.unsqueeze(-1) * op.to(DTYPE)).sum(1) + (env.f_ships.unsqueeze(-1) * gp.to(DTYPE)).sum(1)  # (B,N)
+    alive = op.any(1) | gp.any(1)                                               # (B,N)
+    return s, alive
 
 
 def settle(env):

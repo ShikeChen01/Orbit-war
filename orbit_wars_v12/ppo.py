@@ -11,8 +11,6 @@ import torch.nn.functional as F
 from .constants import DTYPE
 from .policy import evaluate
 
-_HALF_LOG2PIE_C = 1.4189385332046727   # (kept from the notebook; vestigial Gaussian-actor constant)
-
 
 def _surrogate_logratio(cfg, logp, oldlp, n_owned=None):
     """log(pi/pi_old) for the clipped surrogate. [D1/GSPO] optionally length-normalized: divide by
@@ -65,11 +63,18 @@ def ppo_update(cfg, net, opt, tb, ent_coef, policy_coef):
             ent_b = (entropy / n_owned).mean()
             pc = policy_coef   # 0 during value warmup
             loss = pc * pol + cfg.VF_COEF * vloss - (pc * ent_coef) * ent_b
-            rloss = torch.zeros((), device=dev)
-            if cfg.AUX_REWARD_PRED:                           # UNREAL aux: regress the immediate reward r_t off the
+            rloss = torch.zeros((), device=dev); auxr_mb = torch.zeros((), device=dev)
+            if cfg.AUX_WIN_BET:                               # win-bet aux: bet b_t = tanh(rpred) in [-1,1] on the eventual
+                z = tb["outcome"].index_select(0, mi)         # outcome z; payoff = b_t*z, so MINIMIZE -(b_t*z). Pressures
+                bet_payoff = (torch.tanh(rpred) * z).mean()   # the trunk to discriminate winning/losing states (NOT in the
+                rloss = -bet_payoff                           # advantage). payoff>0 = betting well. Trains only AFTER warmup.
+                loss = loss + cfg.AUX_WIN_BET_COEF * rloss
+                auxr_mb = bet_payoff.detach()                 # logged as 'bet' in the heartbeat (>0 = betting right)
+            elif cfg.AUX_REWARD_PRED:                         # UNREAL aux: regress the immediate reward r_t off the
                 rtgt = tb["reward"].index_select(0, mi)       # shared trunk (representation aux; NOT in the advantage).
                 rloss = F.mse_loss(rpred, rtgt)               # During value warmup pc=0 nulls the non-val_ grads below,
                 loss = loss + cfg.AUX_REWARD_COEF * rloss     # so (like the policy) the head trains only AFTER warmup.
+                auxr_mb = rloss.detach()                      # logged as 'ar' (MSE) in the heartbeat
 
             opt.zero_grad()
             loss.backward()
@@ -89,7 +94,7 @@ def ppo_update(cfg, net, opt, tb, ent_coef, policy_coef):
                 ratio = torch.exp(lrc)
                 mb_kl = ((ratio - 1.0) - lrc).mean().item()   # k3 KL estimator (>=0)
                 _acc["total"] += loss.detach(); _acc["policy"] += pol.detach(); _acc["vf"] += vloss.detach()
-                _acc["auxr"] += rloss.detach()
+                _acc["auxr"] += auxr_mb
                 _acc["entropy"] += ent_b.detach(); _acc["sigma"] += ent_b.detach()
                 s["approx_kl"] += mb_kl   # mb_kl already on CPU (the KL early-stop branch needs it)
                 _acc["clipfrac"] += (torch.abs(ratio - 1.0) > cfg.CLIP).to(DTYPE).mean()

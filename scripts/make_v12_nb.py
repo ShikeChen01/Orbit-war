@@ -34,6 +34,7 @@ DEFAULT_OUT = os.path.join(REPO, "notebooks", "setup1_v12_a100.ipynb")
 MCTS_OUT = os.path.join(REPO, "notebooks", "setup1_v12_mcts_a100.ipynb")
 GRPO_OUT = os.path.join(REPO, "notebooks", "setup1_v12_grpo_a100.ipynb")
 GRPO_SMOKE_OUT = os.path.join(REPO, "notebooks", "setup1_v12_grpo_anticollapse.ipynb")
+# BLOCKSEQ_OUT is derived from BLOCKSEQ_DEFS (by name) below, once that list exists.
 
 # Topological order: every module imports only from modules earlier in this list (verified against
 # the import graph). Flattening in this order means every top-level name a module references is
@@ -65,10 +66,10 @@ print("device=%s  SMOKE=%s  ARCH=%s  HIDDEN=%d  ITERS=%d  B=%d  4p=%s"
 
 BIG_SETTINGS = """# ============================= RUN SETTINGS =============================
 # PRESET: BIG transformer, NO MCTS -- the raw-policy leaderboard lineage.
-# GPU: Colab H100 (native bf16). Compute-bound: deep transformer + PPO+GAE self-play league with
+# GPU: Colab A100/H100 (native bf16). Compute-bound: deep transformer + PPO+GAE self-play league with
 # the advanced dual-Elo + MEASURED eviction (on start AND every recal -- v12 default).
 # Colab gotcha: if a torch<->triton crash hits, `pip install triton==3.6.0` then RESTART runtime.
-# Submission: ~43M params -> 173MB fp32 (OVER the 100MB cap) => ship FP16 (~87MB). Deploys GREEDY
+# Submission: ~44M params -> 176MB fp32 (OVER the 100MB cap) => ship FP16 (~88MB). Deploys GREEDY
 # (no search) on the 2-core CPU: ~30-60ms/forward, inside the 1s/turn budget.
 SMOKE       = False     # True -> tiny net + few iters (sanity run; OVERRIDES ignored)
 RESUME_FROM = None      # path to a *_train_state.pt to resume from, else None
@@ -81,7 +82,11 @@ OVERRIDES   = dict(
     # auxiliary reward-prediction head (UNREAL): a shallow head off the SHARED trunk regresses the
     # immediate per-step reward as a representation aux. Does NOT change reward / advantage / critic --
     # only adds trunk gradient, which helps under the terminal-dominated reward. (heartbeat: `ar`.)
-    AUX_REWARD_PRED=False, AUX_REWARD_COEF=0.25,   # True -> turn the aux head on
+    AUX_REWARD_PRED=False, AUX_REWARD_COEF=0.25,   # True -> reward-prediction aux head (predicts r_t)
+    # win-bet aux head (preferred over reward-pred): the trunk bets b in [-1,1] on the eventual outcome z,
+    # earning b*z -- pressures it to discriminate winning vs losing states. Representation aux only (not in
+    # the advantage); mutually exclusive with AUX_REWARD_PRED (win-bet wins).
+    AUX_WIN_BET=False, AUX_WIN_BET_COEF=0.25,      # True -> turn the win-bet aux head on
 )
 """ + _SETTINGS_PRINT
 
@@ -100,9 +105,10 @@ GRPO_SETTINGS = """# ============================= RUN SETTINGS ================
 # "anti-collapse" estimators -- rank[C1] AND drgrpo center-only[B] -- and clip-higher[D3] ALL drove the agent
 # into the PASSIVITY basin (launch-rate -> 0.03-0.34, elo DECLINED), while legacy std-norm stayed STABLE and
 # improving (elo 1497->1576). Bounded != good: rank discards win-MAGNITUDE, so it stops rewarding decisive
-# aggression. The std rare-win amplification the proof flagged is double-edged -- it is also what keeps the
-# agent aggressive. The it426->it526 collapse was a TRIGGER (an asymmetric "lose-slower" outcome decay) x that
-# amplifier, NOT the estimator; the default keeps WIN_DECAY=LOSS_DECAY=1.0 (symmetric, no trigger). The
+# aggression. The std rare-win amplification the "anti-collapse" proof flagged is double-edged -- it is also
+# what KEEPS the agent aggressive, so removing it (rank/drgrpo) is exactly what drives the passivity collapse.
+# i.e. the it426->it526 collapse is the ESTIMATOR change, NOT the reward decay (a "lose-slower" decay
+# hypothesis did not hold up). The
 # estimator flags below are MUTUALLY EXCLUSIVE (precedence phi>sibling>analytic>rank>cvar>std silently picks ONE
 # if several are on -- that was the "all flags on" A100 collapse: it ran sibling/phi-value, NOT rank). train.py
 # now PRINTS the active estimator + WARNS on conflicts. Enable AT MOST ONE and re-ablate on the 3070 Ti (NOT A100).
@@ -210,6 +216,21 @@ for _i, _w in enumerate(_mcts_worlds):
     print("world %d  MCTS %.1f (%.0f-%.0f)  |  greedy %.1f (%.0f-%.0f)  bank=%.1fs"
           % (_i, _sm, _scm[0], _scm[1], _sg, _scg[0], _scg[1], _mcts_agent.bank_s))'''
 
+# Critical-step MCTS demo cell appended to every blockseq notebook (runs MctsAgent on the just-trained net).
+BLOCKSEQ_MCTS_CELL = '''# Critical-step MCTS demo on the freshly trained net -- proves the deploy strategy runs end-to-end.
+# DEPLOY uses crit_schedule=(10, 50, 10.0): a deep 10 s search on steps 0/10/20/30/40, greedy elsewhere.
+# Here the critical budget + bank are SCALED DOWN so the in-notebook demo stays quick (fresh agent/world so
+# each game gets the full bank). Leaf value = bounded heuristic (try value="net" too -- PPO+GAE trains the critic). B=1 = a demo.
+_crit_budget = 0.2 if cfg.SMOKE else 1.0        # DEPLOY: 10.0 s/critical turn
+_greedy_fn = greedy_act_fn(cfg, net)
+for _i, _w in enumerate(make_world_pool(cfg, 2 if cfg.SMOKE else 4, base_seed=99991)):
+    _agent = MctsAgent(cfg, net, opp_kind="greedy", value="heuristic", K=6,
+                       crit_schedule=(10, 50, _crit_budget), bank_s=20.0, reserve_s=2.0)
+    _sm, _scm, _ = play_2p_vs_script(cfg, lambda e, t: _agent.act(e, t)[0], _w, "greedy", max_steps=60)
+    _sg, _scg, _ = play_2p_vs_script(cfg, _greedy_fn, _w, "greedy", max_steps=60)
+    print("world %d  crit-MCTS %.1f (%.0f-%.0f)  |  greedy %.1f (%.0f-%.0f)  bank_left=%.1fs"
+          % (_i, _sm, _scm[0], _scm[1], _sg, _scg[0], _scg[1], max(0.0, _agent.bank_s - _agent.spent_s)))'''
+
 
 def _span(node):
     """1-indexed inclusive line range a top-level node occupies (incl. multi-line imports)."""
@@ -309,14 +330,85 @@ def _code(text):
             "outputs": [], "source": _src_lines(text)}
 
 
-def build_notebook(with_mcts=False, with_grpo=False, with_grpo_smoke=False):
+# ---- block-sequence trunks trained with PPO+GAE (shared-trunk critic head; ALGO="ppo") ----
+# (name, TRUNK_SPEC, human description, #blocks, params(M), measured B=1 2-core fwd ms)
+_DEEP_SPEC = "res4," + "res12,attn1," * 11 + "res8"   # 144 res + 11 attn (attention every 12) = 155 blk
+BLOCKSEQ_DEFS = [
+    ("blockseq1", "res16,attn1,res64",
+     "16 ResNet-MLP -> 1 cross-planet attention -> 64 ResNet-MLP", 81, 11.3, 13.5),
+    ("blockseq2", "res16,attn1,res16,attn1,res32",
+     "16 ResNet-MLP -> attn -> 16 ResNet-MLP -> attn -> 32 ResNet-MLP", 66, 9.5, 11.0),
+    ("blockseq3", "res8,attn1,seq16,res32",
+     "8 ResNet-MLP -> attn -> 16 transformer encoder layers (MHA+MLP) -> 32 ResNet-MLP", 57, 18.7, 15.6),
+    # --- deep-vs-lean side-by-side (h256, PPO+GAE): same training, very different MCTS sims/turn ---
+    ("deep", _DEEP_SPEC,
+     "DEEP mixed (attn every 12): 144 ResNet-MLP + 11 cross-planet attention, h256 -- deepest fp32-shippable", 155, 22.7, 26.9),
+    ("lean", "res8,attn1,res12,attn1,res8",
+     "LEAN/fast: 28 ResNet-MLP + 2 cross-planet attention, h256 (~256x32-class) -- max sims/turn", 30, 5.0, 6.0),
+]
+BLOCKSEQ_OUT = [os.path.join(REPO, "notebooks", "setup1_v12_%s_a100.ipynb" % d[0]) for d in BLOCKSEQ_DEFS]
+
+
+def _blockseq_settings(spec, desc):
+    return ('''# ==================== RUN SETTINGS: block-sequence trunk + PPO+GAE ====================
+# Trunk (h=256, 8 heads): %s
+#   res = pre-LN ResNet-MLP block ; attn = PURE cross-planet multi-head self-attention (no MLP).
+# Training = PPO + GAE (the shipped default; SMOOTHER than the critic-free MC path it replaced). The
+#   critic is a small SHARED-TRUNK HEAD, NOT a separate net: masked-mean pool the trunk tokens ->
+#   concat globals -> val_in -> VALUE_RES_BLOCKS pre-LN ResNet-MLP blocks -> scalar, PopArt-normalized.
+# GPU: A100/H100 (bf16). Colab triton crash -> `pip install triton==3.6.0` then RESTART.
+SMOKE       = False     # True -> tiny net + few iters (sanity run; OVERRIDES ignored)
+RESUME_FROM = None
+OVERRIDES   = dict(
+    ARCH="blockseq", TRUNK_SPEC="%s", HIDDEN=256, N_HEADS=8,
+    ALGO="ppo",                                      # PPO+GAE (learned critic) -- smoother than the old ALGO="mc"
+    VALUE_RES_BLOCKS=2,                              # critic HEAD depth off the shared trunk (try 1-4; deeper trunk -> smaller head)
+    VALUE_WARMUP_ITERS=5,                            # critic-only warmup after BC (val-grad only) before joint PPO
+    VF_COEF=0.5,                                     # actor/critic grad balance on the shared trunk (lower to ~0.25 if value distorts the policy)
+    # (the MC-era AUX_WIN_BET / DENSE_REWARD_SCALE=0.5 knobs are dropped: the real critic + GAE now do
+    #  the credit assignment. Re-add AUX_WIN_BET=True for an extra win/loss representation aux if wanted.)
+    GRAD_CHECKPOINT=True, USE_COMPILE=True, AMP_DTYPE=torch.bfloat16,
+    NUM_GROUPS=16, GROUP_SIZE=16, TOTAL_ITERS=2000, BC_ENABLED=True,
+)''' % (desc, spec)) + "\n" + _SETTINGS_PRINT
+
+
+def _blockseq_mcts_md(desc, nblk, pm, fwd_ms):
+    s10 = int(round(10000.0 / fwd_ms))         # PUCT sims in a 10 s critical turn (1 sim ~ 1 forward + 1 step)
+    return ("## MCTS deploy strategy (critical-step time budget)\n\n"
+            "**Trunk:** %s -- %d blocks, ~%.1fM params. Measured **B=1 forward ~ %.1f ms** (2-core CPU, "
+            "`torch.set_num_threads(2)`, fp32, no `torch.compile`).\n\n"
+            "**Budget.** The game is decided in the opening, so the ~60 s compute bank is spent on a few EARLY "
+            "CRITICAL turns and the rest of the game plays greedy. Critical turns = every 10th step in the first "
+            "50 (steps 0/10/20/30/40 -- five turns); **each runs a deep ~10 s MCTS** (5x10 = 50 s of the 60 s "
+            "bank, leaving a 10 s turbulence reserve). Every other turn is a single greedy forward (free against "
+            "the bank). Leaf value = the bounded **heuristic** by default; with PPO+GAE the **critic (value "
+            "head) is trained**, so `value=\"net\"` is now available too -- A/B it (the policy-biased critic "
+            "historically lost to the heuristic for leaf eval). Wire it as:\n\n"
+            "```python\n"
+            "agent = MctsAgent(cfg, net, opp_kind=\"greedy\", value=\"heuristic\", K=8,\n"
+            "                  crit_schedule=(10, 50, 10.0), bank_s=60.0, reserve_s=10.0)\n"
+            "```\n\n"
+            "At **10 s/critical turn** this net does **~%d PUCT sims** (1 sim ~ 1 forward + 1 env step; the real "
+            "count is lower by the snapshot/step overhead the PoC still pays). With a prior-pruned breadth of "
+            "`b` candidates/node, depth `D ~ sims/b`:\n\n"
+            "| breadth b | 4 | 8 | 16 |\n|---|---|---|---|\n"
+            "| depth D ~ | %d | %d | %d |\n\n"
+            "A leaner/faster trunk trades per-eval quality for MORE sims/turn -- run the **deep** and **lean** "
+            "notebooks side by side to see which wins under the same 10 s budget. fp16 + a lean single-state "
+            "stepper would roughly 1.5-2x the sims."
+            % (desc, nblk, pm, fwd_ms, s10, s10 // 4, s10 // 8, s10 // 16))
+
+
+def build_notebook(with_mcts=False, with_grpo=False, with_grpo_smoke=False, blockseq=None):
     module_order = list(BASE_MODULES)
     if with_mcts:
         module_order.insert(module_order.index("plotting"), "mcts")
-    if with_grpo or with_grpo_smoke:
+    if with_grpo or with_grpo_smoke or blockseq is not None:   # blockseq bundles grpo so ALGO can flip ppo<->mc/grpo
         module_order.insert(module_order.index("rollout"), "grpo")   # after ppo, before train
     if with_grpo_smoke:
         module_order.insert(module_order.index("plotting"), "grpo_diag")   # after train, before plotting
+    if blockseq is not None:                                   # blockseq notebooks DEMO critical-step MCTS
+        module_order.insert(module_order.index("plotting"), "mcts")   # after train, before plotting
     seen, imports = set(), []
     bodies = {}
     for name in module_order:
@@ -341,6 +433,14 @@ def build_notebook(with_mcts=False, with_grpo=False, with_grpo_smoke=False):
                   _md("## Prove the reward will not collapse (bound probe + A/B train)"), _code(GRPO_EXP_CELL)]
         return _wrap(cells)
 
+    if blockseq is not None:
+        _, spec, desc, nblk, pm, fwd = BLOCKSEQ_DEFS[blockseq]
+        cells += [_md(_blockseq_mcts_md(desc, nblk, pm, fwd)), _md("## Run training"),
+                  _code(_blockseq_settings(spec, desc)), _code(BC_CELL), _code(TRAIN_CELL),
+                  _md("## Save every league agent as weights"), _code(SAVE_CELL),
+                  _md("## Plot training-health curves"), _code(PLOT_CELL),
+                  _md("## Critical-step MCTS demo (deploy strategy on the trained net)"), _code(BLOCKSEQ_MCTS_CELL)]
+        return _wrap(cells)
     settings = GRPO_SETTINGS if with_grpo else (SMALL_SETTINGS if with_mcts else BIG_SETTINGS)
     cells += [_md("## Run training"), _code(settings), _code(BC_CELL), _code(TRAIN_CELL),
               _md("## Save every league agent as weights"), _code(SAVE_CELL),
@@ -408,7 +508,7 @@ def check(nb_path):
             break
         exec(compile(src, "nbcell", "exec"), ns)
 
-    assert ns["F_DIM"] == 104, "flatten lost the one-hot obs (F_DIM != 104): %r" % ns.get("F_DIM")
+    assert ns["F_DIM"] == 194, "flatten lost the threat one-hot obs (F_DIM != 194): %r" % ns.get("F_DIM")
 
     # tiny end-to-end train through the flattened defs (exercises rollout/ppo/league/recal/evict)
     cfg = ns["Config"].create(
@@ -491,29 +591,36 @@ def main():
     ap.add_argument("--grpo-smoke", dest="grpo_smoke", action="store_true",
                     help="GRPO anti-collapse smoke experiment (setup1_v12_grpo_anticollapse.ipynb)")
     ap.add_argument("--both", action="store_true", help="generate BOTH the base v12 and v12-mcts notebooks")
-    ap.add_argument("--all", action="store_true", help="generate the base, MCTS, GRPO, and anti-collapse notebooks")
+    ap.add_argument("--all", action="store_true", help="generate base, MCTS, GRPO, anti-collapse + 5 blockseq PPO+GAE notebooks")
+    ap.add_argument("--blockseq", action="store_true", help="generate the 5 block-sequence PPO+GAE notebooks (blockseq1-3 + deep + lean)")
     ap.add_argument("--check", action="store_true", help="exec the generated nb(s) (SMOKE) to verify")
     args = ap.parse_args()
     if sum([args.mcts, args.grpo, args.grpo_smoke]) > 1:
         ap.error("--mcts / --grpo / --grpo-smoke are mutually exclusive")
 
+    bseq = [(False, False, False, i, BLOCKSEQ_OUT[i]) for i in range(len(BLOCKSEQ_DEFS))]
     if args.all:
-        variants = [(False, False, False, DEFAULT_OUT), (True, False, False, MCTS_OUT),
-                    (False, True, False, GRPO_OUT), (False, False, True, GRPO_SMOKE_OUT)]
+        variants = [(False, False, False, None, DEFAULT_OUT), (True, False, False, None, MCTS_OUT),
+                    (False, True, False, None, GRPO_OUT), (False, False, True, None, GRPO_SMOKE_OUT)] + bseq
     elif args.both:
-        variants = [(False, False, False, DEFAULT_OUT), (True, False, False, MCTS_OUT)]
+        variants = [(False, False, False, None, DEFAULT_OUT), (True, False, False, None, MCTS_OUT)]
+    elif args.blockseq:
+        variants = bseq
     else:
         default_out = (GRPO_SMOKE_OUT if args.grpo_smoke else GRPO_OUT if args.grpo
                        else MCTS_OUT if args.mcts else DEFAULT_OUT)
-        variants = [(args.mcts, args.grpo, args.grpo_smoke, args.out or default_out)]
-    for with_mcts, with_grpo, with_grpo_smoke, out in variants:
-        nb = build_notebook(with_mcts=with_mcts, with_grpo=with_grpo, with_grpo_smoke=with_grpo_smoke)
+        variants = [(args.mcts, args.grpo, args.grpo_smoke, None, args.out or default_out)]
+    for with_mcts, with_grpo, with_grpo_smoke, blockseq, out in variants:
+        nb = build_notebook(with_mcts=with_mcts, with_grpo=with_grpo, with_grpo_smoke=with_grpo_smoke, blockseq=blockseq)
         os.makedirs(os.path.dirname(out), exist_ok=True)
         with open(out, "w", encoding="utf-8") as f:
             json.dump(nb, f, indent=1, ensure_ascii=False)
             f.write("\n")
-        n_modules = len(BASE_MODULES) + with_mcts + (with_grpo or with_grpo_smoke) + with_grpo_smoke
-        tag = ", +MCTS" if with_mcts else (", +GRPO+diag" if with_grpo_smoke else ", +GRPO" if with_grpo else "")
+        n_modules = (len(BASE_MODULES) + with_mcts + (with_grpo or with_grpo_smoke or blockseq is not None)
+                     + with_grpo_smoke + (blockseq is not None))   # blockseq also bundles the mcts module
+        tag = ((", +%s+PPO" % BLOCKSEQ_DEFS[blockseq][0]) if blockseq is not None
+               else ", +MCTS" if with_mcts else ", +GRPO+diag" if with_grpo_smoke
+               else ", +GRPO" if with_grpo else "")
         print("wrote %s  (%d cells from %d modules%s)"
               % (os.path.relpath(out, REPO), len(nb["cells"]), n_modules, tag))
         if args.check:

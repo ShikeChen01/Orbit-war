@@ -1,0 +1,552 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+\usepackage{xcolor}
+
+% inline code identifier that prints underscores literally (no manual escaping)
+\newcommand{\cd}[1]{\texttt{\detokenize{#1}}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\setlist{itemsep=2pt,topsep=3pt}
+
+\title{\textbf{Orbit Wars --- v12 Problem Setup, Representation, Reward \& League}\\[3pt]
+\large The shared foundation: the game and its MDP, the GPU-batched simulator, the observation
+encoding, the policy network, the gated-allocation action space, the reward, and the self-play
+Elo league --- everything the MCTS, GRPO, and PPO+GAE documents build on}
+\author{Source of truth: the \texttt{orbit\_wars\_v12/} package}
+\date{2026-06-19}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent This is document~1 of four. It describes the parts of the v12 stack that are
+\emph{the same} for every learner: the game itself, the batched simulator, what the policy sees
+(observation encoding), the network, what it emits (the gated-allocation action), the reward, and
+the self-play league that supplies opponents. The three sibling documents cover the learning
+algorithms that consume this foundation:
+\begin{itemize}
+  \item \cd{v12_ppo_gae.tex} --- PPO with GAE (the shipped default) and the auxiliary
+        reward-prediction head;
+  \item \cd{v12_grpo.tex} --- the critic-free group-relative alternative and its (empirically
+        ruled-out) advantage-estimator family;
+  \item \cd{v12_mcts.tex} --- the AlphaZero-style PUCT proof of concept.
+\end{itemize}
+What exactly is shared differs by component: \textbf{the game, the simulator, the observation
+encoding, the network, and the action space are common to all three}. \textbf{The reward and the
+league are used by the two RL trainers (PPO+GAE and GRPO)}; the MCTS PoC instead scores leaves with
+a bounded heuristic and is not wired into the league. Every number here is read directly from
+\cd{constants.py}, \cd{config.py}, \cd{env.py}, \cd{worldgen.py}, \cd{policy.py},
+\cd{distributions.py}, \cd{rollout.py}, \cd{league.py}, \cd{bc.py}, and \cd{checkpoint.py}.
+\end{abstract}
+
+\tableofcontents
+\bigskip
+
+%==================================================================================================
+\section{The game and its MDP}
+Orbit Wars is a real-time-strategy game on a $100\times100$ board (\cd{BOARD_SIZE}) with a
+sun of radius \cd{SUN_RADIUS}$=10$ fixed at the centre $(50,50)$. \emph{Planets} are owned by a
+player ($0\ldots N{-}1$) or neutral ($-1$), hold an integer \emph{garrison} of ships, and have a
+\emph{production} rate (1--5 ships/tick added while owned). Planets within
+\cd{ROTATION_RADIUS_LIMIT}$=50$ of the centre \emph{orbit} the sun at a per-world angular velocity
+$\omega\in[0.025,0.05]$; the rest are static. A player launches \emph{fleets} from owned planets;
+a fleet travels in a straight line at a ships-dependent speed, can be absorbed by the sun, and on
+reaching a planet fights for it.
+
+\paragraph{Fleet speed and aiming.} A fleet of $n$ ships moves at
+\[
+  v(n) = \min\!\Big(1 + (\cd{SHIP_SPEED}-1)\big(\tfrac{\log n}{\log 1000}\big)^{1.5},\ \cd{SHIP_SPEED}\Big),
+  \qquad \cd{SHIP_SPEED}=6 .
+\]
+Headings are computed analytically to \emph{lead} an orbiting target (16 fixed-point iterations of
+the intercept solve, \cd{LEAD_TARGET}), so neither the policy nor the scripts ever learn aiming ---
+they choose a destination planet and the engine produces the heading.
+
+\paragraph{Combat (official top-vs-second resolve).} On a tick, all fleets that reach a planet are
+summed \emph{per player} into arrivals $\cd{arr}\in\R^{B\times E\times N}$. Let the two largest be
+$a_{(1)}\ge a_{(2)}$ with $a_{(1)}$ owned by player $w$. Survivors are $s=a_{(1)}-a_{(2)}$ (an exact
+tie annihilates: $s=0$). If $w$ already owns the planet it is reinforced ($+s$); otherwise $s$ is
+compared to the garrison and the planet \emph{flips} to $w$ when $s$ exceeds it. This is the exact
+official rule and generalizes to any $N$.
+
+\paragraph{Comets.} Five comet events spawn on a hidden schedule
+(\cd{COMET_SPAWN_STEPS}$=(50,150,250,350,450)$). Each event places 4 point-symmetric neutral comets
+that sweep an elliptical path (precomputed waypoints, \cd{COMET_OFFICIAL}), carry a random garrison,
+produce 1 ship/tick once captured, and expire at the end of their path. Comets are deliberately
+excluded from capture/loss reward accounting (Section~\ref{sec:reward}).
+
+\paragraph{Winning.} A side is alive while it owns a planet or has a fleet in flight. The game ends
+when one side remains, or at the horizon. In 2-player the outcome is $\mathrm{sign}(s_0-s_1)$ on
+total strength $s_p=\sum\text{garrisons}+\sum\text{fleet ships}$; 4-player uses either linear
+\emph{placement} or official \emph{winner-take-all} (Section~\ref{sec:episodes}).
+
+\paragraph{MDP framing.} From the acting seat's view (always re-indexed to ego~$=0$, below) the
+problem is a finite-horizon discrete-time MDP: state $=$ the full board, action $=$ a per-planet
+gated allocation (Section~\ref{sec:action}), transition $=$ one \cd{env_step} tick \emph{given every
+other seat's simultaneous action}, reward $=$ Section~\ref{sec:reward}. Because all seats move
+simultaneously, the multi-agent game is only a stationary MDP once the opponents are fixed --- which
+is exactly how each learner tames it: PPO/GRPO fix the opponents to frozen league members per
+rollout, and the MCTS PoC fixes them to a deterministic script.
+
+%==================================================================================================
+\section{The GPU-batched simulator (\texttt{GpuEnv})}
+All of training runs inside \cd{GpuEnv} (\cd{env.py}), a fully tensorized re-implementation of the
+official engine. Every quantity is a \cd{(B,*)} float32 tensor on \cd{cfg.device}; one
+\cd{env.step} advances all $B$ parallel envs one tick with no host sync. The simulator is
+\textbf{bit-exact to the official Kaggle engine}, including the official elliptical comets
+(verified world-gen-exact and tick-exact; see the project memory \cd{gpuenv-kaggle-parity} and
+\cd{worldgen.py}, which mirrors \cd{REFERENCE_orbit_wars.py} draw-order for draw-order).
+
+\paragraph{State tensors.} Planets: \cd{p_alive}, \cd{p_owner}, \cd{p_x}, \cd{p_y}, \cd{p_radius},
+\cd{p_ships}, \cd{p_prod}, \cd{p_is_comet}, \cd{p_init_x/y} (orbit anchor), \cd{p_rotates},
+\cd{p_comet_vx/vy}, each \cd{(B,Ec)} with \cd{Ec=PLANET_CAP=48}. Fleets: \cd{f_alive},
+\cd{f_owner}, \cd{f_x}, \cd{f_y}, \cd{f_angle}, \cd{f_ships}, \cd{f_seq}, each \cd{(B,Fc)} with
+\cd{Fc=cfg.FLEET_CAP}. Per-env: \cd{ang_vel}, \cd{step_ct}, \cd{done}; plus padded official-comet
+arrays \cd{c_paths/c_len/c_ships/c_slot}.
+
+\paragraph{One tick (\texttt{env\_step}).} In order: (1) spawn comets if this is a spawn step;
+(2) decode the ego action and every seat's action into launches (\cd{_decode_target} for neural
+seats, \cd{opponent_action} for scripted seats); (3) deduct launched ships from origins and append
+fleets into free slots; (4) add production to owned planets; (5) advance planet orbits / comet
+waypoints; (6) move fleets and resolve \emph{swept} fleet--planet collisions against the planets'
+\emph{moving} segments (a quadratic in the relative path), plus out-of-bounds and sun absorption;
+(7) resolve combat (top-vs-second, above); (8) apply new planet positions, clear removed fleets,
+increment \cd{step_ct}. \cd{env_step} returns per-env diagnostics (\cd{captured}, \cd{lost},
+\cd{captured_prod}, \cd{lost_prod}, \cd{launched_ships}, \cd{owned_launch_ships}, $\ldots$) that the
+reward assembly consumes.
+
+\paragraph{Determinism.} With official comets (waypoint playback, no \cd{torch.rand}) and
+deterministic seats, a tick is a pure function of state --- the property the MCTS PoC relies on for
+snapshot/restore. The only stochastic seat is scripted code 0 (random heading) and the legacy
+non-official comet spawner.
+
+%==================================================================================================
+\section{Episodes, outcome, and seat-swap tiling}\label{sec:episodes}
+\paragraph{Horizon and termination.} An episode runs \cd{cfg.EPISODE_STEPS} ticks ($=500$ full,
+$200$ smoke). Per env, a rollout marks termination when \cd{step_ct}$\ge T-2$, or
+$\#\text{alive}\le1$, or the ego seat is dead; finished envs are masked (no per-step CUDA-syncing
+early break).
+
+\paragraph{Outcome scalar.} At termination \cd{_scores_outcome} freezes (a) the ego's pairwise score
+vs every seat ($1$ win / $0.5$ draw / $0$ loss) and (b) the scalar outcome $o\in[-1,1]$:
+\[
+  o = \begin{cases}
+    \mathrm{sign}\!\big(s_0-\max_{p\ge1}s_p\big) & \text{2p, or 4p \cd{OUTCOME_4P="winner"}},\\[2pt]
+    2\,\overline{\text{pairwise}}-1 & \text{4p \cd{OUTCOME_4P="placement"} (beat-all $=+1$).}
+  \end{cases}
+\]
+In 2p, $o\in\{-1,0,+1\}$ exactly.
+
+\paragraph{Seat-swap world tiling (anti positional-overfit).} Because the observation is in
+\emph{absolute} board coordinates, an agent trained only as seat~0 overfits to seat-0 geometry (the
+edge inverts under a $180^\circ$ board rotation; see memory \cd{seat0-tempo-advantage}). The fix is
+deterministic, exhaustive seat coverage: \cd{collect_ppo} tiles $W=B/P$ distinct worlds $P$-fold and
+stamps a per-block board rotation \cd{env._rot_k}$\in\{0,90,180,270\}^\circ$ (2p uses
+$\{0,180\}$, 4p uses $\{0,90,180,270\}$). The board is 4-fold rotationally symmetric, so a
+$k\cdot90^\circ$ rotation about the centre is an \emph{exact} seat remap; the fixed ego (pid~0) thus
+plays every seat's geometry in one batch. Evaluation/recalibration builds canonical (un-rotated)
+envs so ratings stay comparable.
+
+%==================================================================================================
+\section{Observation encoding (\texttt{env\_encode})}
+The encoder produces, for ego seat \cd{ego}, four tensors: \cd{entities} $(B,E,F)$, \cd{entity_mask}
+$(B,E)$ (alive planets), \cd{action_mask} $(B,E)$ (legal sources), and \cd{globals} $(B,G)$.
+Everything is computed \emph{ego-relative} so the same network plays any seat. Ownership is a
+\textbf{4-channel ego-relative seat one-hot} (v9): for a body with owner $o$, channel
+$r=(o-\text{ego})\bmod n_{\text{players}}$ fires; channel~0 is always ``me''; neutral is all-zero.
+In 2p only channels~0--1 ever fire, so 4p reuses the identical input space.
+
+\subsection{Fixed dimensions (\texttt{constants.py})}
+\begin{center}
+\begin{tabular}{@{}llL{0.50\linewidth}@{}}
+\toprule
+Symbol & Value & Meaning \\
+\midrule
+\cd{PLANET_CAP} ($E$)    & 48  & planet/comet slots per env $=$ destination-categorical size \\
+\cd{F_DIM} ($F$)         & 194 & per-planet feature width $=$ 14 body $+$ 180 threat \\
+\cd{N_BODY_FEATURES}     & 14  & per-planet body features (4-channel seat one-hot ownership) \\
+\cd{N_THREAT_FLEETS}     & 30  & top-30 inbound fleets/planet, selected by SIZE \\
+\cd{N_THREAT_FEATS}      & 6   & per-fleet descriptor $=$ 4-ch seat one-hot owner $+$ eta $+$ raw ships \\
+\cd{G_DIM} ($G$)         & 10  & board-global features \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Per-planet body features (14)}
+\begin{center}
+\begin{tabular}{@{}clL{0.56\linewidth}@{}}
+\toprule
+idx & expr & meaning (normalization) \\
+\midrule
+0  & \cd{p_x / BOARD_SIZE}        & x position $\in[0,1]$ \\
+1  & \cd{p_y / BOARD_SIZE}        & y position $\in[0,1]$ \\
+2  & \cd{vmag / THREAT_MAX_SPEED} & orbital tangential speed $|\omega|\cdot d$ if rotating, else 0 (\,/6) \\
+3  & \cd{cw}                      & rotation sense: $+1$ CCW, $-1$ CW, $0$ if static/comet \\
+4  & \cd{p_radius / 3}            & planet radius \\
+5  & \cd{p_prod / 5}              & production rate \\
+6  & \cd{p_ships}                 & garrison (RAW integer ship count; \emph{un-normalized} --- log compression removed) \\
+7--10 & seat one-hot               & ownership [self, enemy$+1$, enemy$+2$, enemy$+3$]; neutral all-0 \\
+11 & \cd{dist / DIAG_HALF}        & distance from centre (\,/ half-diagonal) \\
+12 & \cd{comet}                   & 1 if this slot is a comet \\
+13 & \cd{actable}                 & 1 if own $\wedge$ alive $\wedge$ ships$>0$ ($=$\cd{action_mask}) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Per-planet threat features (180 $=6\times30$)}
+For each planet, the \cd{N_THREAT_FLEETS}$=30$ \textbf{largest} inbound fleets \emph{aimed at it} are
+selected by size ($|\text{ships}|\cdot2^{20}-\text{seq}$, the $-\text{seq}$ a stable tie-break); missing
+slots are zero-padded. Attribution uses the \textbf{apparent} target --- the planet the fleet's ray
+points at, computed by \cd{fleet_target_batch} \emph{ignoring} the sun --- so a fleet that will be
+\textbf{absorbed by the sun} before arriving still shows up in the threat list of the planet it is aimed
+at (the \cd{etf} below is its time-to-apparent-target). Each descriptor (6 features):
+\begin{itemize}
+  \item \textbf{owner one-hot (4)} --- ego-relative seat one-hot of the fleet's owner
+        (channel 0 self, 1--3 the opponents in seat order; empty slots all-zero);
+  \item \cd{etf} --- $\text{ETA}/\cd{THREAT_ETA_SCALE}$ (\,/100);
+  \item \cd{slg} --- $|\text{ships}|$, the \textbf{raw} inbound-fleet size (un-normalized; log compression removed).
+\end{itemize}
+$\cd{entities}=[\text{body}\,\Vert\,\text{threat}]$ is multiplied by \cd{p_alive} so dead slots are 0.
+
+\paragraph{v12 change (per-opponent threat identity).} Pre-v12 the fleet/body owner was a single
+\emph{sign} ($+1$ self / $-1$ any-opponent), collapsing all three 4p opponents into one value. The
+4-channel one-hot lets the policy attribute an incoming fleet to a specific rival; it raised
+\cd{F_DIM} from 104 to 194. Older 104-feature (or 101-feature scalar-owner) members still play via
+\cd{checkpoint.LegacyObsAdapter}, which down-converts the current obs at forward time
+($\text{sign}=\text{ch}_0-\sum_{k=1}^3\text{ch}_k$). See memory \cd{v12-threat-ownership-onehot}.
+
+\paragraph{Motion-aware targeting and serving.} The fleet$\to$planet attribution and \cd{etf} are
+\textbf{motion-aware}: \cd{fleet_target_batch} solves the fleet-vs-\emph{moving}-planet intercept time
+via a swept relative-velocity quadratic (the same form the engine's own collision uses), with each
+planet's velocity taken from a one-step finite difference $\mathbf{p}-\mathbf{p}_{\text{prev}}$ (tracked
+by the env; \emph{internal} --- never an obs feature). This leads orbiting planets and fast comets, so
+a fleet aimed at where a comet \emph{will be} is attributed correctly (a static ray misses it); \cd{etf}
+is the time-to-intercept in ticks. It reconstructs at serving with \textbf{no information loss}: the
+official Kaggle observation gives in-flight fleets as
+$[\text{id},\text{owner},x,y,\text{angle},\text{from\_pid},\text{ships}]$ and planet positions
+\emph{every} turn, and the submission adapter is a persistent $B{=}1$ \cd{GpuEnv}, so the same
+finite-difference velocity is available there (the v12 adapter must track previous positions, matching
+planets by id). A per-source launch-ETA map fed to the WHERE head is a separate, not-yet-wired feature.
+
+\subsection{Board globals (10)}
+\begin{center}
+\begin{tabular}{@{}clL{0.40\linewidth}@{}}
+\toprule
+idx & expr & meaning \\
+\midrule
+0 & \cd{step_ct / T}              & game progress (time fraction) \\
+1 & \cd{ang_vel * 10}            & board rotation angular velocity \\
+2 & \cd{ship_log_t(my_ships)}    & my total garrison (log) \\
+3 & \cd{ship_log_t(en_ships)}    & all-opponents garrison, pooled (log) \\
+4--6 & \cd{my_pl,en_pl,neu_pl / total} & fraction of live bodies mine / opponents' / neutral \\
+7 & \cd{ship_log_t(my_fleet)}    & my in-flight fleet ships (log) \\
+8 & \cd{ship_log_t(en_fleet)}    & opponents' in-flight fleet ships (log) \\
+9 & \cd{min(npl,40)/40}          & live-body count, scaled \\
+\bottomrule
+\end{tabular}
+\end{center}
+The per-planet ownership is one-hot \emph{per opponent}, but the global enemy aggregates (idx 3, 5,
+8) pool \emph{all} opponents (an everyone-vs-me summary).
+
+\paragraph{Ship scaling (raw per-planet, log global).} The \emph{per-planet} ship features --- the
+body garrison \cd{b6} and the inbound-fleet sizes \cd{slg} --- are the \textbf{raw} integer counts;
+the \cd{ship_log_t} compression on them was removed. The \emph{global} ship aggregates (idx 2, 3, 7,
+8) remain log-compressed via \cd{ship_log_t}: they pool the whole board and would otherwise be large,
+un-normalized inputs. The reward potential $\Phi_{\text{ship}}$ (Section~\ref{sec:reward}) likewise
+still uses \cd{ship_log_t}. So the network now sees exact per-planet ship counts (where one ship can
+decide a capture) while the board-level summaries stay compressed.
+
+%==================================================================================================
+\section{The policy network (\texttt{PolicyNet})}
+\cd{build_policy(cfg)} instantiates an actor--critic that maps the four observation tensors to
+WHERE/GATE actor logits, a scalar value, and (optionally) an auxiliary reward prediction. The trunk
+maps \cd{entities} $(B,E,F)$ to per-planet tokens $(B,E,h)$ with $h=\cd{HIDDEN}=512$;
+\cd{cfg.ARCH} selects one of three interchangeable trunks, and everything downstream is identical.
+
+\subsection{Three trunks}
+\textbf{Legacy ResNet-MLP (\cd{ARCH="trunk"}, default):}
+\begin{verbatim}
+  entities -> proj: Linear(F -> 512)
+           -> [optional] cross-planet single-head self-attention   (USE_ATTENTION, default OFF)
+           -> [optional] GLU: x = x + glu_out(glu_val(x) * sigmoid(glu_gate(x)))  (USE_GLU, ON)
+           -> N_RES_BLOCKS x  pre-LN ResNet-MLP: x = x + res_b(act(res_a(LN(x))))  (=86)
+           -> ln_out: LayerNorm(512)
+\end{verbatim}
+At the shipped defaults \cd{USE_ATTENTION} is \emph{False}, so the legacy trunk has \emph{no
+cross-planet mixing inside the trunk} --- planets interact only later, at the masked-mean value pool
+and the bilinear WHERE head. \cd{GRAD_CHECKPOINT} (default on) activation-checkpoints the residual
+blocks so the deep ``512$\times$86'' stack fits in VRAM.
+
+\textbf{Stacked transformer (\cd{ARCH="transformer"}):}
+\begin{verbatim}
+  entities -> proj: Linear(F -> 512)
+           -> N_STEM_RES x pre-LN ResNet-MLP   (=1, pre-attention)
+           -> N_TX_LAYERS x TxEncoderLayer     (=6 pre-LN MHA+MLP blocks)
+           -> N_HEAD_RES x pre-LN ResNet-MLP   (=4, post-attention)
+           -> ln_out: LayerNorm(512)
+\end{verbatim}
+Each \cd{TxEncoderLayer} is $x\leftarrow x+\mathrm{MHA}(\mathrm{LN}_1 x)$;
+$x\leftarrow x+\mathrm{MLP}(\mathrm{LN}_2 x)$, with \cd{N_HEADS} heads (\cd{scaled_dot_product_attention},
+dead-planet keys masked) and MLP expansion \cd{TX_MLP_RATIO}$=4$. \textbf{Footgun:} \cd{N_HEADS} must
+divide \cd{HIDDEN}; the config default pairs $512$ with $12$ (invalid) --- a 512-wide transformer
+must override \cd{N_HEADS} (e.g.\ 8, head dim 64, as \cd{INVITE_CFG} does).
+
+\textbf{Block-sequence (\cd{ARCH="blockseq"}):} an arbitrary ordered sequence of blocks parsed from
+\cd{TRUNK_SPEC}, for hand-designed depth/attention layouts:
+\begin{verbatim}
+  entities -> proj: Linear(F -> h)
+           -> blocks from TRUNK_SPEC, in order:
+                res  = pre-LN ResNet-MLP block
+                attn = PURE cross-planet multi-head self-attention (pre-LN, residual, NO MLP)
+                seq  = full transformer encoder layer (MHA + MLP, TX_MLP_RATIO)
+           -> ln_out: LayerNorm(h)
+\end{verbatim}
+e.g.\ \cd{TRUNK_SPEC="res16,attn1,res64"}; \cd{GRAD_CHECKPOINT} checkpoints every block. Three preset
+notebooks (\cd{make_v12_nb.py --blockseq}) ship at $h=256$, 8 heads, trained with \cd{ALGO="mc"}
+(below) $+$ the win-bet aux head: \textbf{(1)} \cd{res16,attn1,res64} (81 blk, 11.3M); \textbf{(2)}
+\cd{res16,attn1,res16,attn1,res32} (66 blk, 9.5M); \textbf{(3)} \cd{res8,attn1,seq16,res32}
+($8$ res $\to$ attn $\to$ $16$ encoder layers $\to$ $32$ res, 57 blk, 18.7M). Each notebook carries an \emph{MCTS
+depth/breadth estimate} cell (measured B=1 2-core forward $\to$ sims/turn at the $\sim$1\,s budget).
+
+\paragraph{Critic-free Monte-Carlo policy gradient (\cd{ALGO="mc"}).} A third optimizer alongside
+PPO+GAE and GRPO: near-vanilla PPO with \textbf{no critic and no GAE} --- the advantage is the
+\emph{discounted Monte-Carlo return-to-go} $A_t=G_t=\sum_{k\ge t}\gamma^{\,k-t}r_k$ (reset at episode
+end), batch-whitened (center $+$ global scale). It reuses the GRPO clipped-surrogate update (no value
+loss), and \cd{VALUE_WARMUP_ITERS} is forced off. Computed in \cd{collect_ppo}; dispatched in
+\cd{train.py}.
+
+\subsection{Heads (shared by all trunks)}
+Per planet the head input concatenates the trunk token with a board-globals embedding
+$\cd{gp}=\mathrm{relu}(\cd{g_embed}(\cd{globals}))\in\R^{d_g}$, $d_g=\cd{D_G}=32$, giving
+$hh\in\R^{h+d_g}=\R^{544}$.
+\begin{itemize}
+  \item \textbf{WHERE} (\cd{DEST_HEAD="bilinear"}, default): pointer scores
+        $\cd{dest_logits}[s,d]=\langle\cd{dest_q}(hh_s),\cd{dest_k}(hh_d)\rangle/\sqrt h$, a
+        $(B,E,E)$ source$\times$destination matrix.
+  \item \textbf{GATE:} \cd{gate_head} Linear($544\to1$) $\Rightarrow$ per-source launch logit $(B,E)$.
+  \item \textbf{VALUE (critic):} masked-mean pool of trunk tokens over live planets, concat \cd{gp},
+        \cd{val_in}$\to$\cd{VALUE_RES_BLOCKS}$=4$ pre-LN ResNet-MLP blocks$\to$\cd{val_out}. Targets
+        are \textbf{PopArt}-normalized (output-preserving running mean/var; the head predicts
+        normalized values, raw $V=\text{denorm}$). The critic is used by PPO; GRPO leaves it
+        untrained (unless \cd{GRPO_AUX_VALUE}); the MCTS \cd{value="net"} mode reads it.
+  \item \textbf{AUX reward} (optional, \cd{AUX_REWARD_PRED}, default off): a shallow
+        \cd{rew_in}$\to$act$\to$\cd{rew_out} off the same pooled features (document~2). Built only
+        when enabled, so checkpoints are byte-identical when off.
+\end{itemize}
+
+\subsection{Parameter counts (instantiated, fp32)}
+$E=48$, $G=10$, $d_g=32$, \cd{VALUE_RES_BLOCKS}$=4$; heads $=$ g\_embed+WHERE+gate+value (aux off).
+\begin{center}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+config & trunk & heads & \textbf{total} & fp32 / fp16 \\
+\midrule
+\textbf{512$\times$86} legacy (default) & 46.16\,M & 2.94\,M & \textbf{49.10\,M} & 196 / 98\,MB \\
+512$\times$32 legacy                    & 17.73\,M & 2.94\,M & \textbf{20.68\,M} & 83 / 41\,MB \\
+256$\times$32 legacy                    & 4.64\,M  & 0.59\,M & \textbf{5.23\,M}  & 21 / 10\,MB \\
+512h / 6L / 8-head transformer          & 21.65\,M & 2.94\,M & \textbf{24.59\,M} & 98 / 49\,MB \\
+256h / 4L / 8-head (\cd{INVITE_CFG})    & 3.62\,M  & 0.34\,M & \textbf{3.96\,M}  & 16 / 8\,MB \\
+\bottomrule
+\end{tabular}
+\end{center}
+The Kaggle 100\,MB cap implies $\le26$\,M params at fp32: the default 512$\times$86 ships only at
+fp16; the 512$\times$32 legacy and 512h/6L transformer are the largest fp32-shippable trunks.
+
+%==================================================================================================
+\section{Action space \& distributions}\label{sec:action}
+The actor is a \textbf{gated per-source allocation}. For every owned source planet it emits a WHERE
+distribution over destinations and a launch GATE. \emph{On fire, the planet dispatches its full
+garrison routed by the WHERE row; on no-fire it holds.} The action bundle is $(B,E,E{+}1)$:
+$[\,{:}E\,]$ the allocation row, $[\,E\,]$ fire $\in\{0,1\}$. Log-prob and entropy \emph{sum over
+owned sources}; the WHERE term only counts when firing.
+
+\paragraph{Masking.} WHERE logits are clamped to $\pm\cd{LOGIT_CLAMP}=8$ then masked to $-10^9$ on:
+the diagonal (self), dead destinations (\cd{alive}$<0.5$), and sun-blocked destinations
+(\cd{reach}$<0.5$ --- a straight shot absorbed by the sun, recovered geometrically by
+\cd{compute_reach} identically in rollout and update). The support is exactly the legal, reachable
+targets.
+
+\paragraph{Gate.} $g=\sigma(\cd{gate_logit})$. \textbf{Train:} $p=g$ (smooth, full-support gradient
+--- the deploy deadzone clamp used to zero it and vanish the gate gradient). \textbf{Deploy:} hard
+deadzone $p=\mathrm{clip}((g-\cd{GATE_TRIM_LO})/(\cd{GATE_TRIM_HI}-\cd{GATE_TRIM_LO}),0,1)$. Then
+$p\leftarrow\mathrm{clip}(p,\cd{GATE_EPS},1-\cd{GATE_EPS})$, $\text{fire}\sim\text{Bernoulli}(p)$.
+
+\paragraph{\texttt{GatedCatDist} (categorical WHERE, \cd{WHERE_DIST="categorical"}, default).} After
+masking, $\cd{lsm}=\log\mathrm{softmax}(\cd{glogits})$. \emph{Sample:} dest $\sim$ Categorical,
+fire $\sim$ Bernoulli. \emph{Log-prob (per source):}
+$\ell=[\text{fire}\log p+(1{-}\text{fire})\log(1{-}p)]+\text{fire}\cdot\cd{lsm}[\text{dest}]$, summed
+over owned sources. \emph{Entropy:} Bernoulli gate entropy $+\cd{ENT_DIR_COEF}\cdot p\cdot H_{\text{cat}}$
+with $H_{\text{cat}}\le\ln E$; \cd{ENT_DIR_COEF}$=0$ by default, so the bonus is \emph{gate-only}. The
+bounded-sensitivity $\log\mathrm{softmax}$ log-prob is what makes PPO-after-BC stable.
+
+\paragraph{\texttt{GatedAllocDist} (Dirichlet WHERE, v6 A/B).} $\alpha=\mathrm{softplus}(\text{logits})\cdot
+\cd{ALLOC_KAPPA}+10^{-3}$; rows $\sim$ Dirichlet, splitting the garrison across destinations. Its
+greedy decode uses a temperature-sharpened softmax ($\tau=\cd{GREEDY_TAU}=0.5$) because the
+Dirichlet mean spreads the garrison too thin to land a concentrated strike.
+
+\paragraph{Decode (\texttt{\_decode\_target}).} A fired source's full garrison $S$ is routed by its
+renormalised off-diagonal WHERE row $\hat A$: $n_{s,d}=\lfloor \hat A_{s,d}\,S_s\rfloor$ to alive,
+legal destinations, kept only if $n\ge\cd{MIN_LAUNCH_SHIPS}=2$ (dribbles stay home --- a structural
+budget, no penalty). Each launch is aimed at the orbiting intercept. So although the categorical
+WHERE samples one destination, the \emph{decode} is a deterministic full-garrison strike to that
+target.
+
+%==================================================================================================
+\section{Reward (used by the RL trainers)}\label{sec:reward}
+The reward is assembled inside \cd{collect_ppo} (\cd{rollout.py}) and consumed by PPO+GAE and GRPO;
+the MCTS PoC does not use it. Two per-step regimes (selected by \cd{USE_POTENTIAL_SHAPING}, default
+\emph{off} --- the small legacy dense channels, so the terminal W/L dominates) feed a per-step $r_t$,
+plus a sparse terminal payment; everything is divided by \cd{PPO_REWARD_SCALE}$=100$ before it
+reaches the learner.
+
+\subsection{Optional: potential-based shaping}
+Policy-invariant shaping (Ng et al.) on two potentials, evaluated by \cd{_potentials} as the ego's
+log-ship margin and production share vs the \emph{strongest} opponent:
+\[
+  \Phi_{\text{ship}} = \cd{ship_log_t}(s_0)-\cd{ship_log_t}\!\big(\max_{p\ge1}s_p\big),
+  \qquad
+  \Phi_{\text{prod}} = \frac{P_0-\max_{p\ge1}P_p}{\sum P}.
+\]
+Per step (for still-active envs),
+\[
+  r_t = \cd{SHAPE_SHIP}\,(\gamma\Phi_{\text{ship}}'-\Phi_{\text{ship}})
+      + \cd{SHAPE_PROD}\,(\gamma\Phi_{\text{prod}}'-\Phi_{\text{prod}}),
+  \qquad \cd{SHAPE_SHIP}=\cd{SHAPE_PROD}=25,\ \gamma=\cd{GAMMA}=0.997,
+\]
+where primes are the post-step potentials. Being a $\gamma$-difference of a potential, this shaping
+is policy-invariant (it cannot change the optimal policy); it only densifies credit.
+
+\subsection{Default: legacy dense channels}
+With \cd{USE_POTENTIAL_SHAPING=False} (the default), $r_t$ is the sum of three measured channels:
+\begin{itemize}
+  \item \textbf{capture:} $\cd{CAPTURE_REWARD}\big[(\text{captured}+\cd{CAPTURE_PROD_SCALE}\,\text{captured\_prod})
+        -\cd{CAPTURE_LOSS_FRAC}(\text{lost}+\cd{CAPTURE_PROD_SCALE}\,\text{lost\_prod})\big]$,
+        $\cd{CAPTURE_REWARD}=30$, comet flips excluded;
+  \item \textbf{production milestone:} $+\cd{PROD_MILESTONE_REWARD}=20$ each time total strength
+        doubles past \cd{PROD_MILESTONE_BASE}$=100$ (monotone --- losing ships never claws it back);
+  \item \textbf{launch shaping} (first \cd{LAUNCH_WINDOW}$=150$ steps): a small per-ship-launched
+        bonus, per-step- and per-game-capped (\cd{LAUNCH_STEP_CAP}, \cd{LAUNCH_GAME_CAP}); unspent
+        budget is cashed out on a win.
+\end{itemize}
+
+\subsection{Terminal outcome payment}
+Both regimes add the sparse game result to the \emph{last active step}. With episode length $\ell$
+and $\text{len\_eff}=(\ell-\cd{DECAY_START_STEP})_+$, $\cd{DECAY_START_STEP}=100$,
+\[
+  O = \begin{cases}
+    o\cdot\cd{WIN_DECAY}^{\,\text{len\_eff}}\cdot\cd{WIN_BONUS}, & o>0,\\
+    o\cdot\cd{LOSS_DECAY}^{\,\text{len\_eff}}\cdot\cd{LOSS_PENALTY}, & o\le0,
+  \end{cases}
+  \qquad \cd{WIN_BONUS}=\cd{LOSS_PENALTY}=1000,
+\]
+added as $O/\cd{PPO_REWARD_SCALE}$. In 4p placement mode the fractional $o$ scales the magnitudes
+linearly; in 2p $o\in\{-1,0,+1\}$.
+
+\paragraph{Outcome decay.} The current defaults are $\cd{WIN_DECAY}=1.0$ and
+$\cd{LOSS_DECAY}=0.9995$: an asymmetric ``lose-slower'' shaping (a late loss is penalized slightly
+less than an early one --- a mild survival incentive), with wins undecayed. The provenance doc
+\cd{set-ups/1.md} used a $0.995$ symmetric decay past step~100. This is purely a reward-shaping knob:
+an earlier write-up blamed an asymmetric decay for the GRPO passivity collapse, but that did not hold
+up --- the collapse is caused by the advantage-estimator changes (document~3), not by the decay.
+
+%==================================================================================================
+\section{Self-play league (the curriculum)}\label{sec:league}
+There are \emph{no hand-coded curriculum stages}: the dual-Elo PFSP league (\cd{league.py}) \emph{is}
+the curriculum. Each iteration samples an opponent (or a 4p trio), the learner rolls out against it,
+and the result updates ratings. The two RL trainers share this verbatim; the MCTS PoC does not use
+it.
+
+\paragraph{Members and ratings.} Every member carries a 2p rating \cd{elo} and a 4p rating \cd{elo4}.
+Fixed scripted \emph{anchors} seed the league --- \cd{random}, \cd{starter}, \cd{greedy},
+\cd{medium}, \cd{intermediate} --- at pinned ratings (e.g.\ \cd{ELO_STARTER}$=1350$,
+\cd{ELO_MEDIUM}$=1560$). Frozen learner \emph{snapshots} (added every \cd{SELFPLAY_REFRESH} iters)
+and \emph{invited} external agents fill the rest. The learner itself is grounded on a \textbf{rolling
+self-anchor} --- its own frozen high-water snapshot --- so its rating never clamps on saturated
+scripts (memory \cd{v9-elo-saturation-confirmed}).
+
+\paragraph{Scripted opponents (\texttt{opponent\_action}).} The anchor ``kinds'' map to deterministic
+(except code~0) rules of escalating strength:
+\begin{center}
+\begin{tabular}{@{}llL{0.56\linewidth}@{}}
+\toprule
+code & kind & behaviour (one launch per owned planet, half garrison $\ge20$) \\
+\midrule
+0 & random       & random heading \\
+1 & starter      & fire at the nearest \emph{static} non-owned planet \\
+2 & noop         & never launches \\
+3 & medium       & nearest non-owned planet incl.\ orbiting, lead-aimed at the intercept \\
+4 & greedy       & nearest beatable non-owned planet within \cd{CAPTURE_RADIUS}, just-enough ships \\
+5 & intermediate & in-flight-aware capture from the nearest capable source $+$ counter $+$ rebalance $+$ comet-escape \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{PFSP matchmaking.} Per-member sampling weight (\cd{_weights}) is a PFSP function of the
+expected score $p$ (\cd{PFSP_MODE="even"}: $p(1{-}p)$ --- evenly-matched opponents) times a
+behavioural-footprint mix (2p), invited/scripted boosts, and an advance lock (\cd{greedy}/\cd{medium}
+stay locked until the learner clears \cd{ADVANCE_TRIGGER_ELO}). A scripted-share cap keeps scripts
+collectively $\le\cd{SCRIPT_SHARE_CAP}=0.30$ while any neural member carries weight; a 2p-mastered
+script leaves 2p matchmaking.
+
+\paragraph{Dual Elo and the 2p/4p mix.} 2p results are a single Elo update; 4p FFA results are
+decomposed into pairwise updates at \cd{ELO_K4}/$k$ each, cross-coupled into the 2p rating by
+\cd{ELO_COUPLING}$=0.25$. The fraction of 4p iterations is \cd{share_4p} from an EMA of the
+(elo2$-$elo4) gap, \emph{pinned} to $0.25$ at the shipped defaults
+($\cd{S4_MIN}=\cd{S4_MAX}=0.25$, a 3:1 2p:4p ratio; memory \cd{share4p-pinned-1to1}).
+
+\paragraph{Recalibration and measured eviction.} Periodic recals re-ground both rating scales on the
+top self-anchor and blend into the live ratings (first recal is raw). A \textbf{measured eviction}
+(\cd{evict_mastered}) removes any league member the learner has mastered under one standard --- 2p
+seat-averaged score $>\cd{MASTER_EVICT_2P_WR}=0.90$ \emph{or} 4p 1st-place rate vs three copies
+$>\cd{MASTER_EVICT_4P_WR}=0.75$ --- covering scripted anchors and neural players alike, but never the
+self-anchors, the newest snapshot, or the \cd{random}/\cd{greedy} watchdogs. Dormant
+\emph{watchdogs} (\cd{random}, \cd{greedy}) re-enter as live opponents if the learner underperforms
+its own rating prediction by \cd{WATCHDOG_TOL} --- a collapse alarm. See memory
+\cd{v12-clean-league-measured-eviction} and \cd{v12-eviction-league-players}.
+
+\paragraph{Best-checkpoint selection.} Checkpoints are scored on a held-out world pool by a
+\emph{mixed gauntlet}: a 2p score vs (\cd{starter}, \cd{intermediate}, \cd{greedy}) blended with a 4p
+FFA score (scripted trio $+$ invited-neural trio), weighted by \cd{GAUNTLET_4P_W}. The held-out seeds
+are never touched by training, so the score measures generalization and stays comparable across the
+run.
+
+\subsection{Behaviour-cloning warm-start (\texttt{bc\_pretrain})}
+From-scratch RL reliably falls into a passivity trap (memory
+\cd{orbit-wars-policy-failure-diagnosis}), so training optionally starts from a BC clone of the
+\cd{medium} rule. The clone visits its own states against a mixed scripted-opponent schedule and
+minimizes $\text{BCE}(\text{gate})+\text{CE}(\text{masked WHERE})$ on firing sources, expressing the
+expert as one-hot WHERE rows $+$ fire. This produces a committing, aiming policy (memory
+\cd{bc-warmstart-gated-alloc}); both RL trainers then resume from it.
+
+%==================================================================================================
+\section{How each algorithm plugs in}
+\begin{center}
+\begin{tabular}{@{}lL{0.66\linewidth}@{}}
+\toprule
+component & who uses it \\
+\midrule
+game + \cd{GpuEnv} + episodes & all three (PPO+GAE, GRPO, MCTS) \\
+observation encoding + network & all three \\
+gated-allocation action + decode & all three \\
+reward (Section~\ref{sec:reward}) & PPO+GAE, GRPO (MCTS uses a heuristic leaf value instead) \\
+self-play league (Section~\ref{sec:league}) & PPO+GAE, GRPO (MCTS PoC plays a fixed scripted seat) \\
+BC warm-start & PPO+GAE, GRPO (and the planned MCTS self-play loop) \\
+\bottomrule
+\end{tabular}
+\end{center}
+\noindent The learner's per-iteration loop --- PFSP-sample opponents, \cd{collect_ppo} rollout,
+\cd{ppo_update} or \cd{grpo_update}, Elo update, periodic recal/eviction, best-ckpt gauntlet --- lives
+in \cd{train.py::Trainer.train} and is identical for PPO and GRPO save for the update call and the
+advantage construction. Those two updates, and the MCTS search, are the subjects of the three sibling
+documents.
+
+\end{document}

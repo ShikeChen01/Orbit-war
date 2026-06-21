@@ -1,11 +1,12 @@
 """GRPO anti-collapse diagnostics + A/B experiment harness (the proof the reward will not collapse).
 
-The collapsing run (it426 -> it526, ALGO=grpo, GRPO_STD_NORM=True legacy path) is a self-play
-passivity death-spiral: as the snapshot pool gets strong the learner faces increasingly LOPSIDED
-losing groups, where the legacy per-group-std (and analytic [A]) advantage of a rare win is
-``sqrt((1-p)/p)`` -- UNBOUNDED as the win-rate ``p -> 0``. The policy then chases those few (often
-lucky) wins, launch-rate ratchets down, and the learner loses to its own snapshots and even to the
-``greedy`` watchdog. This module proves two things at SMOKE scale, without a GPU:
+The collapsing run (it426 -> it526, ALGO=grpo) was a self-play passivity death-spiral. The ORIGINAL
+HYPOTHESIS (which motivated this harness) blamed the legacy per-group-std baseline: as the snapshot
+pool gets strong the learner faces increasingly LOPSIDED losing groups, where the per-group-std (and
+analytic [A]) advantage of a rare win is ``sqrt((1-p)/p)`` -- UNBOUNDED as ``p -> 0``, so the policy
+chases those few (often lucky) wins and launch-rate ratchets down. The GPU ablation below REJECTED
+that hypothesis: legacy std-norm is in fact the stable KEEPER, and the estimator "fixes" are what
+collapse. This module computes two things at SMOKE scale, without a GPU:
 
   * :func:`advantage_bound_probe` -- DETERMINISTIC: across win-counts ``k=0..G`` it computes the
     worst-case advantage magnitude under each estimator. The legacy ``std``/``analytic`` magnitude
@@ -15,14 +16,14 @@ lucky) wins, launch-rate ratchets down, and the learner loses to its own snapsho
   * :func:`run_anticollapse_compare` -- a short A/B ``train()`` (LEGACY vs the :data:`ANTICOLLAPSE`
     bundle) returning the advantage-health / launch-rate / return curves for :func:`plot_anticollapse`.
 
-EMPIRICAL RESULT (RTX 3070 Ti ablation, ``scripts/_gpu_ab*.py``; full write-up in ``docs/grpo_v12.tex``
-Section "Empirical result"): the bound holds -- rank advantage IS bounded by sqrt3 -- but **bounded != good**.
-EVERY estimator in :data:`ANTICOLLAPSE`/:data:`DRGRPO_BUNDLE`, plus sibling[B1] and phi-value[C], drove the
-agent into the PASSIVITY basin (launch-rate -> ~0, Elo DOWN), while LEGACY per-group std-norm stayed
-stable/improving (Elo 1497->1576). The real it426->it526 collapse was a reward TRIGGER (an asymmetric
-"lose-slower" outcome decay), NOT the estimator. **So these bundles are a DIAGNOSTIC/RESEARCH harness, NOT a
-recommended config:** train on legacy std-norm + symmetric decay (WIN_DECAY=LOSS_DECAY=1.0); re-ablate any
-estimator on the 3070 Ti before trusting it.
+EMPIRICAL RESULT (RTX 3070 Ti ablation, ``scripts/_gpu_ab*.py``, shared init; full write-up in
+``docs/v12_grpo.tex`` Section "Empirical result"): the bound holds -- rank advantage IS bounded by sqrt3 --
+but **bounded != good**. EVERY estimator in :data:`ANTICOLLAPSE`/:data:`DRGRPO_BUNDLE`, plus sibling[B1] and
+phi-value[C], drove the agent into the PASSIVITY basin (launch-rate -> ~0, Elo DOWN), while LEGACY per-group
+std-norm stayed stable/improving (Elo 1497->1576). So the GRPO collapse is caused by the ESTIMATOR CHANGES,
+not by the legacy baseline -- and NOT by the reward decay (an earlier "lose-slower decay" hypothesis did not
+hold up). **These bundles are a DIAGNOSTIC/RESEARCH harness, NOT a recommended config:** train on legacy
+std-norm (every estimator flag off); re-ablate any estimator on the 3070 Ti before trusting it.
 """
 import torch
 

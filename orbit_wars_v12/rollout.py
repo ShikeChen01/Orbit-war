@@ -247,6 +247,8 @@ def collect_ppo(cfg, env, net, world_pool, cursor, rng, seats, n_players=2, n_en
                 step_seats.append({"pid": sp["pid"], "script": sp["script"]})
         out = env_step(cfg, env, a_t, seats=step_seats, step_idx=t)
         a = active
+        s_all, alive_all = settle_n(env)    # ONE settle after the step -> reused by the milestone reward, the
+        #                                     sibling buckets, and the terminal/outcome check below (was 2x/step)
 
         if cfg.USE_POTENTIAL_SHAPING:
             phi_ship_now, phi_prod_now = _potentials(env)
@@ -255,8 +257,7 @@ def collect_ppo(cfg, env, net, world_pool, cursor, rng, seats, n_players=2, n_en
             launch_t = torch.zeros_like(cap_t)
             phi_ship_prev, phi_prod_prev = phi_ship_now, phi_prod_now
         else:
-            s_all0, _ = settle_n(env)
-            s0n = s_all0[:, 0]
+            s0n = s_all[:, 0]
             cap_t = a * (cfg.CAPTURE_REWARD * ((out.captured + cfg.CAPTURE_PROD_SCALE * out.captured_prod)
                                                - cfg.CAPTURE_LOSS_FRAC * (out.lost + cfg.CAPTURE_PROD_SCALE * out.lost_prod)))
             m_now = torch.where(s0n >= cfg.PROD_MILESTONE_BASE,
@@ -274,6 +275,12 @@ def collect_ppo(cfg, env, net, world_pool, cursor, rng, seats, n_players=2, n_en
             launch_room = (cfg.LAUNCH_GAME_CAP - launch_paid).clamp_min(0.0)
             launch_t = torch.minimum(launch_t, launch_room)
             launch_paid = launch_paid + launch_t
+        # global dense-reward attenuator: shrink capture + prod-milestone shaping vs the terminal +-WIN_BONUS
+        # so the W/L outcome dominates the return. LAUNCH is deliberately EXEMPT: it never dominates (<<WIN_BONUS)
+        # and it is the per-step activity incentive that guards against the passivity ratchet -- scaling it down
+        # under critic-free mc/grpo (no critic baseline) collapses the policy to "stop launching". Keep it >0.
+        if cfg.DENSE_REWARD_SCALE != 1.0:
+            cap_t = cap_t * cfg.DENSE_REWARD_SCALE; mr_t = mr_t * cfg.DENSE_REWARD_SCALE
         captureR = captureR + cap_t; prodMR = prodMR + mr_t; launchR = launchR + launch_t
         dense_t = torch.zeros_like(cap_t) if phi_value else (cap_t + mr_t + launch_t)   # [C] Phi -> value, not reward
         rew_buf[t] = dense_t / cfg.PPO_REWARD_SCALE
@@ -283,7 +290,6 @@ def collect_ppo(cfg, env, net, world_pool, cursor, rng, seats, n_players=2, n_en
         valid_sum = valid_sum + a * out.valid
         step_sum = step_sum + a
 
-        s_all, alive_all = settle_n(env)
         if sib:                             # [B1] ship-margin position s_{t} for matched-prefix sibling buckets
             phiship_buf[t] = ship_log_t(s_all[:, 0]) - ship_log_t(s_all[:, 1:].max(1).values)
         step_now = env.step_ct
@@ -306,7 +312,7 @@ def collect_ppo(cfg, env, net, world_pool, cursor, rng, seats, n_players=2, n_en
     outcome = torch.where(still, oc, outcome)
 
     bootstrap = torch.zeros(Bn, device=dev)
-    if not grpo:                                           # GRPO has no critic to bootstrap from
+    if cfg.ALGO == "ppo":                                  # only PPO+GAE bootstraps from the critic (grpo/mc are critic-free)
         with torch.no_grad():
             fe, fm, fa_, fg = env_encode(env, 0)
             _, _, vT = act(cfg, net, fe, fm, fa_, fg, greedy=False)
@@ -369,6 +375,15 @@ def collect_ppo(cfg, env, net, world_pool, cursor, rng, seats, n_players=2, n_en
             adv[t] = A * al
             nextval = Vhat[t]; A = A * al
         ret_full = (adv + Vhat).reshape(-1); adv_full = adv.reshape(-1)
+    elif cfg.ALGO == "mc":
+        # ---- vanilla Monte-Carlo: advantage = discounted return-to-go G_t (no GAE, no critic, no value
+        # loss). Whitened below (center + global scale); consumed by the critic-free clipped-surrogate update. ----
+        ret_buf = torch.zeros(Tu, Bn, device=dev)
+        G = torch.zeros(Bn, device=dev)
+        for t in range(Tu - 1, -1, -1):
+            G = rew[t] + cfg.GAMMA * G * (1.0 - done[t])   # reset at episode end (done)
+            ret_buf[t] = G * alive[t]
+        adv_full = ret_buf.reshape(-1); ret_full = ret_buf.reshape(-1)
     else:
         # GAE on GPU (no .cpu(), no synchronize)
         adv = torch.zeros(Tu, Bn, device=dev)
@@ -407,6 +422,8 @@ def collect_ppo(cfg, env, net, world_pool, cursor, rng, seats, n_players=2, n_en
     tb["returns"] = sel(ret_full)
     if cfg.AUX_REWARD_PRED:                                 # aux reward-prediction target: the per-step reward r_t
         tb["reward"] = sel(rew.reshape(-1))                # (the same signal GAE consumes; includes the terminal payment)
+    if cfg.AUX_WIN_BET:                                     # win-bet target: the episode outcome z in [-1,1], broadcast to
+        tb["outcome"] = sel(outcome.unsqueeze(0).expand(Tu, Bn).reshape(-1))   # every step (the bet b_t is scored b_t*z)
     tb["n"] = keep.shape[0]
     del ent_buf, em_buf, am_buf, gl_buf, act_buf, oldlp_buf, val_buf, rew_buf, done_buf, valid_buf, adv_full, ret_full
 

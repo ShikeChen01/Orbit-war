@@ -7,7 +7,7 @@ in C++), ~55× faster end-to-end than a pure-Python loop, with the native env st
 swappable agent/representation abstractions, and serves trained policies.
 
 > **New here? Read [`docs/SETUP.md`](docs/SETUP.md)**, then
-> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/NATIVE_CPP.md`](docs/NATIVE_CPP.md),
+> [`docs/archive/ARCHITECTURE.md`](docs/archive/ARCHITECTURE.md), [`docs/NATIVE_CPP.md`](docs/NATIVE_CPP.md),
 > and [`docs/GAME_REFERENCE.md`](docs/GAME_REFERENCE.md). The **strength work** (what makes a
 > policy that plays well, with measured results) lives in [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md).
 
@@ -92,4 +92,4 @@ bit-exact `py_engine` forward model — submits without the `.pyd`). The deploya
 - **Use a trained policy anywhere**: `PolicyAgent.load("runs/.../final.pt")` — it's an
   `Agent`, and `.to_kaggle_agent()` produces the submission callable.
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for details.
+See [`docs/archive/ARCHITECTURE.md`](docs/archive/ARCHITECTURE.md) for details.

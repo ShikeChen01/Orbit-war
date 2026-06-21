@@ -52,9 +52,10 @@ These never vary between runs (\cd{constants.py}); they are game/representation 
 Symbol & Value & Meaning \\
 \midrule
 \cd{PLANET_CAP} ($E$)    & 48  & planet/comet slots per env = destination-categorical size \\
-\cd{F_DIM} ($F$)         & 104 & per-planet feature width = 14 body $+$ 90 threat \\
+\cd{F_DIM} ($F$)         & 194 & per-planet feature width = 14 body $+$ 180 threat \\
 \cd{N_BODY_FEATURES}     & 14  & per-planet body features (v9: 4-channel seat one-hot ownership) \\
 \cd{N_THREAT_FLEETS}     & 30  & inbound-fleet slots/planet = \cd{N_SOON} 15 $+$ \cd{N_BIG} 15 \\
+\cd{N_THREAT_FEATS}      & 6   & per-fleet descriptor = 4-ch seat one-hot owner $+$ eta $+$ log-ships \\
 \cd{G_DIM} ($G$)         & 10  & board-global features \\
 \cd{BOARD_SIZE}          & 100 & square board; \cd{CENTER}$=50$, \cd{SUN_RADIUS}$=10$ \\
 \bottomrule
@@ -68,7 +69,7 @@ Symbol & Value & Meaning \\
 \toprule
 Tensor & Shape & Notes \\
 \midrule
-\cd{entities}     & $(B, 48, 104)$   & per-planet features, dead slots zeroed \\
+\cd{entities}     & $(B, 48, 194)$   & per-planet features, dead slots zeroed \\
 \cd{entity_mask}  & $(B, 48)$        & $1$ = a live planet/comet slot ($=\cd{p_alive}$) \\
 \cd{action_mask}  & $(B, 48)$        & $1$ = legal launch source (own, alive, ships$>0$) \\
 \cd{globals}      & $(B, 10)$        & board summary, ego-relative \\
@@ -106,18 +107,29 @@ idx & expr & meaning (normalization) \\
 \end{tabular}
 \end{center}
 
-\subsection{Per-planet threat features (90 $=3\times30$)}
+\subsection{Per-planet threat features (180 $=6\times30$)}
 For each planet slot, among all in-flight fleets \emph{currently targeting it} (analytic aim from
 \cd{fleet_target_batch}), select the \cd{N_SOON}$=15$ smallest-ETA fleets and the \cd{N_BIG}$=15$
 largest fleets (size key $|\text{ships}|\cdot2^{20}-\text{seq}$ for a stable tie-break), giving up to
-30 inbound-fleet descriptors; missing slots are zero-padded. Each descriptor is 3 features:
+30 inbound-fleet descriptors; missing slots are zero-padded. Each descriptor is 6 features:
 \begin{itemize}
-  \item \cd{sgn} --- $+1$ if the fleet is the ego's, $-1$ if an opponent's;
+  \item \textbf{owner one-hot (4)} --- an ego-relative seat one-hot of the fleet's owner,
+        $\text{rel}=(\cd{f_owner}-\text{ego})\bmod n_{\text{players}}$: channel 0 = self, channels
+        1--3 = the opponents in seat order (empty slots all-zero). Mirrors the body ownership
+        one-hot, so the policy can tell \emph{which} opponent launched an incoming fleet.
   \item \cd{etf} --- $\text{ETA}/\cd{THREAT_ETA_SCALE}$ (\,/100);
   \item \cd{slg} --- $\cd{ship_log_t}(|\text{ships}|)$, log-compressed fleet size.
 \end{itemize}
-Stacked as $(\,\cd{sgn},\cd{etf},\cd{slg}\,)\times 30 = 90$. Final
-$\cd{entities}=[\text{body}\,\Vert\,\text{threat}]$ is multiplied by \cd{p_alive} so dead slots are 0.
+Stacked as $6\times 30 = 180$. Final $\cd{entities}=[\text{body}\,\Vert\,\text{threat}]$ is
+multiplied by \cd{p_alive} so dead slots are 0.
+
+\paragraph{v12 change (per-opponent threat identity).} Before v12 the owner was a single
+\emph{sign} ($+1$ self / $-1$ any-opponent), so in 4p all three opponents collapsed into one value
+and the policy could not attribute an incoming fleet to a specific rival. The 4-channel one-hot
+fixes this (2p still only ever lights channels 0--1, so the 2p input is unchanged in meaning); it
+raises \cd{F_DIM} from 104 to 194. Members trained on the old 104-feature obs still play via
+\cd{checkpoint.LegacyObsAdapter}, which collapses the one-hot back to the sign at forward time
+($\text{sign}=\text{ch}_0-\sum_{k=1}^{3}\text{ch}_k$).
 
 \subsection{Board globals (10)}
 \begin{center}
@@ -287,9 +299,9 @@ value (aux head off). $E=48$, $F=104$, $G=10$, $d_g=32$, \cd{VALUE_RES_BLOCKS}$=
 \toprule
 config & trunk & heads & \textbf{total} & fp32 / fp16 \\
 \midrule
-\textbf{512$\times$86} (default) & 46.11\,M & 2.94\,M & \textbf{49.05\,M} & 196 / 98\,MB \\
-512$\times$32                    & 17.69\,M & 2.94\,M & \textbf{20.63\,M} & 82 / 41\,MB \\
-256$\times$32                    & 4.62\,M  & 0.59\,M & \textbf{5.20\,M}  & 21 / 10\,MB \\
+\textbf{512$\times$86} (default) & 46.16\,M & 2.94\,M & \textbf{49.10\,M} & 196 / 98\,MB \\
+512$\times$32                    & 17.73\,M & 2.94\,M & \textbf{20.68\,M} & 83 / 41\,MB \\
+256$\times$32                    & 4.64\,M  & 0.59\,M & \textbf{5.23\,M}  & 21 / 10\,MB \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -300,7 +312,7 @@ config & trunk & heads & \textbf{total} & fp32 / fp16 \\
 \toprule
 component & params \\
 \midrule
-\cd{proj} ($104\to512$)                        & 53{,}760 \\
+\cd{proj} ($194\to512$)                        & 99{,}840 \\
 GLU (\cd{glu_gate}+\cd{glu_val}+\cd{glu_out})   & 787{,}968 \\
 86 ResNet-MLP blocks (\cd{res_a}+\cd{res_b})    & 45{,}176{,}832 \\
 \cd{ln_res}+\cd{ln_out}                         & 89{,}088 \\
@@ -309,7 +321,7 @@ WHERE (\cd{dest_q}+\cd{dest_k})                 & 558{,}080 \\
 GATE                                            & 545 \\
 VALUE (in + 4 res + ln + out)                   & 2{,}384{,}897 \\
 \midrule
-\textbf{total}                                  & \textbf{49{,}051{,}522} \\
+\textbf{total}                                  & \textbf{49{,}097{,}602} \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -320,9 +332,9 @@ VALUE (in + 4 res + ln + out)                   & 2{,}384{,}897 \\
 \toprule
 config & trunk & heads & \textbf{total} & fp32 / fp16 \\
 \midrule
-512h / 6L / 8-head (current cfg, heads fixed)  & 21.60\,M & 2.94\,M & \textbf{24.54\,M} & 98 / 49\,MB \\
-512h / 12L / 8-head (it426-class)              & 40.52\,M & 2.94\,M & \textbf{43.46\,M} & 174 / 87\,MB \\
-256h / 4L / 8-head (\cd{INVITE_CFG} canonical) & 3.60\,M  & 0.34\,M & \textbf{3.94\,M}  & 16 / 8\,MB \\
+512h / 6L / 8-head (current cfg, heads fixed)  & 21.65\,M & 2.94\,M & \textbf{24.59\,M} & 98 / 49\,MB \\
+512h / 12L / 8-head (it426-class)              & 40.57\,M & 2.94\,M & \textbf{43.51\,M} & 174 / 87\,MB \\
+256h / 4L / 8-head (\cd{INVITE_CFG} canonical) & 3.62\,M  & 0.34\,M & \textbf{3.96\,M}  & 16 / 8\,MB \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -333,7 +345,7 @@ config & trunk & heads & \textbf{total} & fp32 / fp16 \\
 \toprule
 component & params \\
 \midrule
-\cd{proj} ($104\to512$)                                  & 53{,}760 \\
+\cd{proj} ($194\to512$)                                  & 99{,}840 \\
 stem (\cd{N_STEM_RES}$=1$ pre-attn ResNet-MLP)           & 526{,}336 \\
 6$\times$ MHA (\cd{q},\cd{k},\cd{v},\cd{o})              & 6{,}303{,}744 \\
 6$\times$ MLP (\cd{mlp_in}+\cd{mlp_out}, ratio 4)        & 12{,}598{,}272 \\
@@ -342,7 +354,7 @@ head (\cd{N_HEAD_RES}$=4$ post-attn ResNet-MLP)          & 2{,}105{,}344 \\
 \cd{ln_out}                                              & 1{,}024 \\
 heads (g\_embed + WHERE + gate + value)                  & 2{,}943{,}874 \\
 \midrule
-\textbf{total}                                           & \textbf{24{,}544{,}642} \\
+\textbf{total}                                           & \textbf{24{,}590{,}722} \\
 \bottomrule
 \end{tabular}
 \end{center}

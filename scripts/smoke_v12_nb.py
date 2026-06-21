@@ -60,7 +60,7 @@ for i, c in enumerate(doc["cells"]):
     exec(compile(src, "cell%d" % i, "exec"), ns)
 
 # --- shared league invariants ---
-assert ns["F_DIM"] == 104, "v12 keeps the one-hot obs (F_DIM 104), got %r" % ns["F_DIM"]
+assert ns["F_DIM"] == 194, "v12 per-opponent threat one-hot obs (F_DIM 194), got %r" % ns["F_DIM"]
 hist = ns["hist"]
 n2, n4 = hist["fmt"].count(2), hist["fmt"].count(4)
 print("\n[smoke] iterations: %d x 2p, %d x 4p" % (n2, n4))

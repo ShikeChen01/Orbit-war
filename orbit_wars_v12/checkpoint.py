@@ -13,7 +13,8 @@ import re
 
 import torch
 
-from .constants import F_DIM, G_DIM, PLANET_CAP
+from .constants import (F_DIM, F_DIM_BINARY_THREAT, F_DIM_SCALAR_OWNER, G_DIM, N_BODY_FEATURES,
+                        N_THREAT_FEATS, N_THREAT_FLEETS, PLANET_CAP)
 from .policy import PolicyNet, build_policy
 from .worldgen import make_world_pool
 
@@ -27,17 +28,31 @@ def _freeze_snapshot(net):
 
 
 class LegacyObsAdapter(torch.nn.Module):
-    """Wraps a league member saved with the older SCALAR-ownership obs (3 fewer body features:
-    v7/v8 F_DIM=101) so it can play inside a one-hot build (v9, F_DIM=104): the 4 seat channels
-    collapse back to the scalar code the member was trained on (1 = self, 2 = ANY enemy,
-    0 = neutral). DORMANT whenever the member's F_DIM matches the current build's."""
-    def __init__(self, net):
+    """Wraps a league member saved with an OLDER observation layout so it still plays inside the
+    current build: each forward DOWN-CONVERTS the current obs to the member's layout.
+
+    Current build (F_DIM): 14 body (4-ch seat one-hot ownership) + 30 inbound fleets x 6
+    (4-ch fleet seat one-hot owner + eta + raw ships). Supported older members:
+      * F_DIM_BINARY_THREAT (104): member used a single self/enemy SIGN per fleet -> collapse each
+        fleet's 4-ch owner one-hot to that sign (+1 self / -1 enemy / 0 empty) -> 30 x 3.
+      * F_DIM_SCALAR_OWNER (101): member also used SCALAR body ownership -> additionally collapse the
+        body 4-ch one-hot to the scalar code (1 self, 2 ANY enemy, 0 neutral).
+    DORMANT (the net is returned unwrapped) whenever the member's F_DIM matches the current build."""
+    def __init__(self, net, member_fdim):
         super().__init__()
         self.net = net
+        self.member_fdim = int(member_fdim)
 
     def forward(self, ent, em, am, gl):
-        b7 = ent[..., 7:8] + 2.0 * ent[..., 8:11].sum(-1, keepdim=True).clamp(max=1.0)
-        return self.net(torch.cat([ent[..., :7], b7, ent[..., 11:]], -1), em, am, gl)
+        pre = ent.shape[:-1]
+        body = ent[..., :N_BODY_FEATURES]                                            # (...,14)
+        thr = ent[..., N_BODY_FEATURES:].reshape(*pre, N_THREAT_FLEETS, N_THREAT_FEATS)
+        sign = thr[..., 0:1] - thr[..., 1:4].sum(-1, keepdim=True)                   # +1 self / -1 enemy / 0 empty
+        thr_old = torch.cat([sign, thr[..., 4:6]], -1).reshape(*pre, 3 * N_THREAT_FLEETS)   # (...,90)
+        if self.member_fdim == F_DIM_SCALAR_OWNER:                                   # collapse body ownership too
+            b7 = body[..., 7:8] + 2.0 * body[..., 8:11].sum(-1, keepdim=True).clamp(max=1.0)
+            body = torch.cat([body[..., :7], b7, body[..., 11:]], -1)               # (...,11)
+        return self.net(torch.cat([body, thr_old], -1), em, am, gl)
 
 
 def _unwrap(net):
@@ -45,19 +60,19 @@ def _unwrap(net):
 
 
 def _wrap_if_legacy(net, member_cfg):
-    """Current-format members pass through; v7-format (3 fewer body features) get the obs
+    """Current-format members pass through; supported older obs layouts get the down-converting
     adapter; anything else is incompatible."""
     fd = int((member_cfg or {}).get("F_DIM", F_DIM))
     if fd == F_DIM:
         return net
-    if fd == F_DIM - 3:
-        return LegacyObsAdapter(net)
+    if fd in (F_DIM_BINARY_THREAT, F_DIM_SCALAR_OWNER):
+        return LegacyObsAdapter(net, fd)
     raise ValueError("incompatible member F_DIM %d (current %d)" % (fd, F_DIM))
 
 
 _POLICY_KW = ("HIDDEN", "D_G", "N_RES_BLOCKS", "USE_GLU", "USE_ATTENTION", "VALUE_RES_BLOCKS",
               "ARCH", "N_HEADS", "N_TX_LAYERS", "TX_MLP_RATIO", "N_STEM_RES", "N_HEAD_RES",
-              "F_DIM")
+              "TRUNK_SPEC", "F_DIM")
 
 
 def _live(cfg, k):
@@ -82,6 +97,8 @@ def _cfg_from(cfg, blob_cfg, fallback=None):
     # break the strict load. Default OFF so pre-aux snapshots (and invited members) rebuild unchanged.
     out["AUX_REWARD_PRED"] = bool((blob_cfg or {}).get("AUX_REWARD_PRED",
                                                        (fallback or {}).get("AUX_REWARD_PRED", False)))
+    out["AUX_WIN_BET"] = bool((blob_cfg or {}).get("AUX_WIN_BET",
+                                                   (fallback or {}).get("AUX_WIN_BET", False)))
     return out
 
 
@@ -93,7 +110,9 @@ def build_from_cfg(cfg, member_cfg):
                      n_heads=member_cfg["N_HEADS"], n_tx_layers=member_cfg["N_TX_LAYERS"],
                      tx_mlp_ratio=member_cfg["TX_MLP_RATIO"], n_stem_res=member_cfg["N_STEM_RES"],
                      n_head_res=member_cfg["N_HEAD_RES"], act=member_cfg.get("ACT_FN", "relu"),
-                     aux_reward_pred=member_cfg.get("AUX_REWARD_PRED", False))
+                     aux_reward_pred=member_cfg.get("AUX_REWARD_PRED", False),
+                     aux_win_bet=member_cfg.get("AUX_WIN_BET", False),
+                     trunk_spec=member_cfg.get("TRUNK_SPEC", ""))
 
 
 def load_snapshot(cfg, path, fallback_cfg=None):
@@ -145,11 +164,13 @@ def save_ckpt(cfg, net, path, meta=None):
                        "PLANET_CAP": PLANET_CAP, "F_DIM": F_DIM, "G_DIM": G_DIM,
                        "ARCH": cfg.ARCH, "N_TX_LAYERS": cfg.N_TX_LAYERS, "N_HEADS": cfg.N_HEADS,
                        "TX_MLP_RATIO": cfg.TX_MLP_RATIO, "N_STEM_RES": cfg.N_STEM_RES, "N_HEAD_RES": cfg.N_HEAD_RES,
+                       "TRUNK_SPEC": getattr(cfg, "TRUNK_SPEC", ""),   # [blockseq] rebuild the res/attn sequence
                        "USE_GLU": cfg.USE_GLU, "USE_ATTENTION": cfg.USE_ATTENTION, "VALUE_RES_BLOCKS": cfg.VALUE_RES_BLOCKS,
                        "ACT_FN": cfg.ACT_FN, "target_actor": True,
                        # persist the ACTUAL net's head state (not cfg) -- members built without the head
                        # (invited / legacy-wrapped) must round-trip as AUX_REWARD_PRED=False.
-                       "AUX_REWARD_PRED": bool(getattr(net, "aux_reward_pred", False))}}
+                       "AUX_REWARD_PRED": bool(getattr(net, "aux_reward_pred", False)),
+                       "AUX_WIN_BET": bool(getattr(net, "aux_win_bet", False))}}
     if meta:
         blob.update(meta)
     # league snapshots can be SMALLER than the live config (invited dims): persist the true dims

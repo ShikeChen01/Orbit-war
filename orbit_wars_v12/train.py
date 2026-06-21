@@ -15,7 +15,7 @@ import time
 import torch
 
 from .checkpoint import _freeze_snapshot, load_train_state, save_ckpt, save_train_state
-from .env import GpuEnv
+from .env import GpuEnv, maybe_compile_encode
 from .grpo import grpo_update
 from .league import League, eval_gauntlet, eval_gauntlet4
 from .policy import build_policy
@@ -49,6 +49,7 @@ class Trainer:
             opt = torch.optim.Adam(net.parameters(), lr=cfg.LR, eps=cfg.ADAM_EPS)
         net_fwd = torch.compile(net, mode=cfg.COMPILE_MODE) if cfg.USE_COMPILE else net   # compile LEARNER forward only;
         #          snapshots (deepcopy), recals and saves keep the eager `net` to avoid recompile churn.
+        maybe_compile_encode(cfg)   # also compile the pure obs encoder (_encode_core) -> fused rollout encode
         env = GpuEnv(cfg)
         rng = random.Random(cfg.SEED * 2654435761 + 12345)
         start_it = 0
@@ -126,7 +127,7 @@ class Trainer:
             ent_coef = anneal_ent_coef(cfg, it)   # entropy anneal (anti collapse -> exploit)
             # v7 guardrails: linear LR warmup + critic-only warmup (both per train() CALL, not global iter)
             # GRPO has no critic to warm up -> always full policy weight.
-            policy_coef = 1.0 if cfg.ALGO == "grpo" else (0.0 if step < cfg.VALUE_WARMUP_ITERS else 1.0)
+            policy_coef = 1.0 if cfg.ALGO in ("grpo", "mc") else (0.0 if step < cfg.VALUE_WARMUP_ITERS else 1.0)
             if cfg.LR_WARMUP_ITERS > 0:
                 wf = min(1.0, (step + 1) / float(cfg.LR_WARMUP_ITERS))
                 for pg in opt.param_groups:
@@ -159,7 +160,7 @@ class Trainer:
                            else sum(league._p_beat(m, 4) for m in seats) / max(1, len(seats)))
             tb, rs, cursor = collect_ppo(cfg, env, net_fwd, pool, cursor, rng, seats,
                                          n_players=fmt, n_envs=(cfg.B if fmt == 2 else cfg.B_4P), opp_exp=opp_exp)
-            if cfg.ALGO == "grpo":
+            if cfg.ALGO in ("grpo", "mc"):   # both critic-free: same clipped-surrogate update (no value loss)
                 us = grpo_update(cfg, net_fwd, opt, tb, ent_coef, policy_coef, ref_net=ref_net)
             else:
                 us = ppo_update(cfg, net_fwd, opt, tb, ent_coef, policy_coef)
@@ -211,7 +212,8 @@ class Trainer:
                       % (it + 1, fmt, rs["mean_return"], rs["win_rate"], rs["score"],
                          rs["r_outcome"], rs["r_capture"], rs["r_milestone"], rs["r_launch"],
                          rs["lnch_per_step"], us["approx_kl"], us["clipfrac"], us["grad_norm"], rs["adv_absmax"],
-                         us["total"], us["policy"], us["vf"], (" ar %.3f" % us["auxr"] if cfg.AUX_REWARD_PRED else ""),
+                         us["total"], us["policy"], us["vf"],
+                         (" bet %+.3f" % us["auxr"] if cfg.AUX_WIN_BET else (" ar %.3f" % us["auxr"] if cfg.AUX_REWARD_PRED else "")),
                          league.learner_elo, league.learner_elo4, s4, opp_lab[:22], sps))
 
             # checkpoint: periodic + best-by-MIXED-GAUNTLET (2p + 4p; fixed opponents, held-out worlds)
