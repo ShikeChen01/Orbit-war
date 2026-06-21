@@ -87,6 +87,10 @@ OVERRIDES   = dict(
     # earning b*z -- pressures it to discriminate winning vs losing states. Representation aux only (not in
     # the advantage); mutually exclusive with AUX_REWARD_PRED (win-bet wins).
     AUX_WIN_BET=False, AUX_WIN_BET_COEF=0.25,      # True -> turn the win-bet aux head on
+    # ONE-SIDED win-bet REWARD (needs AUX_WIN_BET=True): also feed the (detached) bet into the advantage as
+    # coef*relu(tanh(bet))*max(z,0) -- rewards CONFIDENT WINS, pays ZERO on a loss (the two-sided bet*z reward
+    # is a passivity trap). Behaviour shaping, not just representation. Heartbeat: R[... wb].
+    AUX_WIN_BET_REWARD=False, AUX_WIN_BET_REWARD_COEF=0.5,   # True -> one-sided confident-win bet reward
 )
 """ + _SETTINGS_PRINT
 
@@ -348,6 +352,79 @@ BLOCKSEQ_DEFS = [
 ]
 BLOCKSEQ_OUT = [os.path.join(REPO, "notebooks", "setup1_v12_%s_a100.ipynb" % d[0]) for d in BLOCKSEQ_DEFS]
 
+# ---- the SUBMISSION notebook: the one config we actually train + ship -----------------------
+# blockseq trunk (h256, 8 heads): 16res,1attn,16res,1attn,32res,1attn,32res,1attn,32res,1attn,32res
+# = 160 ResNet-MLP + 5 cross-planet attention (~165 blocks, ~22.8M params -> ~91MB fp32, at the EDGE of
+# the 100MB submission cap). PPO+GAE (value head = 2 ResNet-MLP blocks). WIN-POOL reward + one-sided
+# confident-win bet + potential shaping coexisting with the 250-capped dense channels. Deploy = sparse
+# critical-step MCTS: crit_schedule=(10, 50, 10.0) -> 10 s search on steps 0/10/20/30/40 (5x10=50 s of a
+# 60 s bank, 10 s turbulence reserve), greedy elsewhere. ~28 ms/forward (2-core fp32) -> ~357 PUCT sims
+# per 10 s critical turn.
+SUBMISSION_OUT = os.path.join(REPO, "notebooks", "setup1_v12_submission.ipynb")
+SUBMISSION_SPEC = "res16,attn1,res16,attn1,res32,attn1,res32,attn1,res32,attn1,res32"
+SUBMISSION_DESC = ("16 ResNet-MLP -> attn -> 16 ResNet-MLP -> attn -> 32 ResNet-MLP -> attn -> 32 ResNet-MLP"
+                   " -> attn -> 32 ResNet-MLP -> attn -> 32 ResNet-MLP")
+SUBMISSION_NBLK, SUBMISSION_PM, SUBMISSION_FWD = 165, 22.8, 28.0   # blocks, params(M), measured B=1 2-core fwd ms
+
+SUBMISSION_SETTINGS = '''# ===================== RUN SETTINGS: SUBMISSION (train this, then ship) =====================
+# Base: v12 (battle-tested heuristic engine, full info, comets handled). Method: PPO + GAE, shared-trunk
+# critic head = 2 ResNet-MLP blocks. See docs/v13_submission.md for the full spec + the flagged decisions.
+#
+# TRUNK (h256, 8 heads): 16res,1attn,16res,1attn,32res,1attn,32res,1attn,32res,1attn,32res
+#   = 160 ResNet-MLP + 5 cross-planet attention (~165 blocks, ~22.8M params -> ~91MB fp32, AT THE EDGE
+#   of the 100MB submission cap -- ship fp32; if it tips over, fp16 halves it).
+#
+# REWARD (raw units, pre PPO_REWARD_SCALE=100):
+#   * WIN POOL = 1200: +ALIVE_REWARD (2) per alive step (the survival "drip"), and on a WIN the ego collects
+#     the REST of the pool (1200 - 2*len) -> a won game totals EXACTLY 1200, undecayed (discounting still
+#     rewards winning FAST: the remainder arrives earlier).
+#   * LOSS = -1000, decayed 0.9995 from step 100. The per-step drip is CLAWED BACK on a loss so a long-
+#     surviving loss can NEVER net positive -> a loser nets exactly -decayed(1000). (closes the passivity ratchet.)
+#   * One-sided confident-WIN bet: AUX_WIN_BET head bets b=tanh in [-1,1] on the outcome; it ALSO earns up to
+#     +1/step (coef*relu(b)*max(z,0)) -- paid ONLY on won games, EXACTLY ZERO on a loss (no give-up trap).
+#   * Potential shaping ON (ship-margin + prod-share, policy-invariant) AND the legacy dense channels
+#     (capture + prod-milestone + launch) -- which SHARE one 250 hard game cap. (FLAG: shaping's ship-margin
+#     overlaps the capture channel; set DENSE_WITH_SHAPING=False for shaping-only if that double-count bites.)
+#
+# DEPLOY (CPU, 2 cores): sparse critical-step MCTS. crit_schedule=(10, 50, 10.0) -> a deep ~10 s PUCT search
+#   on steps 0/10/20/30/40 (five critical turns = 50 s of a 60 s bank, 10 s turbulence reserve), a single
+#   greedy forward on every other turn. ~28 ms/forward -> ~357 sims per 10 s turn (depth 10 easily reached;
+#   breadth K as large as the bank allows). Leaf value = bounded heuristic (try value="net": PPO trains the critic).
+#
+# GPU: A100/H100 (bf16). Colab triton crash -> `pip install triton==3.6.0` then RESTART.
+SMOKE       = False     # True -> tiny net + few iters (sanity run; OVERRIDES ignored)
+RESUME_FROM = None      # path to a *_train_state.pt to resume from, else None
+OVERRIDES   = dict(
+    ARCH="blockseq", TRUNK_SPEC="%s", HIDDEN=256, N_HEADS=8,
+    ALGO="ppo", VALUE_RES_BLOCKS=2, VALUE_WARMUP_ITERS=5, VF_COEF=0.5,
+    GRAD_CHECKPOINT=True, USE_COMPILE=True, AMP_DTYPE=torch.bfloat16,
+    NUM_GROUPS=16, GROUP_SIZE=16, TOTAL_ITERS=2000, BC_ENABLED=True,
+    # --- WIN POOL terminal + clawback (1200 win / -1000 decayed loss) ---
+    USE_WIN_POOL=True, WIN_POOL=1200.0, ALIVE_REWARD=2.0,
+    LOSS_PENALTY=1000.0, LOSS_DECAY=0.9995, WIN_DECAY=1.0, DECAY_START_STEP=100.0,
+    # --- potential shaping ON, coexisting with the legacy dense channels (capture/prod/launch) ---
+    USE_POTENTIAL_SHAPING=True, DENSE_WITH_SHAPING=True, SHAPE_SHIP=25.0, SHAPE_PROD=25.0,
+    # --- capture + prod-milestone + launch SHARE one 250 hard game cap ---
+    USE_DENSE_GAME_CAP=True, DENSE_GAME_CAP=250.0,
+    # --- one-sided confident-WIN bet reward: up to +1/step on won games, zero on a loss ---
+    AUX_WIN_BET=True, AUX_WIN_BET_COEF=0.25, AUX_WIN_BET_REWARD=True, AUX_WIN_BET_REWARD_COEF=1.0,
+)''' % SUBMISSION_SPEC + "\n" + _SETTINGS_PRINT
+
+# Critical-step MCTS deploy demo for the submission nb -- the EXACT deploy schedule (scaled bank for a quick demo).
+SUBMISSION_MCTS_CELL = '''# Critical-step MCTS deploy demo on the freshly trained net -- the EXACT ship strategy, end-to-end.
+# DEPLOY: crit_schedule=(10, 50, 10.0) -> a deep 10 s PUCT search on steps 0/10/20/30/40, greedy elsewhere,
+# bank_s=60, reserve_s=10. Here the per-turn budget + bank are SCALED DOWN so the in-notebook demo stays quick
+# (fresh agent/world per game). Leaf value = bounded heuristic (A/B value="net": PPO+GAE trains the critic). B=1 demo.
+_crit_budget = 0.2 if cfg.SMOKE else 1.0        # DEPLOY: 10.0 s/critical turn
+_greedy_fn = greedy_act_fn(cfg, net)
+for _i, _w in enumerate(make_world_pool(cfg, 2 if cfg.SMOKE else 4, base_seed=99991)):
+    _agent = MctsAgent(cfg, net, opp_kind="greedy", value="heuristic", K=8,
+                       crit_schedule=(10, 50, _crit_budget), bank_s=20.0, reserve_s=2.0)
+    _sm, _scm, _ = play_2p_vs_script(cfg, lambda e, t: _agent.act(e, t)[0], _w, "greedy", max_steps=60)
+    _sg, _scg, _ = play_2p_vs_script(cfg, _greedy_fn, _w, "greedy", max_steps=60)
+    print("world %d  crit-MCTS %.1f (%.0f-%.0f)  |  greedy %.1f (%.0f-%.0f)  bank_left=%.1fs"
+          % (_i, _sm, _scm[0], _scm[1], _sg, _scg[0], _scg[1], max(0.0, _agent.bank_s - _agent.spent_s)))'''
+
 
 def _blockseq_settings(spec, desc):
     return ('''# ==================== RUN SETTINGS: block-sequence trunk + PPO+GAE ====================
@@ -365,8 +442,10 @@ OVERRIDES   = dict(
     VALUE_RES_BLOCKS=2,                              # critic HEAD depth off the shared trunk (try 1-4; deeper trunk -> smaller head)
     VALUE_WARMUP_ITERS=5,                            # critic-only warmup after BC (val-grad only) before joint PPO
     VF_COEF=0.5,                                     # actor/critic grad balance on the shared trunk (lower to ~0.25 if value distorts the policy)
-    # (the MC-era AUX_WIN_BET / DENSE_REWARD_SCALE=0.5 knobs are dropped: the real critic + GAE now do
-    #  the credit assignment. Re-add AUX_WIN_BET=True for an extra win/loss representation aux if wanted.)
+    # (the MC-era DENSE_REWARD_SCALE=0.5 knob is dropped: the real critic + GAE now do the credit
+    #  assignment.) Optional aux: AUX_WIN_BET=True adds a win/loss representation head; pair it with
+    #  AUX_WIN_BET_REWARD=True (+ _COEF) to ALSO feed a ONE-SIDED confident-WIN bet reward into the
+    #  advantage (coef*relu(tanh(bet))*max(z,0); zero on a loss -> no give-up trap). Heartbeat: R[... wb].
     GRAD_CHECKPOINT=True, USE_COMPILE=True, AMP_DTYPE=torch.bfloat16,
     NUM_GROUPS=16, GROUP_SIZE=16, TOTAL_ITERS=2000, BC_ENABLED=True,
 )''' % (desc, spec)) + "\n" + _SETTINGS_PRINT
@@ -399,7 +478,7 @@ def _blockseq_mcts_md(desc, nblk, pm, fwd_ms):
             % (desc, nblk, pm, fwd_ms, s10, s10 // 4, s10 // 8, s10 // 16))
 
 
-def build_notebook(with_mcts=False, with_grpo=False, with_grpo_smoke=False, blockseq=None):
+def build_notebook(with_mcts=False, with_grpo=False, with_grpo_smoke=False, blockseq=None, submission=False):
     module_order = list(BASE_MODULES)
     if with_mcts:
         module_order.insert(module_order.index("plotting"), "mcts")
@@ -407,7 +486,7 @@ def build_notebook(with_mcts=False, with_grpo=False, with_grpo_smoke=False, bloc
         module_order.insert(module_order.index("rollout"), "grpo")   # after ppo, before train
     if with_grpo_smoke:
         module_order.insert(module_order.index("plotting"), "grpo_diag")   # after train, before plotting
-    if blockseq is not None:                                   # blockseq notebooks DEMO critical-step MCTS
+    if blockseq is not None or submission:                     # blockseq + submission notebooks DEMO critical-step MCTS
         module_order.insert(module_order.index("plotting"), "mcts")   # after train, before plotting
     seen, imports = set(), []
     bodies = {}
@@ -431,6 +510,15 @@ def build_notebook(with_mcts=False, with_grpo=False, with_grpo_smoke=False, bloc
     if with_grpo_smoke:
         cells += [_md("## Anti-collapse smoke experiment"), _code(GRPO_SMOKE_SETTINGS),
                   _md("## Prove the reward will not collapse (bound probe + A/B train)"), _code(GRPO_EXP_CELL)]
+        return _wrap(cells)
+
+    if submission:
+        cells += [_md(_blockseq_mcts_md(SUBMISSION_DESC, SUBMISSION_NBLK, SUBMISSION_PM, SUBMISSION_FWD)),
+                  _md("## Run training"), _code(SUBMISSION_SETTINGS), _code(BC_CELL), _code(TRAIN_CELL),
+                  _md("## Save every league agent as weights"), _code(SAVE_CELL),
+                  _md("## Plot training-health curves"), _code(PLOT_CELL),
+                  _md("## Critical-step MCTS deploy demo (the exact ship strategy on the trained net)"),
+                  _code(SUBMISSION_MCTS_CELL)]
         return _wrap(cells)
 
     if blockseq is not None:
@@ -508,7 +596,7 @@ def check(nb_path):
             break
         exec(compile(src, "nbcell", "exec"), ns)
 
-    assert ns["F_DIM"] == 194, "flatten lost the threat one-hot obs (F_DIM != 194): %r" % ns.get("F_DIM")
+    assert ns["F_DIM"] == 198, "flatten lost the v13 motion+threat obs (F_DIM != 198): %r" % ns.get("F_DIM")
 
     # tiny end-to-end train through the flattened defs (exercises rollout/ppo/league/recal/evict)
     cfg = ns["Config"].create(
@@ -591,34 +679,41 @@ def main():
     ap.add_argument("--grpo-smoke", dest="grpo_smoke", action="store_true",
                     help="GRPO anti-collapse smoke experiment (setup1_v12_grpo_anticollapse.ipynb)")
     ap.add_argument("--both", action="store_true", help="generate BOTH the base v12 and v12-mcts notebooks")
-    ap.add_argument("--all", action="store_true", help="generate base, MCTS, GRPO, anti-collapse + 5 blockseq PPO+GAE notebooks")
+    ap.add_argument("--all", action="store_true", help="generate base, MCTS, GRPO, anti-collapse, 5 blockseq + the submission notebook")
     ap.add_argument("--blockseq", action="store_true", help="generate the 5 block-sequence PPO+GAE notebooks (blockseq1-3 + deep + lean)")
+    ap.add_argument("--submission", action="store_true", help="generate the SUBMISSION notebook (setup1_v12_submission.ipynb)")
     ap.add_argument("--check", action="store_true", help="exec the generated nb(s) (SMOKE) to verify")
     args = ap.parse_args()
-    if sum([args.mcts, args.grpo, args.grpo_smoke]) > 1:
-        ap.error("--mcts / --grpo / --grpo-smoke are mutually exclusive")
+    if sum([args.mcts, args.grpo, args.grpo_smoke, args.submission]) > 1:
+        ap.error("--mcts / --grpo / --grpo-smoke / --submission are mutually exclusive")
 
-    bseq = [(False, False, False, i, BLOCKSEQ_OUT[i]) for i in range(len(BLOCKSEQ_DEFS))]
+    # tuple = (with_mcts, with_grpo, with_grpo_smoke, blockseq, submission, out)
+    bseq = [(False, False, False, i, False, BLOCKSEQ_OUT[i]) for i in range(len(BLOCKSEQ_DEFS))]
     if args.all:
-        variants = [(False, False, False, None, DEFAULT_OUT), (True, False, False, None, MCTS_OUT),
-                    (False, True, False, None, GRPO_OUT), (False, False, True, None, GRPO_SMOKE_OUT)] + bseq
+        variants = [(False, False, False, None, False, DEFAULT_OUT), (True, False, False, None, False, MCTS_OUT),
+                    (False, True, False, None, False, GRPO_OUT), (False, False, True, None, False, GRPO_SMOKE_OUT)] \
+                   + bseq + [(False, False, False, None, True, SUBMISSION_OUT)]
     elif args.both:
-        variants = [(False, False, False, None, DEFAULT_OUT), (True, False, False, None, MCTS_OUT)]
+        variants = [(False, False, False, None, False, DEFAULT_OUT), (True, False, False, None, False, MCTS_OUT)]
     elif args.blockseq:
         variants = bseq
+    elif args.submission:
+        variants = [(False, False, False, None, True, args.out or SUBMISSION_OUT)]
     else:
         default_out = (GRPO_SMOKE_OUT if args.grpo_smoke else GRPO_OUT if args.grpo
                        else MCTS_OUT if args.mcts else DEFAULT_OUT)
-        variants = [(args.mcts, args.grpo, args.grpo_smoke, None, args.out or default_out)]
-    for with_mcts, with_grpo, with_grpo_smoke, blockseq, out in variants:
-        nb = build_notebook(with_mcts=with_mcts, with_grpo=with_grpo, with_grpo_smoke=with_grpo_smoke, blockseq=blockseq)
+        variants = [(args.mcts, args.grpo, args.grpo_smoke, None, False, args.out or default_out)]
+    for with_mcts, with_grpo, with_grpo_smoke, blockseq, submission, out in variants:
+        nb = build_notebook(with_mcts=with_mcts, with_grpo=with_grpo, with_grpo_smoke=with_grpo_smoke,
+                            blockseq=blockseq, submission=submission)
         os.makedirs(os.path.dirname(out), exist_ok=True)
         with open(out, "w", encoding="utf-8") as f:
             json.dump(nb, f, indent=1, ensure_ascii=False)
             f.write("\n")
         n_modules = (len(BASE_MODULES) + with_mcts + (with_grpo or with_grpo_smoke or blockseq is not None)
-                     + with_grpo_smoke + (blockseq is not None))   # blockseq also bundles the mcts module
+                     + with_grpo_smoke + (blockseq is not None or submission))   # blockseq/submission also bundle the mcts module
         tag = ((", +%s+PPO" % BLOCKSEQ_DEFS[blockseq][0]) if blockseq is not None
+               else ", +SUBMISSION" if submission
                else ", +MCTS" if with_mcts else ", +GRPO+diag" if with_grpo_smoke
                else ", +GRPO" if with_grpo else "")
         print("wrote %s  (%d cells from %d modules%s)"

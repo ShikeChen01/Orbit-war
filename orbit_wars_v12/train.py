@@ -90,7 +90,7 @@ class Trainer:
 
         hist = {"iter": [], "return": [], "win_rate": [],
                 "lnch_per_step": [], "approx_kl": [], "clipfrac": [], "sigma": [], "grad_norm": [], "auxr": [],
-                "r_outcome": [], "r_capture": [], "r_milestone": [], "r_launch": [],
+                "r_outcome": [], "r_capture": [], "r_milestone": [], "r_launch": [], "r_shape": [], "r_alive": [], "r_win_bet": [],
                 "learner_elo": [], "learner_elo4": [], "share_4p": [], "fmt": [],
                 "adv_absmax": [], "adv_std": []}   # anti-collapse advantage-health curves
 
@@ -190,6 +190,8 @@ class Trainer:
             hist["clipfrac"].append(us["clipfrac"]); hist["sigma"].append(us["sigma"]); hist["grad_norm"].append(us["grad_norm"]); hist["auxr"].append(us.get("auxr", 0.0))
             hist["r_outcome"].append(rs["r_outcome"]); hist["r_capture"].append(rs["r_capture"])
             hist["r_milestone"].append(rs["r_milestone"]); hist["r_launch"].append(rs["r_launch"])
+            hist["r_shape"].append(rs.get("r_shape", 0.0))
+            hist["r_alive"].append(rs.get("r_alive", 0.0)); hist["r_win_bet"].append(rs.get("r_win_bet", 0.0))
             hist["learner_elo"].append(league.learner_elo)
             hist["learner_elo4"].append(league.learner_elo4)
             hist["share_4p"].append(s4); hist["fmt"].append(fmt)
@@ -204,13 +206,15 @@ class Trainer:
                     print("  [TRIPWIRE] launch/st EMA %.2f < %.0f%% of early baseline %.2f -> passivity ratchet suspected; check gauntlet+elo before continuing" % (_ema, cfg.TRIPWIRE_FRAC * 100, _base))
 
             if (it + 1) % log_every == 0 or step == 0 or step == total_iters - 1:
-                # heartbeat: R[o c p ln] = outcome, capture, prod-milestone, launch (real units)
+                # heartbeat: R[o c p ln (sh) al (wb)] = outcome, capture, prod-milestone, launch, (shaping), alive-survival, (win-bet)
                 opp_lab = "+".join(m["label"] for m in seats)
-                print("it%4d %dp | ret %8.2f wr %.2f sc %.2f | R[o %7.1f c %6.1f p %5.1f ln %5.1f] | "
+                _wb = (" wb %5.1f" % rs.get("r_win_bet", 0.0)) if cfg.AUX_WIN_BET_REWARD else ""
+                _sh = (" sh %6.1f" % rs.get("r_shape", 0.0)) if cfg.USE_POTENTIAL_SHAPING else ""
+                print("it%4d %dp | ret %8.2f wr %.2f sc %.2f | R[o %7.1f c %6.1f p %5.1f ln %5.1f%s al %6.1f%s] | "
                       "lnch/st %.2f | kl %.3f cf %.2f gn %.1f aMx %5.1f | loss %7.3f (pol %.3f vf %.3f%s) | "
                       "elo2 %5.0f elo4 %5.0f s4 %.2f vs %-22s | sps %5.0f"
                       % (it + 1, fmt, rs["mean_return"], rs["win_rate"], rs["score"],
-                         rs["r_outcome"], rs["r_capture"], rs["r_milestone"], rs["r_launch"],
+                         rs["r_outcome"], rs["r_capture"], rs["r_milestone"], rs["r_launch"], _sh, rs["r_alive"], _wb,
                          rs["lnch_per_step"], us["approx_kl"], us["clipfrac"], us["grad_norm"], rs["adv_absmax"],
                          us["total"], us["policy"], us["vf"],
                          (" bet %+.3f" % us["auxr"] if cfg.AUX_WIN_BET else (" ar %.3f" % us["auxr"] if cfg.AUX_REWARD_PRED else "")),

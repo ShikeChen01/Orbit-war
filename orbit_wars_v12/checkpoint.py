@@ -13,8 +13,8 @@ import re
 
 import torch
 
-from .constants import (F_DIM, F_DIM_BINARY_THREAT, F_DIM_SCALAR_OWNER, G_DIM, N_BODY_FEATURES,
-                        N_THREAT_FEATS, N_THREAT_FLEETS, PLANET_CAP)
+from .constants import (F_DIM, F_DIM_BINARY_THREAT, F_DIM_NO_MOTION, F_DIM_SCALAR_OWNER, G_DIM,
+                        N_BODY_FEATURES, N_BODY_FEATURES_V12, N_THREAT_FEATS, N_THREAT_FLEETS, PLANET_CAP)
 from .policy import PolicyNet, build_policy
 from .worldgen import make_world_pool
 
@@ -31,8 +31,10 @@ class LegacyObsAdapter(torch.nn.Module):
     """Wraps a league member saved with an OLDER observation layout so it still plays inside the
     current build: each forward DOWN-CONVERTS the current obs to the member's layout.
 
-    Current build (F_DIM): 14 body (4-ch seat one-hot ownership) + 30 inbound fleets x 6
-    (4-ch fleet seat one-hot owner + eta + raw ships). Supported older members:
+    Current build (F_DIM=198): 18 body = 14 v12 channels (4-ch seat one-hot ownership, ...) + 4 v13
+    MOTION channels (vx,vy,ax,ay), then 30 inbound fleets x 6 (4-ch fleet seat one-hot + eta + raw
+    ships). EVERY supported older member first DROPS the 4 motion channels (they never had them):
+      * F_DIM_NO_MOTION (194): pre-v13 v12 -> drop motion only; 6-feat threat passes through unchanged.
       * F_DIM_BINARY_THREAT (104): member used a single self/enemy SIGN per fleet -> collapse each
         fleet's 4-ch owner one-hot to that sign (+1 self / -1 enemy / 0 empty) -> 30 x 3.
       * F_DIM_SCALAR_OWNER (101): member also used SCALAR body ownership -> additionally collapse the
@@ -45,8 +47,10 @@ class LegacyObsAdapter(torch.nn.Module):
 
     def forward(self, ent, em, am, gl):
         pre = ent.shape[:-1]
-        body = ent[..., :N_BODY_FEATURES]                                            # (...,14)
-        thr = ent[..., N_BODY_FEATURES:].reshape(*pre, N_THREAT_FLEETS, N_THREAT_FEATS)
+        body = ent[..., :N_BODY_FEATURES_V12]                                        # drop v13 motion -> (...,14)
+        thr = ent[..., N_BODY_FEATURES:].reshape(*pre, N_THREAT_FLEETS, N_THREAT_FEATS)   # 6-feat threat (...,30,6)
+        if self.member_fdim == F_DIM_NO_MOTION:                                      # pre-v13 v12: threat unchanged
+            return self.net(torch.cat([body, thr.reshape(*pre, N_THREAT_FEATS * N_THREAT_FLEETS)], -1), em, am, gl)
         sign = thr[..., 0:1] - thr[..., 1:4].sum(-1, keepdim=True)                   # +1 self / -1 enemy / 0 empty
         thr_old = torch.cat([sign, thr[..., 4:6]], -1).reshape(*pre, 3 * N_THREAT_FLEETS)   # (...,90)
         if self.member_fdim == F_DIM_SCALAR_OWNER:                                   # collapse body ownership too
@@ -65,7 +69,7 @@ def _wrap_if_legacy(net, member_cfg):
     fd = int((member_cfg or {}).get("F_DIM", F_DIM))
     if fd == F_DIM:
         return net
-    if fd in (F_DIM_BINARY_THREAT, F_DIM_SCALAR_OWNER):
+    if fd in (F_DIM_NO_MOTION, F_DIM_BINARY_THREAT, F_DIM_SCALAR_OWNER):
         return LegacyObsAdapter(net, fd)
     raise ValueError("incompatible member F_DIM %d (current %d)" % (fd, F_DIM))
 

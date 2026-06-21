@@ -39,22 +39,34 @@ N_THREAT_FLEETS = N_SOON + N_BIG            # 30 inbound-fleet slots per planet 
 # (v12: replaces the single self/enemy SIGN, which collapsed all opponents into one channel in 4p)
 # + eta + raw ships (per-fleet ship-log compression removed; un-normalized integer count).
 N_THREAT_FEATS = 6
-N_BODY_FEATURES = 14   # v9: ownership = 4-channel seat one-hot (was 1 scalar) -> +3
-N_ENTITY_FEATURES = N_BODY_FEATURES + N_THREAT_FEATS * N_THREAT_FLEETS   # 14 + 6*30 = 194
+# v13: body = the 14 v9/v12 channels + 4 MOTION channels (vx, vy, ax, ay): the per-planet velocity
+# and curvature, backward finite-diff of position, UNIFORM across static/orbital/comet bodies (the new
+# info is comet motion -- orbital already had vmag/cw; static is 0). Appended AFTER the v12 channels so
+# indices 0..13 are unchanged (only the threat-block offset shifts). See docs/v13_motion.md.
+N_BODY_FEATURES_V12 = 14   # pre-v13 body width (no motion vectors) -> legacy down-convert target
+N_BODY_FEATURES = 18   # v13: + vx,vy,ax,ay  (v9: ownership = 4-channel seat one-hot, was 1 scalar -> +3)
+N_ENTITY_FEATURES = N_BODY_FEATURES + N_THREAT_FEATS * N_THREAT_FLEETS   # 18 + 6*30 = 198
 N_GLOBAL_FEATURES = 10
 F_DIM = N_ENTITY_FEATURES
 G_DIM = N_GLOBAL_FEATURES
 # Older observation layouts kept playable as league members via checkpoint.LegacyObsAdapter, which
 # down-converts the CURRENT obs to the member's layout each forward:
+#   F_DIM_NO_MOTION    (194): pre-v13 v12 layout (14 body, no motion vectors; SAME 6-feat threat) ->
+#                             drop the 4 motion channels, threat passes through uncollapsed.
 #   F_DIM_BINARY_THREAT (104): v9-v12 single self/enemy fleet SIGN (collapse the 4-ch owner one-hot).
 #   F_DIM_SCALAR_OWNER  (101): v7/v8, additionally SCALAR body ownership (collapse the body one-hot).
-F_DIM_BINARY_THREAT = N_BODY_FEATURES + 3 * N_THREAT_FLEETS           # 104: 14 body + 30x3 threat
-F_DIM_SCALAR_OWNER = (N_BODY_FEATURES - 3) + 3 * N_THREAT_FLEETS      # 101: 11 body + 30x3 threat
+# All pinned to N_BODY_FEATURES_V12 (the historical 14-body width), NOT the live N_BODY_FEATURES.
+F_DIM_NO_MOTION = N_BODY_FEATURES_V12 + N_THREAT_FEATS * N_THREAT_FLEETS   # 194: 14 body + 30x6 threat
+F_DIM_BINARY_THREAT = N_BODY_FEATURES_V12 + 3 * N_THREAT_FLEETS           # 104: 14 body + 30x3 threat
+F_DIM_SCALAR_OWNER = (N_BODY_FEATURES_V12 - 3) + 3 * N_THREAT_FLEETS      # 101: 11 body + 30x3 threat
 
 SHIP_LOG_DENOM = math.log(1000.0)
 DIAG_HALF = math.sqrt(BOARD_SIZE * BOARD_SIZE + BOARD_SIZE * BOARD_SIZE) / 2.0
 THREAT_MAX_SPEED = 6.0      # == ship speed; fleet speed cap for the ETA model
 THREAT_ETA_SCALE = 100.0
+# v13 motion-feature normalisers (per-planet body channels 14..17 = vx,vy,ax,ay).
+V_SCALE = THREAT_MAX_SPEED  # velocity ~ COMET_SPEED(4)/orbital chord(<=3.5) -> ~0.6 normalised
+A_SCALE = THREAT_MAX_SPEED  # curvature (2nd diff) is small; placeholder == V_SCALE, tune from measured |accel|
 BIG = 1e18
 
 # ---- world-generator group bounds (REFERENCE_orbit_wars.py::generate_planets) --------------

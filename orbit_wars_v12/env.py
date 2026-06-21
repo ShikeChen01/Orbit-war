@@ -11,10 +11,10 @@ import math
 import numpy as np
 import torch
 
-from .constants import (BIG, BOARD_SIZE, CENTER, COMET_PRODUCTION, COMET_RADIUS, DIAG_HALF, DTYPE,
-                        N_THREAT_FEATS, N_THREAT_FLEETS, PI, PLANET_CAP,
+from .constants import (A_SCALE, BIG, BOARD_SIZE, CENTER, COMET_PRODUCTION, COMET_RADIUS, DIAG_HALF,
+                        DTYPE, N_THREAT_FEATS, N_THREAT_FLEETS, PI, PLANET_CAP,
                         ROTATION_RADIUS_LIMIT, SHIP_SPEED, SUN_RADIUS, THREAT_ETA_SCALE,
-                        THREAT_MAX_SPEED, fleet_speed_t, ship_log_t)
+                        THREAT_MAX_SPEED, V_SCALE, fleet_speed_t, ship_log_t)
 
 # opponent_action codes by league "kind" (the two notebook names are the same mapping).
 _OPP_BY_KIND = {"random": 0, "starter": 1, "noop": 2, "medium": 3, "greedy": 4, "intermediate": 5}
@@ -101,7 +101,8 @@ class GpuEnv:
         self.done = torch.zeros(B, dtype=DTYPE, device=dev)
         if getattr(self, '_rot_aug', False):       # seat-swap aug (training env only); set by collect_ppo
             _apply_rot_aug(self)
-        self.p_x_prev = self.p_x.clone(); self.p_y_prev = self.p_y.clone()   # one-step prev pos -> finite-diff body velocity
+        self.p_x_prev = self.p_x.clone(); self.p_y_prev = self.p_y.clone()    # 1-step prev pos -> finite-diff velocity
+        self.p_x_prev2 = self.p_x.clone(); self.p_y_prev2 = self.p_y.clone()  # 2-step prev pos -> finite-diff curvature (v13)
 
 
 # ---- seat-swap augmentation helpers (training env only) --------------------------------------
@@ -188,7 +189,7 @@ def fleet_target_batch(env, fx, fy, fang, fships, vmax):
 
 def _encode_core(ego, na, T, vmax, p_alive, p_owner, p_x, p_y, p_radius, p_is_comet, ang_vel,
                  p_prod, p_ships, f_x, f_y, f_angle, f_ships, f_alive, f_owner, f_seq, step_ct,
-                 p_x_prev, p_y_prev):
+                 p_x_prev, p_y_prev, p_x_prev2, p_y_prev2):
     """Pure-tensor core of env_encode (NO env object) -> torch.compile-friendly. ``ego``/``na``/``T``/
     ``vmax`` are python scalars (compile specializes one graph per distinct value -- a tiny, fixed set:
     ego in 0..3, na in {2,4}, T in {200,500}); everything else is a tensor. Identical math to the
@@ -227,7 +228,17 @@ def _encode_core(ego, na, T, vmax, p_alive, p_owner, p_x, p_y, p_radius, p_is_co
     b9 = comet.to(DTYPE)
     actable = (owner == float(ego)) & alive & (p_ships > 0.0)
     b10 = actable.to(DTYPE)
-    body = torch.stack([b0, b1, b2, b3, b4, b5, b6, b7a, b7b, b7c, b7d, b8, b9, b10], 2)  # (B,Ec,14)
+    # v13 MOTION: per-planet velocity + curvature via BACKWARD finite-diff (the only definition
+    # reproducible at serve time -- prod cannot see the next tick). Uniform over body types: static->0,
+    # orbital->tangent/centripetal, comet->drift/bend (the comet case is the new signal; orbital was
+    # already covered by b2/b3). Absolute board coords, so the seat-swap rot-aug rotates v/a with the
+    # positions automatically (prev/prev2 are set post-rotation at reset). See docs/v13_motion.md.
+    b14 = (p_x - p_x_prev) / V_SCALE                                  # vx
+    b15 = (p_y - p_y_prev) / V_SCALE                                  # vy
+    b16 = (p_x - 2.0 * p_x_prev + p_x_prev2) / A_SCALE                # ax (curvature)
+    b17 = (p_y - 2.0 * p_y_prev + p_y_prev2) / A_SCALE                # ay (curvature)
+    body = torch.stack([b0, b1, b2, b3, b4, b5, b6, b7a, b7b, b7c, b7d, b8, b9, b10,
+                        b14, b15, b16, b17], 2)  # (B,Ec,18)
 
     # threat: per planet, the TOP N_THREAT_FLEETS inbound fleets BY SIZE. Attribution uses the APPARENT
     # target (the planet the ray points at, IGNORING the sun), so a fleet that will be absorbed by the sun
@@ -300,6 +311,7 @@ def env_encode(env, ego=0):
     torch.compile trace it -- dynamo cannot follow the env object's getattr-with-default accesses."""
     na = float(getattr(env, "n_players", 2))
     p_x_prev = getattr(env, "p_x_prev", env.p_x); p_y_prev = getattr(env, "p_y_prev", env.p_y)
+    p_x_prev2 = getattr(env, "p_x_prev2", p_x_prev); p_y_prev2 = getattr(env, "p_y_prev2", p_y_prev)
     # The encoder never needs grad (its output is stored into the rollout buffers as constants; the
     # update re-runs net(...) on those, not on this output). Forcing no_grad at the dispatch boundary
     # keeps grad_mode CONSTANT across every caller (rollout ego/opp, league recal, eval, MCTS) so the
@@ -309,7 +321,7 @@ def env_encode(env, ego=0):
         return _ENCODE_CORE(int(ego), na, int(env.T), env.vmax, env.p_alive, env.p_owner, env.p_x, env.p_y,
                             env.p_radius, env.p_is_comet, env.ang_vel, env.p_prod, env.p_ships, env.f_x,
                             env.f_y, env.f_angle, env.f_ships, env.f_alive, env.f_owner, env.f_seq,
-                            env.step_ct, p_x_prev, p_y_prev)
+                            env.step_ct, p_x_prev, p_y_prev, p_x_prev2, p_y_prev2)
 
 
 def maybe_compile_encode(cfg):
@@ -633,6 +645,9 @@ def spawn_comets(cfg, env):
             _set(env.p_alive, torch.ones(B, device=dev))
             _set(env.p_owner, torch.full((B,), -1.0, device=dev))
             _set(env.p_x, px); _set(env.p_y, py); _set(env.p_init_x, px); _set(env.p_init_y, py)
+            # v13: seed the position history at the spawn point so the first finite-diff velocity/curvature
+            # is computed off the comet itself, not the recycled slot's stale (dead-planet) prev position.
+            _set(env.p_x_prev, px); _set(env.p_y_prev, py); _set(env.p_x_prev2, px); _set(env.p_y_prev2, py)
             _set(env.p_comet_vx, vx); _set(env.p_comet_vy, vy)
             _set(env.p_ships, ships)
             _set(env.p_prod, torch.full((B,), float(COMET_PRODUCTION), device=dev))
@@ -657,6 +672,9 @@ def spawn_comets_official(env, e):
         _set(env.p_owner, -one)
         _set(env.p_x, px); _set(env.p_y, py)
         _set(env.p_init_x, px); _set(env.p_init_y, py)
+        # v13: seed position history at the spawn waypoint (see spawn_comets) so the first velocity/
+        # curvature is off the comet, not the recycled slot's stale prev.
+        _set(env.p_x_prev, px); _set(env.p_y_prev, py); _set(env.p_x_prev2, px); _set(env.p_y_prev2, py)
         _set(env.p_ships, env.c_ships[:, e].unsqueeze(1))
         _set(env.p_prod, one * float(COMET_PRODUCTION))
         _set(env.p_radius, one * float(COMET_RADIUS))
@@ -839,7 +857,11 @@ def env_step(cfg, env, ego_action, opponent=None, opp_action=None, step_idx=None
     env.p_owner = torch.where(flips, surv_owner, env.p_owner)
 
     # --- apply planet positions; clear removed fleets ---
-    env.p_x_prev = old_px; env.p_y_prev = old_py   # one-step prev pos for finite-diff body velocity (threat lead)
+    # shift the position history: prev2 <- prev (pre-update) THEN prev <- this step's start pos.
+    # encode at the next step start then reads p_x(=new), p_x_prev(=this start), p_x_prev2(=last start)
+    # -> velocity = p_x-prev, curvature = p_x-2*prev+prev2 (threat lead still uses prev only).
+    env.p_x_prev2 = env.p_x_prev; env.p_y_prev2 = env.p_y_prev
+    env.p_x_prev = old_px; env.p_y_prev = old_py
     env.p_x = nx; env.p_y = ny
     if cfg.COMETS_ENABLED:                               # comet expiry: official = path end; legacy = swept past the inner region
         if _comet_expired is not None:

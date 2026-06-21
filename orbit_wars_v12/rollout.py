@@ -27,6 +27,15 @@ def _potentials(env):
     return phi_ship, (pe - pen) / tot
 
 
+def one_sided_bet_reward(coef, bet_buf, outcome, alive):
+    """ONE-SIDED confident-win bet reward (raw units, pre PPO_REWARD_SCALE). ``bet_buf`` (Tu,Bn) already holds
+    relu(tanh(bet_t)) >= 0 (the confident-POSITIVE part of the bet). Pays ``coef * bet * max(z,0)`` so it
+    rewards confident WINS and is EXACTLY ZERO on a draw/loss (z<=0) -- the symmetric ``bet*z`` reward is a
+    passivity trap (it would pay coef/step for confidently LOSING). ``outcome`` (Bn,) z in [-1,1]; ``alive``
+    (Tu,Bn) the live-step mask. Returns (Tu,Bn). Factored out so the one-sidedness is unit-testable."""
+    return coef * bet_buf * outcome.clamp_min(0.0).unsqueeze(0) * alive
+
+
 def _opp_baseline(cfg, Re, opp_exp):
     """[E1] subtract the league's Elo-expected outcome vs THIS opponent (a constant per iteration).
     Under one-opponent-per-iter + per-group centering this is a no-op for the centered advantage; it
@@ -199,13 +208,18 @@ def collect_ppo(cfg, env, net, world_pool, cursor, rng, seats, n_players=2, n_en
     rew_buf = torch.zeros(T, Bn, device=dev); val_buf = torch.zeros(T, Bn, device=dev); done_buf = torch.zeros(T, Bn, device=dev)
     phi_buf = torch.zeros(T, Bn, device=dev) if phi_value else None        # [C] Phi(s_t) per step, fed to the V_hat baseline
     phiship_buf = torch.zeros(T, Bn, device=dev) if sib else None          # [B1] phi_ship(s_t) per step, for sibling buckets
+    want_bet = bool(cfg.AUX_WIN_BET and cfg.AUX_WIN_BET_REWARD)            # one-sided confident-win bet reward enabled?
+    bet_buf = torch.zeros(T, Bn, device=dev) if want_bet else None         # relu(tanh(bet_t)) per step (-> reward once z known)
 
     active = torch.ones(Bn, device=dev); outcome = torch.zeros(Bn, device=dev)
     seat_sc = torch.zeros(len(specs), Bn, device=dev)   # pairwise score vs each seat, frozen at term
     inv_sum = torch.zeros(Bn, device=dev); lnch_sum = torch.zeros(Bn, device=dev)
     valid_sum = torch.zeros(Bn, device=dev); step_sum = torch.zeros(Bn, device=dev)
     launch_paid = torch.zeros(Bn, device=dev); milestone_prev = torch.zeros(Bn, device=dev)
+    dense_paid = torch.zeros(Bn, device=dev)   # running sum of the CAPPED dense channels (USE_DENSE_GAME_CAP)
     captureR = torch.zeros(Bn, device=dev); launchR = torch.zeros(Bn, device=dev); prodMR = torch.zeros(Bn, device=dev)
+    shapeR = torch.zeros(Bn, device=dev)   # integrated potential-shaping reward (heartbeat 'sh'; 0 unless shaping on)
+    aliveR = torch.zeros(Bn, device=dev)   # v13: integrated per-step survival reward (heartbeat 'al')
 
     phi_ship_prev, phi_prod_prev = _potentials(env)   # shaping potentials at s_0
 
@@ -229,7 +243,11 @@ def collect_ppo(cfg, env, net, world_pool, cursor, rng, seats, n_players=2, n_en
         if phi_value:                       # Phi(s_t): phi_*_prev still holds the current state (s_0, or s_t from the prior step)
             phi_buf[t] = cfg.SHAPE_SHIP * phi_ship_prev + cfg.SHAPE_PROD * phi_prod_prev
         ent, em, am, gl = env_encode(env, 0)
-        a_t, logp, value = act(cfg, net, ent, em, am, gl, greedy=False)
+        if want_bet:
+            a_t, logp, value, rpred_t = act(cfg, net, ent, em, am, gl, greedy=False, want_rpred=True)
+            bet_buf[t] = torch.relu(torch.tanh(rpred_t)) * active   # confident-POSITIVE bet, masked to live envs
+        else:
+            a_t, logp, value = act(cfg, net, ent, em, am, gl, greedy=False)
         ent_buf[t] = ent; em_buf[t] = em; am_buf[t] = am; gl_buf[t] = gl
         act_buf[t] = a_t; oldlp_buf[t] = logp; valid_buf[t] = active; val_buf[t] = value
 
@@ -250,13 +268,12 @@ def collect_ppo(cfg, env, net, world_pool, cursor, rng, seats, n_players=2, n_en
         s_all, alive_all = settle_n(env)    # ONE settle after the step -> reused by the milestone reward, the
         #                                     sibling buckets, and the terminal/outcome check below (was 2x/step)
 
-        if cfg.USE_POTENTIAL_SHAPING:
-            phi_ship_now, phi_prod_now = _potentials(env)
-            cap_t = a * (cfg.SHAPE_SHIP * (cfg.GAMMA * phi_ship_now - phi_ship_prev))   # ship-margin shaping
-            mr_t = a * (cfg.SHAPE_PROD * (cfg.GAMMA * phi_prod_now - phi_prod_prev))    # production-share shaping
-            launch_t = torch.zeros_like(cap_t)
-            phi_ship_prev, phi_prod_prev = phi_ship_now, phi_prod_now
-        else:
+        # --- dense per-step channels: legacy capture/prod-milestone/launch and/or Ng potential shaping.
+        # Normally mutually exclusive (shaping REPLACES the legacy channels). DENSE_WITH_SHAPING lets them
+        # COEXIST -- the legacy channels run AND the telescoping shaping deltas are summed on top.
+        shaping_on = cfg.USE_POTENTIAL_SHAPING
+        dense_on = (not shaping_on) or cfg.DENSE_WITH_SHAPING        # are the legacy capped channels live?
+        if dense_on:
             s0n = s_all[:, 0]
             cap_t = a * (cfg.CAPTURE_REWARD * ((out.captured + cfg.CAPTURE_PROD_SCALE * out.captured_prod)
                                                - cfg.CAPTURE_LOSS_FRAC * (out.lost + cfg.CAPTURE_PROD_SCALE * out.lost_prod)))
@@ -275,15 +292,39 @@ def collect_ppo(cfg, env, net, world_pool, cursor, rng, seats, n_players=2, n_en
             launch_room = (cfg.LAUNCH_GAME_CAP - launch_paid).clamp_min(0.0)
             launch_t = torch.minimum(launch_t, launch_room)
             launch_paid = launch_paid + launch_t
-        # global dense-reward attenuator: shrink capture + prod-milestone shaping vs the terminal +-WIN_BONUS
-        # so the W/L outcome dominates the return. LAUNCH is deliberately EXEMPT: it never dominates (<<WIN_BONUS)
-        # and it is the per-step activity incentive that guards against the passivity ratchet -- scaling it down
-        # under critic-free mc/grpo (no critic baseline) collapses the policy to "stop launching". Keep it >0.
+        else:
+            cap_t = torch.zeros(Bn, device=dev); mr_t = torch.zeros(Bn, device=dev); launch_t = torch.zeros(Bn, device=dev)
+        if shaping_on:
+            phi_ship_now, phi_prod_now = _potentials(env)
+            shape_t = a * (cfg.SHAPE_SHIP * (cfg.GAMMA * phi_ship_now - phi_ship_prev)    # ship-margin shaping
+                           + cfg.SHAPE_PROD * (cfg.GAMMA * phi_prod_now - phi_prod_prev))  # production-share shaping
+            phi_ship_prev, phi_prod_prev = phi_ship_now, phi_prod_now
+        else:
+            shape_t = torch.zeros(Bn, device=dev)
+        # global dense-reward attenuator: shrink capture + prod-milestone vs the terminal +-WIN/LOSS so the W/L
+        # outcome dominates the return. LAUNCH is deliberately EXEMPT: it never dominates and it is the per-step
+        # activity incentive that guards the passivity ratchet (scaling it down under critic-free mc/grpo
+        # collapses the policy to "stop launching"). Shaping is policy-invariant -> also exempt.
         if cfg.DENSE_REWARD_SCALE != 1.0:
             cap_t = cap_t * cfg.DENSE_REWARD_SCALE; mr_t = mr_t * cfg.DENSE_REWARD_SCALE
-        captureR = captureR + cap_t; prodMR = prodMR + mr_t; launchR = launchR + launch_t
-        dense_t = torch.zeros_like(cap_t) if phi_value else (cap_t + mr_t + launch_t)   # [C] Phi -> value, not reward
-        rew_buf[t] = dense_t / cfg.PPO_REWARD_SCALE
+        # shared hard GAME cap on the legacy dense sum (capture + prod-milestone + launch). When the step
+        # would push the running total over DENSE_GAME_CAP, the three channels are scaled DOWN TOGETHER so
+        # they share the remaining room (their per-step ratio is preserved). Net negative steps free room
+        # back. Shaping (shape_t) is NOT inside the cap.
+        if cfg.USE_DENSE_GAME_CAP and dense_on:
+            dense_step = cap_t + mr_t + launch_t
+            room = (cfg.DENSE_GAME_CAP - dense_paid).clamp_min(0.0)
+            scale = torch.where(dense_step > room, room / dense_step.clamp_min(1e-8), torch.ones_like(dense_step))
+            cap_t = cap_t * scale; mr_t = mr_t * scale; launch_t = launch_t * scale
+            dense_paid = dense_paid + (cap_t + mr_t + launch_t)
+        captureR = captureR + cap_t; prodMR = prodMR + mr_t; launchR = launchR + launch_t; shapeR = shapeR + shape_t
+        dense_t = torch.zeros_like(cap_t) if phi_value else (cap_t + mr_t + launch_t + shape_t)   # [C] Phi -> value, not reward
+        # v13 survival reward: a flat ALIVE_REWARD for every active (ego-alive, game-undecided) step. A
+        # genuine reward (NOT shaping), so it is EXEMPT from DENSE_REWARD_SCALE and present even in phi_value
+        # mode -- it densifies the halved (+-500) terminal outcome across the trajectory.
+        alive_t = a * cfg.ALIVE_REWARD
+        aliveR = aliveR + alive_t
+        rew_buf[t] = (dense_t + alive_t) / cfg.PPO_REWARD_SCALE
 
         inv_sum = inv_sum + a * out.invalid
         lnch_sum = lnch_sum + a * out.launches
@@ -321,16 +362,36 @@ def collect_ppo(cfg, env, net, world_pool, cursor, rng, seats, n_players=2, n_en
     Tu = last_t + 1
     rew = rew_buf[:Tu].clone(); val = val_buf[:Tu]; done = done_buf[:Tu]; alive = valid_buf[:Tu]
     length = alive.sum(0)
+    # ONE-SIDED confident-win bet reward: pay coef * relu(tanh(bet_t)) * max(z,0), rectified to the WINNING
+    # side so it can never pay for confidently losing (the two-sided bet*z reward is a passivity trap). The
+    # bet is DETACHED (a reward, not a loss); it flows through GAE / the per-step GRPO return like any reward.
+    r_win_bet_log = 0.0
+    if want_bet:
+        bet_r = one_sided_bet_reward(cfg.AUX_WIN_BET_REWARD_COEF, bet_buf[:Tu], outcome, alive)
+        rew = rew + bet_r / cfg.PPO_REWARD_SCALE                                   # raw units / scale, like the other channels
+        r_win_bet_log = bet_r.sum(0).mean().item()                                # heartbeat 'wb' (raw units, like R[o c p ln])
     len_eff = (length - cfg.DECAY_START_STEP).clamp_min(0.0)
-    win_val = torch.pow(torch.full_like(outcome, cfg.WIN_DECAY), len_eff) * cfg.WIN_BONUS
+    if cfg.USE_WIN_POOL:
+        # WIN POOL: a win pays the REST of the WIN_POOL after the per-step ALIVE_REWARD drip already paid
+        # (-> a won game totals exactly WIN_POOL, undecayed; discounting still rewards winning fast). The
+        # loss side keeps the decayed LOSS_PENALTY. Clawback below cancels the drip on non-wins.
+        win_val = (cfg.WIN_POOL - cfg.ALIVE_REWARD * length).clamp_min(0.0)
+    else:
+        win_val = torch.pow(torch.full_like(outcome, cfg.WIN_DECAY), len_eff) * cfg.WIN_BONUS
     loss_val = torch.pow(torch.full_like(outcome, cfg.LOSS_DECAY), len_eff) * cfg.LOSS_PENALTY
     # fractional outcomes (4p placement mode) scale the outcome magnitudes linearly;
     # in 2p outcome is exactly {-1, 0, +1} -> identical to the v7 payment
     Ot = torch.where(outcome > 0.0, outcome * win_val, outcome * loss_val)
+    if cfg.USE_WIN_POOL:
+        # claw back the survival drip (ALIVE_REWARD*len) on NON-winning outcomes so a long-surviving loss
+        # can never net positive (the passivity ratchet): a loser then nets exactly -decayed(LOSS_PENALTY).
+        Ot = Ot - (outcome < 0.0).to(Ot.dtype) * cfg.ALIVE_REWARD * length
     r_outcome_log = Ot.mean().item()
-    if not cfg.USE_POTENTIAL_SHAPING:
+    if dense_on:
         disp_cashout = torch.clamp(cfg.LAUNCH_WINDOW - length, min=0.0) * cfg.LAUNCH_STEP_CAP * (outcome > 0.0).to(outcome.dtype)
-        disp_cashout = torch.minimum(disp_cashout, (cfg.LAUNCH_GAME_CAP - launch_paid).clamp_min(0.0))
+        cash_room = ((cfg.DENSE_GAME_CAP - dense_paid) if cfg.USE_DENSE_GAME_CAP
+                     else (cfg.LAUNCH_GAME_CAP - launch_paid)).clamp_min(0.0)
+        disp_cashout = torch.minimum(disp_cashout, cash_room)
         launchR = launchR + disp_cashout
         Ot = (Ot + disp_cashout) / cfg.PPO_REWARD_SCALE
     else:
@@ -440,9 +501,12 @@ def collect_ppo(cfg, env, net, world_pool, cursor, rng, seats, n_players=2, n_en
         "valid_per_step": (valid_sum.sum().item() / step_total) if step_total > 0 else 0.0,
         "transitions": tb["n"],
         "r_outcome": r_outcome_log,
-        "r_capture": captureR.mean().item(),      # = ship-margin shaping when USE_POTENTIAL_SHAPING
+        "r_capture": captureR.mean().item(),      # legacy capture channel (0 under pure shaping)
         "r_launch": launchR.mean().item(),
-        "r_milestone": prodMR.mean().item(),      # = production-share shaping when USE_POTENTIAL_SHAPING
+        "r_milestone": prodMR.mean().item(),      # legacy prod-milestone channel (0 under pure shaping)
+        "r_shape": shapeR.mean().item(),          # integrated potential shaping (ship-margin + prod-share)
+        "r_alive": aliveR.mean().item(),          # v13: integrated per-step survival reward
+        "r_win_bet": r_win_bet_log,               # one-sided confident-win bet reward (0 unless AUX_WIN_BET_REWARD)
         # advantage-health diagnostics (anti-collapse proof): the FINAL advantage fed to the surrogate.
         # The legacy per-group-std path can explode on near-degenerate groups; rank/Dr.GRPO stay bounded.
         "adv_absmax": float(tb["advantage"].abs().max().item()) if tb["n"] > 0 else 0.0,

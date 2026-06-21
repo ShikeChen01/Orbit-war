@@ -42,6 +42,7 @@ from .policy import _make_dist, act
 _SNAP_ATTRS = (
     "p_alive", "p_owner", "p_x", "p_y", "p_radius", "p_ships", "p_prod", "p_is_comet",
     "p_init_x", "p_init_y", "p_rotates", "p_comet_vx", "p_comet_vy",
+    "p_x_prev", "p_y_prev", "p_x_prev2", "p_y_prev2",   # motion history -> finite-diff velocity/curvature (v13)
     "f_alive", "f_owner", "f_x", "f_y", "f_angle", "f_ships", "f_seq",
     "ang_vel", "step_ct", "done", "c_slot",
 )

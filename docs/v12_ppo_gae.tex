@@ -212,6 +212,29 @@ $b=\operatorname{sign}(2p-1)$, so it elicits the \emph{sign} of the win-probabil
 $p$. That is fine for a representation aux (it forces confident win/loss discrimination); use a
 log/Brier rule if calibrated probabilities are wanted. See memory \cd{v12-aux-win-bet-head}.
 
+\subsection{One-sided win-bet \emph{reward} (\texttt{AUX\_WIN\_BET\_REWARD})}
+Optionally the bet is promoted from a pure representation aux to an actual per-step \emph{reward} fed
+into the advantage, to \emph{shape behaviour} (not just the representation). It must be \emph{one-sided}.
+Folding the symmetric payoff $b_t z$ into the return is a passivity trap: in a game it is going to lose
+($z=-1$) the policy collects $(-1)(-1)=+1$ per step for confidently betting on its own loss, so the
+cheapest way to maximize the channel is to \emph{throw the game early and bet against itself} --- the
+documented passivity ratchet (memories \cd{orbit-wars-policy-failure-diagnosis},
+\cd{grpo-anticollapse-v12}). Rectifying to the winning side removes that gradient entirely. The added
+per-step reward is
+\[
+  r^{\text{bet}}_t \;=\; \cd{AUX_WIN_BET_REWARD_COEF}\cdot \operatorname{relu}\!\big(\tanh \hat r_t\big)\cdot \max(z,0),
+\]
+i.e.\ it pays for \emph{confident wins} and \emph{exactly zero} on a draw/loss. The bet is
+\emph{detached} when used as a reward (it is a reward, not a loss --- the head is still trained as a
+calibrated bet by \cd{AUX_WIN_BET}); $z$ is known only at termination, so the rectified reward is added
+to every live step's reward once the rollout's outcome is resolved (\cd{collect_ppo}), in raw units
+divided by \cd{PPO_REWARD_SCALE} like the other dense channels. Because it lives in the reward stream it
+flows through PPO+GAE and the per-step GRPO / \cd{ALGO="mc"} returns alike (bypassed only under
+\cd{GRPO_OUTCOME_ONLY}, which scores the terminal payoff only). It \textbf{requires}
+\cd{AUX_WIN_BET=True} (\cd{Config.create} raises otherwise) and is reported as the \cd{wb} channel in the
+\cd{R[o c p ln wb]} heartbeat. Default off. Keep the coefficient modest (the default $0.5$ raw integrates
+to $\sim$75 over a won game, $\ll$ \cd{WIN_BONUS} $=1000$) so the terminal W/L still dominates.
+
 %==================================================================================================
 \section{Config-knob map}
 \begin{center}
@@ -238,6 +261,8 @@ field & default & controls \\
 \cd{AUX_REWARD_COEF}   & 0.25  & aux reward-MSE weight \\
 \cd{AUX_WIN_BET}       & False & build/train the win-bet head (maximize $b\cdot z$; precedence over reward-pred) \\
 \cd{AUX_WIN_BET_COEF}  & 0.25  & win-bet aux weight \\
+\cd{AUX_WIN_BET_REWARD}& False & one-sided confident-win bet reward into the advantage (needs \cd{AUX_WIN_BET}) \\
+\cd{AUX_WIN_BET_REWARD_COEF}& 0.5 & raw per-step weight of $\operatorname{relu}(b_t)\max(z,0)$ (pre \cd{PPO_REWARD_SCALE}) \\
 \bottomrule
 \end{tabular}
 \end{center}

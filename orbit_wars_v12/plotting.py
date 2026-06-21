@@ -41,7 +41,10 @@ def plot_training_health(hist, show=True, save_path=None):
     _panel(ax[2, 3], "share_4p", "share of 4p iterations", pct=True)
     _panel(ax[2, 0], "lnch_per_step", "launches / step")
     _panel(ax[2, 1], "r_outcome", "reward: outcome channel")
-    for k, c in (("r_capture", "tab:green"), ("r_launch", "tab:orange"), ("r_milestone", "tab:purple")):
+    for k, c in (("r_capture", "tab:green"), ("r_launch", "tab:orange"), ("r_milestone", "tab:purple"),
+                 ("r_alive", "tab:blue"), ("r_win_bet", "tab:red")):
+        if not hist.get(k) or not any(hist[k]):   # skip channels that are absent (old hist) or all-zero (feature off)
+            continue
         ax[2, 2].plot(it, hist[k], color=c, alpha=0.20, lw=0.8)
         ax[2, 2].plot(it, _ema(hist[k]), color=c, lw=1.6, label=k.replace("r_", ""))
     ax[2, 2].set_title("reward: dense channels"); ax[2, 2].grid(alpha=0.3, lw=0.5); ax[2, 2].legend(fontsize=7)

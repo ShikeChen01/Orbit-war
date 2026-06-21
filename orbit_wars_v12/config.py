@@ -114,6 +114,17 @@ class Config:
     # precedence). Default OFF; flag persisted in the ckpt blob so league members rebuild correctly.
     AUX_WIN_BET: bool = False        # build + train the win-bet head (maximize bet*outcome; ppo_update only)
     AUX_WIN_BET_COEF: float = 0.25   # weight of the win-bet aux loss (shared-trunk regularizer)
+    # ---- ONE-SIDED win-bet REWARD (behaviour shaping; PPO + GRPO + mc) --------------------------
+    # Optionally promote the bet from a pure representation aux to an actual per-step REWARD fed into
+    # the advantage -- but ONE-SIDED: pay coef * relu(tanh(bet)) * max(z,0). It rewards CONFIDENT WINS
+    # and pays EXACTLY ZERO on a draw/loss. The two-sided bet*z reward is a passivity trap (it pays
+    # coef/step for confidently LOSING -> the policy learns to bet against itself and throw games, the
+    # documented passivity ratchet); rectifying to the winning side removes that gradient entirely. The
+    # bet is DETACHED into the reward (no grad through it); the head is still trained as a calibrated bet
+    # by the AUX_WIN_BET loss above. REQUIRES AUX_WIN_BET=True. Default OFF; flows through PPO+GAE and the
+    # per-step GRPO/mc returns (bypassed only under GRPO_OUTCOME_ONLY, which keeps the terminal payoff).
+    AUX_WIN_BET_REWARD: bool = False     # add the one-sided confident-win bet reward into the advantage
+    AUX_WIN_BET_REWARD_COEF: float = 0.5 # raw per-step weight (pre PPO_REWARD_SCALE); ~0.5 -> ~75 raw over a won game (<<WIN_BONUS 1000)
 
     # ---- GRPO (group-relative PO; critic-free alternative to PPO+GAE) -----------------------
     # ALGO selects the optimizer at rollout+update time. "grpo" rolls each world out GRPO_GROUP
@@ -222,11 +233,39 @@ class Config:
     LAUNCH_GAME_CAP: float = 30.0
 
     # ---- reward (v5; docs/set-ups/1.md) ----------------------------------------------------
-    WIN_BONUS: float = 1000.0
-    LOSS_PENALTY: float = 1000.0
+    # v13: terminal W/L halved to +-500 and the residual ~500 of outcome magnitude is moved into a
+    # DENSE per-step survival reward (ALIVE_REWARD below) -- every alive step pays, so credit is spread
+    # across the trajectory instead of one sparse +-1000 spike at the end (easier value learning / lower
+    # return variance). NOTE this is a survival bonus, NOT Ng et al. potential shaping (it is not
+    # policy-invariant): it rewards staying alive, so watch lnch/st for a passivity drift.
+    WIN_BONUS: float = 500.0
+    LOSS_PENALTY: float = 500.0
+    ALIVE_REWARD: float = 2.0      # raw reward per step the ego is alive (pre-PPO_REWARD_SCALE); ~2*len over a game
     WIN_DECAY: float = 1.0
     LOSS_DECAY: float = 0.9995     # asymmetric "lose-slower": a late loss is penalized slightly less than an
     #                                early one (a survival incentive); winning is undecayed (WIN_DECAY=1.0)
+    # ---- v13 submission: WIN POOL terminal + dense shared cap (all default OFF -> legacy unchanged) ----
+    # USE_WIN_POOL recasts the win side as a FIXED POOL of WIN_POOL raw reward: the ego draws ALIVE_REWARD
+    # per alive step (the survival drip) and, on a WIN, collects the REST of the pool (WIN_POOL -
+    # ALIVE_REWARD*len, clamped >=0). So a won game pays EXACTLY WIN_POOL total regardless of length -- the
+    # drip just spreads it across the trajectory for credit assignment (discounting still rewards winning
+    # FAST: the big remainder arrives earlier = less discounted). On a NON-win the drip is CLAWED BACK at
+    # terminal so a long-surviving loss can't net positive (the passivity ratchet): a loser nets exactly
+    # -decayed(LOSS_PENALTY). Replaces WIN_DECAY^len * WIN_BONUS for the win side ONLY; the loss side keeps
+    # LOSS_DECAY^len_eff * LOSS_PENALTY. Pair with LOSS_PENALTY=1000 for the documented 1200/-1000 design.
+    USE_WIN_POOL: bool = False
+    WIN_POOL: float = 1200.0       # total raw win reward (drip + terminal remainder); >= ALIVE_REWARD*max_len
+    # USE_DENSE_GAME_CAP applies ONE shared hard cap (DENSE_GAME_CAP raw) to the SUM of the legacy dense
+    # channels over a game -- capture + prod-milestone + launch share it (their per-step ratio is preserved
+    # when the cap binds). Supersedes the launch-only LAUNCH_GAME_CAP as the binding ceiling. Keeps the small
+    # shaped channels from ever rivalling the +-WIN_POOL/LOSS_PENALTY terminal outcome.
+    USE_DENSE_GAME_CAP: bool = False
+    DENSE_GAME_CAP: float = 250.0  # shared game cap (raw) on capture + prod-milestone + launch combined
+    # DENSE_WITH_SHAPING lets the legacy dense channels (capture/prod-milestone/launch) COEXIST with Ng et al.
+    # potential shaping instead of being replaced by it: when USE_POTENTIAL_SHAPING=True AND this is True,
+    # BOTH are summed into the per-step reward (shaping is policy-invariant + telescoping, so it is NOT inside
+    # the DENSE_GAME_CAP). WARNING: ship-margin shaping overlaps the capture channel -- watch for double-count.
+    DENSE_WITH_SHAPING: bool = False
     DECAY_START_STEP: float = 100.0
     CAPTURE_REWARD: float = 30.0
     CAPTURE_LOSS_FRAC: float = 0.9
@@ -373,6 +412,8 @@ class Config:
         unknown = set(vals) - valid
         if unknown:
             raise TypeError("unknown Config fields: %s" % ", ".join(sorted(unknown)))
+        if vals.get("AUX_WIN_BET_REWARD") and not vals.get("AUX_WIN_BET"):
+            raise ValueError("AUX_WIN_BET_REWARD requires AUX_WIN_BET=True (the bet head must be trained)")
         return cls(**vals)
 
     def replace(self, **changes) -> "Config":

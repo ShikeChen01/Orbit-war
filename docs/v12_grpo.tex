@@ -178,6 +178,10 @@ grad clip, single end-of-update host sync), with four differences:
   \item \textbf{aux head} (when \cd{AUX_WIN_BET} or \cd{AUX_REWARD_PRED}): the same shallow scalar head's
         win-bet ($-\,b_t z$, $b_t=\tanh$) or reward-prediction (MSE) loss as PPO (document~2) is added
         here too, so the critic-free path --- including \cd{ALGO="mc"} --- trains it (representation aux only).
+  \item \textbf{one-sided win-bet reward} (when \cd{AUX_WIN_BET_REWARD}, needs \cd{AUX_WIN_BET}): the
+        rectified bonus $\operatorname{relu}(b_t)\max(z,0)$ enters the \emph{reward} stream (document~2,
+        \S``One-sided win-bet reward''), so it shapes the per-step GRPO / \cd{mc} return like any reward
+        --- bypassed only under \cd{GRPO_OUTCOME_ONLY}, which scores the terminal payoff only.
 \end{itemize}
 
 %==================================================================================================

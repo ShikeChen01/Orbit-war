@@ -368,13 +368,15 @@ def _make_dist(cfg, net, ent, em, am, gl):
 
 
 @torch.no_grad()
-def act(cfg, net, ent, em, am, gl, greedy=False, crn_group=0):
-    dist, value, _ = _make_dist(cfg, net, ent, em, am, gl)   # reward_pred unused while ACTING (update only)
+def act(cfg, net, ent, em, am, gl, greedy=False, crn_group=0, want_rpred=False):
+    dist, value, rpred = _make_dist(cfg, net, ent, em, am, gl)   # rpred (bet logit) unused unless want_rpred
     # crn_group>1 couples the sampling noise across each contiguous block of crn_group envs (GRPO
     # common-random-numbers, docs/grpo_v12.tex [D]); 0 = independent draws (the default everywhere else).
     action = dist.greedy() if greedy else dist.sample(crn_group=crn_group)
     if cfg.USE_POPART and getattr(net, 'popart', None) is not None:
         value = net.popart.denormalize(value)
+    if want_rpred:   # AUX_WIN_BET_REWARD path: also surface the per-step bet logit (-> one-sided win reward in rollout)
+        return action, dist.log_prob(action), value, rpred
     return action, dist.log_prob(action), value
 
 
