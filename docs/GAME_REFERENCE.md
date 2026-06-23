@@ -88,7 +88,7 @@ Return a list of moves: `[[from_planet_id, direction_angle, num_ships], ...]`.
 ## How this maps to the code
 
 - Engine reward is `0` until the end, then `+1`/`-1`. `OrbitWarsEnv` adds a dense
-  score-margin reward for RL (see `docs/ARCHITECTURE.md`).
+  score-margin reward for RL (see `docs/archive/ARCHITECTURE.md`).
 - `EntityObservation` encodes planets/comets as entity rows with masks; fleets are
   summarized into per-planet "pressure" + global features.
 - `PerPlanetAction` maps a per-planet categorical to the `[from_id, angle, ships]` list.

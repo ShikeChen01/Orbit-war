@@ -1,0 +1,290 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+\usepackage{xcolor}
+
+\newcommand{\cd}[1]{\texttt{\detokenize{#1}}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\setlist{itemsep=2pt,topsep=3pt}
+
+\title{\textbf{Orbit Wars --- v12 GRPO}\\[3pt]
+\large The critic-free group-relative learner: the group rollout, the advantage-estimator family
+(mutually exclusive, with precedence), the clipped-surrogate update --- and the empirical verdict
+that the anti-collapse estimators \emph{failed} and legacy std-norm is the keeper}
+\author{Source of truth: \texttt{orbit\_wars\_v12/rollout.py}, \texttt{grpo.py}, \texttt{grpo\_diag.py}}
+\date{2026-06-19}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent This is document~3 of four. GRPO (\cd{cfg.ALGO="grpo"}) is a \emph{critic-free} PPO variant:
+it replaces the learned value baseline with a \textbf{group baseline} (several rollouts share one
+initial world; an advantage is the rollout's return relative to its group). It assumes document~1
+(\cd{v12_setup.tex}) for the game, rollout, encoding, action, and reward, and reuses PPO's clipped
+surrogate from document~2 verbatim. This document is precise about (i) how the group rollout is
+rendered, (ii) the family of advantage estimators and their \emph{mutually exclusive} precedence,
+(iii) the update. \textbf{It also records the empirical result that matters most}: every
+``anti-collapse'' estimator in that family caused passivity in controlled ablation, and the keeper
+is the \emph{legacy} per-group-std baseline with symmetric outcome decay.
+\end{abstract}
+
+\begin{center}
+\fcolorbox{red!55!black}{red!5}{\parbox{0.95\linewidth}{%
+\textbf{\textcolor{red!60!black}{EMPIRICAL VERDICT --- read before enabling any flag.}}
+The Tier~0--2 advantage-estimator family below (rank\,[C1], Dr.GRPO center-only\,[B], CVaR\,[C2],
+sibling\,[B1], phi-value\,[C], asymmetric clip\,[D3]) was built to stop a GRPO ``reward collapse.''
+Controlled 3070\,Ti ablations (\cd{scripts/_gpu_ab*.py}, shared init) show \textbf{the estimator
+changes ARE what cause the collapse}: all of them drive the agent into passivity, while the
+\textbf{keeper is the legacy default} --- \cd{GRPO_STD_NORM=True}, every estimator flag \emph{off},
+\cd{CLIP_HI=0} --- which stays stable and improving. \emph{Bounded $\ne$ good}: the rank bound held but discarded win-magnitude and stopped
+rewarding aggression. The shipped notebook \cd{setup1_v12_grpo_a100.ipynb} is reverted to the keeper.
+Details in Section~\ref{sec:verdict}.}}
+\end{center}
+
+\tableofcontents
+\bigskip
+
+%==================================================================================================
+\section{Why group-relative, and what changes vs PPO}
+PPO's critic estimates a per-state baseline $V(s)$; GRPO instead rolls each world out $G$ times and
+uses the \emph{within-group} return statistics as the baseline, so the world's intrinsic difficulty
+cancels without a learned value function. Concretely, versus \cd{ppo_update}:
+\begin{itemize}
+  \item \textbf{no value loss} --- the critic head is left untrained and unused (unless the
+        \cd{GRPO_AUX_VALUE} representation aux is on);
+  \item \textbf{no bootstrap} --- there is no critic to bootstrap from at the horizon;
+  \item \textbf{optional KL-to-reference} (DeepSeekMath $\beta=\cd{GRPO_KL_COEF}$) against a frozen
+        snapshot of the policy.
+\end{itemize}
+Everything else --- the gated-allocation actor, the clipped surrogate, entropy bonus, KL early-stop,
+grad clipping, the GPU stat accumulators --- is shared with PPO. PPO and GRPO checkpoints are
+interchangeable (the critic is simply dormant under GRPO). The advantage is precomputed in
+\cd{collect_ppo} and stored in \cd{tb["advantage"]}, exactly like PPO, so \cd{grpo_update} just
+consumes it.
+
+%==================================================================================================
+\section{The group rollout (\texttt{collect\_ppo}, GRPO branch)}
+When \cd{cfg.ALGO="grpo"}, the rollout tiles $n_W$ distinct worlds into contiguous groups of $G$
+envs (one group $=$ one world rolled out $G$ times), with $G=\cd{GRPO_GROUP}$ or \cd{GROUP_SIZE}
+(falling back to the whole batch if $B\bmod G\ne0$). Each group is assigned a \emph{single} seat
+geometry, cycling the seat rotations across groups so the ego still trains on every seat without
+breaking within-group homogeneity (which the baseline depends on). The per-group return is
+\[
+  R^e = \begin{cases}
+    O^e/\cd{PPO_REWARD_SCALE} & \cd{GRPO_OUTCOME_ONLY}\ \text{(terminal outcome only)},\\
+    \sum_t r^e_t\,\cd{alive}^e_t & \text{otherwise (the full shaped return)},
+  \end{cases}
+\]
+reshaped to $\R^{n_W\times G}$ as \cd{Rg}. \textbf{[D] \cd{GRPO_CRN}} optionally shares the
+\emph{opponent's} sampling noise across the $G$ rollouts of a group (common random numbers; the ego
+keeps independent noise) so the group baseline isolates ego-action variance.
+
+%==================================================================================================
+\section{The advantage-estimator family}\label{sec:family}
+The single most important structural fact: \textbf{the advantage estimators are mutually exclusive}.
+Turning several on does \emph{not} stack them --- the code silently selects exactly one by
+precedence. \cd{grpo_adv_mode(cfg,n_players)} resolves the active estimator and the
+enabled-but-ignored ones, and \cd{train.py} prints the active choice at start with a loud warning
+listing any ignored estimators. The precedence is
+\[
+  \text{phi-value\,[C]} \succ \text{sibling\,[B1]} \succ \text{analytic\,[A]\,(2p)}
+  \succ \text{rank\,[C1]} \succ \text{CVaR\,[C2]} \succ \text{center/std\,[B]}.
+\]
+This footgun is exactly why an ``all flags on'' run collapses on an \emph{un-validated} per-step path
+(it runs sibling or phi-value, never rank). Orthogonal levers (next subsection) \emph{do} compose.
+
+\subsection{The flat estimators (\texttt{grpo\_flat\_advantage})}
+One scalar advantage per rollout, broadcast over its steps. With $R^e$ as above:
+\begin{itemize}
+  \item \textbf{[B] legacy / Dr.GRPO / RLOO (the default ladder).} Centre on the group mean
+        $\mu=\frac1G\sum_g R_g$ (or the leave-one-out mean if \cd{GRPO_LOO}). Then
+        \cd{GRPO_STD_NORM=True} (default) divides by the per-group std,
+        $A=(R-\mu)/(\sigma_g+\cd{GRPO_ADV_EPS})$; \cd{GRPO_STD_NORM=False} is Dr.GRPO --- centre-only
+        with \emph{one global} scale (removes the cross-group difficulty-inversion bias of std-norm).
+  \item \textbf{[A] analytic 2p binary} (\cd{GRPO_ANALYTIC_ADV}, 2p only). At a Beta-shrunk win-rate
+        $\hat p=(\#\text{wins}+\alpha_0)/(G+2\alpha_0)$, the closed-form standardized advantage of a
+        binary outcome: $A=\text{win}\,\sqrt{(1{-}\hat p)/\hat p}-\text{loss}\,\sqrt{\hat p/(1{-}\hat p)}$.
+        \emph{Not} anti-collapse --- it has the same unbounded $\sqrt{(1{-}p)/p}$ as a rare win.
+  \item \textbf{[C1] rank} (\cd{GRPO_RANK_ADV}). Van der Waerden / NES average-rank score: with
+        average rank $\in[0,G{-}1]$, $A=(\text{rank}-\frac{G-1}{2})/\sqrt{(G^2-1)/12}$, bounded in
+        $[-\sqrt3,\sqrt3]$ and invariant to every reward-magnitude knob.
+  \item \textbf{[C2] CVaR} (\cd{GRPO_CVAR_ALPHA}$>0$). Risk-sensitive: baseline on the worst-$\alpha$
+        tail quantile, with extra gradient weight \cd{GRPO_CVAR_LAMBDA} on the tail rollouts.
+\end{itemize}
+$[A]$, $[C1]$, and $[B]$-with-std are already $\sim$unit-variance and are passed through unscaled;
+$[B]$-center-only and $[C2]$ get one global scale (or \cd{ADV_TARGET_RMS}, below).
+
+\subsection{The per-step estimators (critic-free GAE)}
+\begin{itemize}
+  \item \textbf{[B1] sibling} (\cd{GRPO_SIBLING_BASELINE}, \cd{_grpo_sibling_advantage}). The $G$
+        shared-root rollouts of a group are bucketed by quantized $\Phi_{\text{ship}}(s_t)$ at each
+        step; the matched-bucket mean terminal return is a per-step value $\hat V(s_t)$ (whole-group
+        mean when a bucket is thinner than \cd{GRPO_SIBLING_MIN_PEERS}); then GAE$(\gamma,\lambda)$ on
+        the per-step reward. A VinePPO-style per-step credit with no critic.
+  \item \textbf{[C] phi-value} (\cd{GRPO_PHI_VALUE}, needs \cd{USE_POTENTIAL_SHAPING}). Build a value
+        $\hat V(s_t)=\mu_g+a\,(\Phi(s_t)-\Phi(s_0))$ where $\mu_g$ is the group (or LOO) baseline and
+        $a$ is the OLS slope of the outcome on the terminal $\Delta\Phi$, clamped to
+        $[0,\cd{GRPO_PHI_A_MAX}]$; then GAE on the per-step reward. Here $\Phi$ is moved \emph{out} of
+        the reward (\cd{dense_t}$=0$) and \emph{into} the value, turning shaping (which the group mean
+        would cancel) into a per-step baseline.
+\end{itemize}
+
+\subsection{Orthogonal levers (these compose)}
+\begin{center}
+\begin{tabular}{@{}llL{0.52\linewidth}@{}}
+\toprule
+flag & tag & effect \\
+\midrule
+\cd{CLIP_HI}            & D3 & asymmetric upper clip in the shared surrogate (anti-passivity) \\
+\cd{RATIO_LENGTHNORM}   & D1 & GSPO geometric-mean ratio (\,/\#owned) \\
+\cd{GRPO_RB_GATE}       & A1 & Rao-Blackwellize the WHERE term over the launch Bernoulli (de-noise) \\
+\cd{ADV_TARGET_RMS}     & D4 & pin the (center-only) advantage RMS so league difficulty can't drift the effective LR \\
+\cd{GRPO_OPP_BASELINE_W}& E1 & subtract the Elo-expected outcome vs this foe (a no-op under one-opponent-per-iter centering) \\
+\cd{GRPO_AUX_VALUE}     & B2 & train the dormant value head by MC regression as a representation aux (not in the advantage) \\
+\cd{GRPO_LOO}           & --- & leave-one-out group mean (RLOO) \\
+\cd{GRPO_KL_COEF}       & --- & KL-to-reference penalty $\beta$ \\
+\cd{GRPO_CRN}           & D  & common-random-numbers opponent coupling \\
+\bottomrule
+\end{tabular}
+\end{center}
+\noindent\textbf{[E2] \cd{GRPO_OPP_STRATA}} is reserved (not wired): it would sample several opponents
+per iteration so the baseline averages opponent strength, at which point E1 stops being a no-op.
+
+%==================================================================================================
+\section{The update (\texttt{grpo\_update})}
+\cd{grpo_update} runs the same \cd{UPDATE_EPOCHS}$\times$\cd{MINIBATCHES} clipped-surrogate passes as
+PPO (document~2: the ratio, \cd{CLIP}/\cd{CLIP_HI}, per-owned-source entropy bonus, k3 KL early-stop,
+grad clip, single end-of-update host sync), with four differences:
+\begin{itemize}
+  \item \textbf{no value loss}: $L=L^{\text{pol}}-\cd{ent_coef}\,\bar H$ (the policy is always at full
+        weight --- \cd{policy_coef} is accepted for call-site parity but there is no critic to warm up);
+  \item \textbf{KL-to-reference} (when \cd{GRPO_KL_COEF}$>0$ and a frozen \cd{ref_net} exists):
+        $+\beta\,\widehat{\mathrm{KL}}(\pi\Vert\pi_{\text{ref}})$ with the unbiased k3 estimator,
+        gradient flowing through $\log\pi$. It is logged in the \cd{vf} slot (no critic) so the
+        heartbeat prints unchanged;
+  \item \textbf{[B2] aux value} (when \cd{GRPO_AUX_VALUE}): an MSE of the (otherwise unused) value head
+        to the MC return, weighted by \cd{GRPO_AUX_COEF}, as a shared-trunk regularizer --- it does
+        \emph{not} enter the critic-free advantage and keeps the weights PPO-compatible.
+  \item \textbf{aux head} (when \cd{AUX_WIN_BET} or \cd{AUX_REWARD_PRED}): the same shallow scalar head's
+        win-bet ($-\,b_t z$, $b_t=\tanh$) or reward-prediction (MSE) loss as PPO (document~2) is added
+        here too, so the critic-free path --- including \cd{ALGO="mc"} --- trains it (representation aux only).
+  \item \textbf{one-sided win-bet reward} (when \cd{AUX_WIN_BET_REWARD}, needs \cd{AUX_WIN_BET}): the
+        rectified bonus $\operatorname{relu}(b_t)\max(z,0)$ enters the \emph{reward} stream (document~2,
+        \S``One-sided win-bet reward''), so it shapes the per-step GRPO / \cd{mc} return like any reward
+        --- bypassed only under \cd{GRPO_OUTCOME_ONLY}, which scores the terminal payoff only.
+\end{itemize}
+
+%==================================================================================================
+\section{Empirical verdict: the estimators failed; legacy is the keeper}\label{sec:verdict}
+\paragraph{The original symptom.} Legacy GRPO (\cd{GRPO_STD_NORM=True}) was observed to death-spiral
+in self-play (\cd{it426}$\to$\cd{it526}: launch/step $0.88\to0.37$, learner elo2 $2124\to1772$,
+losing to its own earlier snapshot and to the \cd{greedy} watchdog). The advantage-bound probe
+(\cd{grpo_diag.advantage_bound_probe}) showed that as the snapshot pool strengthens, the learner
+faces \emph{lopsided losing groups} where a rare win's per-group-std advantage is
+$\sqrt{(1{-}p)/p}$ --- unbounded as $p\to0$. The hypothesis was that the policy chases those lucky
+wins into a passivity ratchet, and that a \emph{bounded, scale-invariant} estimator (rank) would fix
+it.
+
+\paragraph{The controlled result.} Three matched 3070\,Ti A/Bs (\cd{scripts/_gpu_ab_anticollapse.py},
+\cd{_gpu_ab2.py}, \cd{_gpu_ab3.py}; h256 trunk, BC-warm, 2p, 100 iters, shared init/seed) reversed the
+hypothesis:
+\begin{center}
+\begin{tabular}{@{}lccL{0.30\linewidth}@{}}
+\toprule
+config & launch/step & elo2 & verdict \\
+\midrule
+\textbf{legacy std-norm} & $0.70\to0.59$ & $1497\to\mathbf{1576}$ & \textbf{stable / improving} \\
+rank\,[C1] $+$ clip (the shipped default!) & $0.53\to0.10$ & $\to1259$ & passivity collapse \\
+rank-noclip                                & $0.48\to0.27$ & $\to1292$ & passivity \\
+Dr.GRPO\,[B] center-only                   & $0.57\to0.34$ & $\to1370$ & passivity \\
+Dr.GRPO $+$ clip-hi                        & $0.46\to0.03$ & $\to1274$ & worst \\
+sibling\,[B1] (an ``all-on'' path)         & $0.57\to0.24$ & $\to1295$ & passivity ($|A|_{\max}\,16$) \\
+phi-value\,[C] (the other ``all-on'' path) & $0.59\to0.31$ & $\to1358$ & passivity ($|A|_{\max}\,22$) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{The cause, and a footgun.}
+\begin{enumerate}
+  \item \textbf{The collapse is the estimator change itself.} Every Tier~0--2 estimator (rank, with or
+        without clip; Dr.GRPO center-only; sibling; phi-value) drives launch-rate and Elo down, while
+        the legacy per-group std-norm baseline is stable and improving on the SAME shared init. The
+        reward decay is \emph{not} a factor: an earlier hypothesis that an asymmetric ``lose-slower''
+        decay triggered the collapse did not hold up.
+  \item \textbf{The ``all flags on'' A100 collapse was also a precedence footgun.} With every flag on,
+        \cd{grpo_adv_mode} selects sibling\,[B1] or phi-value\,[C] --- never rank --- and those
+        per-step paths both go passive \emph{and} throw heavy-tailed advantages ($|A|_{\max}$ 16--22).
+        The guard (active-estimator log $+$ ignored-estimator warning) was added so this is visible.
+\end{enumerate}
+
+\paragraph{Why ``bounded $\ne$ good''.} The $\sqrt3$ rank bound held exactly --- but a rank advantage
+discards win \emph{magnitude}, so it stops rewarding decisive aggression and settles into the
+passivity basin (the project's oldest failure mode). The std-norm rare-win amplification the probe
+flagged is double-edged: it is also what \emph{keeps} the agent aggressive. Removing the amplifier
+removed the aggression.
+
+\paragraph{The keeper, and the real next lever.} Train GRPO with
+\[
+  \boxed{\;\cd{GRPO_STD_NORM=True},\ \text{every estimator flag off},\ \cd{CLIP_HI=0}\;}
+\]
+If the \cd{it426}-style spiral recurs under the keeper, the evidence points to a
+\textbf{trust-region / entropy} lever (KL-to-reference \cd{GRPO_KL_COEF}$>0$, or an entropy floor) on
+top of legacy std-norm --- \emph{not} an advantage-estimator swap. The meta-lesson, now in the
+project memory (\cd{grpo-anticollapse-v12}): a deterministic proof of a \emph{property}
+(boundedness) is not a proof of \emph{improving the objective}; always local-ablate on the 3070\,Ti
+before spending A100 time.
+
+\paragraph{Diagnostic harness.} \cd{grpo_diag.py} holds \cd{advantage_bound_probe} (deterministic CPU
+bound $+$ difficulty-inversion check), \cd{run_anticollapse_compare} (the 3-arm A/B, with
+\cd{resume_from} to reproduce the real spiral on GPU), and \cd{plot_anticollapse}. The
+\cd{ANTICOLLAPSE} / \cd{DRGRPO_BUNDLE} dicts in that module are a \emph{research harness that
+empirically failed}, not a recommended configuration. The rollout exposes \cd{adv_absmax} /
+\cd{adv_std} (and an \cd{aMx} heartbeat field) so a heavy-tailed advantage is visible live.
+
+%==================================================================================================
+\section{Config-knob map}
+Estimator flags (mutually exclusive; \textbf{all default off $=$ the keeper}):
+\begin{center}
+\begin{tabular}{@{}llL{0.50\linewidth}@{}}
+\toprule
+field & default & estimator \\
+\midrule
+\cd{GRPO_STD_NORM}        & True  & [B] per-group std-norm (keeper; False $=$ Dr.GRPO center-only) \\
+\cd{GRPO_ANALYTIC_ADV}    & False & [A] 2p closed-form (not anti-collapse) \\
+\cd{GRPO_RANK_ADV}        & False & [C1] bounded average-rank --- \emph{went passive} \\
+\cd{GRPO_CVAR_ALPHA}      & 0.0   & [C2] worst-$\alpha$ tail baseline \\
+\cd{GRPO_SIBLING_BASELINE}& False & [B1] per-step matched-prefix sibling GAE \\
+\cd{GRPO_PHI_VALUE}       & False & [C] $\Phi$-as-value per-step GAE \\
+\bottomrule
+\end{tabular}
+\end{center}
+Group / orthogonal knobs:
+\begin{center}
+\begin{tabular}{@{}llL{0.50\linewidth}@{}}
+\toprule
+field & default & controls \\
+\midrule
+\cd{ALGO}            & \texttt{"ppo"} & set to \texttt{"grpo"} to select this learner \\
+\cd{GRPO_GROUP}      & 0 (=\cd{GROUP_SIZE}) & rollouts sharing one world \\
+\cd{GRPO_OUTCOME_ONLY}& False & baseline on the terminal outcome only \\
+\cd{GRPO_LOO}        & False & leave-one-out group mean (RLOO) \\
+\cd{GRPO_KL_COEF}    & 0.0   & KL-to-reference $\beta$ (the recommended next lever) \\
+\cd{GRPO_AUX_VALUE}  & False & [B2] value-head MC-regression representation aux \\
+\cd{ADV_TARGET_RMS}  & 0.0   & [D4] pin the advantage RMS \\
+\cd{CLIP_HI}         & 0.0   & [D3] asymmetric upper clip (keeper $=0$) \\
+\cd{GRPO_CRN}        & False & [D] common-random-numbers opponent coupling \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\end{document}

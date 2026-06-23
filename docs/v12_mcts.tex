@@ -1,0 +1,188 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+\usepackage{xcolor}
+
+\newcommand{\cd}[1]{\texttt{\detokenize{#1}}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\setlist{itemsep=2pt,topsep=3pt}
+
+\title{\textbf{Orbit Wars --- v12 MCTS}\\[3pt]
+\large An AlphaZero-style PUCT search over the bit-exact forward model: net prior on sampled
+candidate moves, bounded leaf value, snapshot/restore expansion, and a step-scheduled deploy time
+budget --- a proof of concept, \emph{not} wired into training}
+\author{Source of truth: \texttt{orbit\_wars\_v12/mcts.py}}
+\date{2026-06-19}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent This is document~4 of four. It documents \cd{mcts.py}: a Monte-Carlo Tree Search that uses
+the document~1 network as a \emph{prior over sampled candidate actions} and a bounded \emph{leaf
+value}, so a (small) policy can spend inference compute to play better and so search visit
+distributions can later serve as policy-improvement targets. It reuses document~1's \cd{GpuEnv},
+observation encoding, and gated-allocation action verbatim; it does \emph{not} use the reward
+(document~1) or the league --- it scores leaves with a heuristic and plays a fixed scripted opponent.
+\textbf{This is an explicit proof of concept}: the search plumbing is verified, but it is over the
+deploy time budget and a small searched net still loses the head-to-head; the intended payoff is a
+BC-warm-started self-play distillation loop, which is future work. Status is in
+Section~\ref{sec:status}.
+\end{abstract}
+
+\tableofcontents
+\bigskip
+
+%==================================================================================================
+\section{Scope and simplifications}
+The v12 stack already provides everything AlphaZero needs except the search: a bit-exact, fast
+forward model (\cd{GpuEnv}) and a net with a prior $+$ value head. \cd{mcts.py} adds the search, under
+three deliberate simplifications:
+\begin{itemize}
+  \item \textbf{Fixed deterministic opponent} (\cd{opponent_action} codes). With the opponent fixed,
+        the game is a deterministic \emph{single-agent} MDP from the ego's view, so plain PUCT is
+        sound --- the simultaneous-move subtlety is dodged on purpose. The real self-play fix
+        (decoupled-UCT / regret matching per node, 2p zero-sum first) is deferred until there is a
+        BC-warm-started net to self-play.
+  \item \textbf{Single env} ($B=1$). A node stores a full state snapshot; expansion restores it into
+        one shared work env and steps once. Batched-across-games search is a later optimization.
+  \item \textbf{Bounded heuristic leaf value} by default (\cd{value="net"} uses the value head
+        instead). The PPO critic is policy-biased and historically lost to exactly this heuristic for
+        leaf eval; an AlphaZero loop is what would later de-bias the head.
+\end{itemize}
+\textbf{Determinism} (required for correct snapshot/restore and reproducible search) holds with
+official comets (waypoint playback, no \cd{torch.rand}) and a deterministic scripted opponent (codes
+1/3/4/5; avoid 0$=$random). Candidate ego actions are sampled once and stored on the node, so the
+transitions never re-sample.
+
+%==================================================================================================
+\section{Snapshot and restore}
+A node owns a snapshot: \cd{snapshot_env} clones the mutable \cd{GpuEnv} state (the planet/fleet
+tensors, \cd{ang_vel}, \cd{step_ct}, \cd{done}, and the comet \cd{c_slot}) into a plain dict;
+\cd{restore_env} writes it back, \emph{re-cloning on the way in} so the in-place \cd{env_step} writes
+of a simulation never corrupt the stored snapshot. The static official-comet arrays
+(\cd{c_paths}/\cd{c_len}/\cd{c_ships}) are read-only during stepping and are shared by reference
+(bound once on the work env), so only \cd{c_slot} is cloned.
+
+%==================================================================================================
+\section{Node, candidates, and the prior}
+A \cd{_Node} stores its state snapshot plus $K$ candidate edges with prior $P$, visit counts $N$,
+and value sums $W$ (all on CPU --- the per-node bookkeeping is tiny and per-sim \cd{.item()} syncs
+would otherwise dominate).
+
+\paragraph{Candidates (one net forward).} \cd{_candidates} builds the $K$ candidate full-turn actions
+as the policy-greedy move (index~0, a safe fallback) plus $K{-}1$ samples. Crucially, all $K$ share
+an \emph{identical} observation, so the policy distribution is built \emph{once} (one trunk$+$heads
+forward via \cd{_make_dist}) and sampled $K$ times; the prior is
+\[
+  P = \mathrm{softmax}\big(\log\pi(a_1),\ldots,\log\pi(a_K)\big),
+\]
+the softmax of the candidates' own policy log-probs. (Re-running \cd{act} per candidate --- the naive
+version --- would cost $K\times$ the entire search budget for a distributionally identical result;
+this dedup is what makes it a real search instead of a depth-1 stub.)
+
+%==================================================================================================
+\section{Selection, expansion, backup}
+\paragraph{PUCT selection.} At a node, with total visits $N_{\text{tot}}=\sum_a N_a$,
+\[
+  a^\star=\arg\max_a\ \Big[\,Q_a + c_{\text{puct}}\,P_a\,\frac{\sqrt{N_{\text{tot}}}}{1+N_a}\,\Big],
+  \qquad
+  Q_a=\begin{cases}W_a/N_a & N_a>0\\ 0.5 & \text{(first-play urgency)}\end{cases}
+\]
+with $c_{\text{puct}}=\cd{c_puct}$ (default 1.5). Unvisited edges get a neutral FPU of 0.5.
+
+\paragraph{Expansion (\texttt{\_expand\_child}).} Restore the node's snapshot into the work env, apply
+the chosen edge --- ego candidate $+$ scripted opponent --- with one \cd{env_step}, and \cd{settle}.
+The child is \emph{terminal} if either side died or the horizon is reached, with terminal value
+\[
+  v=\begin{cases}1 & \text{ego alive, opponent dead}\\ 0 & \text{ego dead, opponent alive}\\
+  0.5 & \text{both dead}\\ \mathbf{1}[s_0>s_1]+\tfrac12\mathbf{1}[s_0=s_1] & \text{horizon, by strength}\end{cases}
+\]
+otherwise it is a fresh leaf whose value is the bounded leaf estimate and which stores its own
+snapshot $+$ candidates.
+
+\paragraph{Leaf value.} \cd{value="heuristic"} (default): a logistic of the ego's strength margin
+against all opponents pooled,
+\[
+  v=\sigma\!\Big(\tfrac{1}{\cd{VALUE_SCALE}}\big[(\text{ships}+\text{fleet}+\cd{PROD_WEIGHT}\cdot\text{prod})_{\text{ego}}
+  -(\cdots)_{\text{opp}}\big]\Big)\in[0,1],
+\]
+with $\cd{PROD_WEIGHT}=20$ (1 production $\approx$ 20 ships of long-run value) and
+$\cd{VALUE_SCALE}=200$; this matches \cd{settle_n}'s accounting. \cd{value="net"} instead reads the
+value head, $\sigma(V/\cd{VALUE_SCALE})$.
+
+\paragraph{Backup.} The leaf value is propagated up the visited path: $N_a\mathrel{+}=1$,
+$W_a\mathrel{+}=v$ for each $(node,a)$ on the path. (Single-agent: the opponent is baked into the
+transition, so the value is not negated between plies.)
+
+\paragraph{Search loop (\texttt{mcts\_search}).} Up to \cd{n_sims} PUCT simulations from the root,
+descending by selection until an unexpanded edge (expand) or a terminal child, then backing up.
+A \cd{time_budget} (seconds) stops early --- the most-visited edge so far is always a safe answer
+(greedy is edge~0). It returns the most-visited root action plus stats (\cd{visits},
+\cd{sims_run}, \cd{best_idx}, \cd{switched} $=$ search preferred a non-greedy move, \cd{root_q},
+\cd{visit_entropy}, \cd{elapsed}).
+
+%==================================================================================================
+\section{Deploy agent (\texttt{MctsAgent})}
+\cd{MctsAgent} plays seat~0 with the most-visited move under a \textbf{step-scheduled wall-clock
+budget}. \cd{schedule} is a tuple of \cd{(until_step, phase_seconds)}; the per-turn budget inside a
+phase is $\text{phase\_seconds}/\text{phase\_length}$. The default
+\[
+  \cd{DEFAULT_SCHEDULE}=((20,30.0),(60,20.0),(80,5.0))
+\]
+spends $1.5/0.5/0.25$\,s per turn over steps $0$--$20$ / $20$--$60$ / $60$--$80$, i.e.\ the per-game
+compute bank is front-loaded into the opening (where the game is decided) and tapers to greedy:
+$30+20+5=55$\,s of a $\cd{bank_s}=60$\,s bank, leaving a $\cd{reserve_s}=5$\,s \emph{untouchable}
+turbulence reserve that absorbs latency spikes so one slow turn cannot blow the game's total time.
+Past the last phase, or once $\text{bank}-\text{reserve}$ is spent, it plays \textbf{pure greedy} (one
+forward, no search). It reuses a single work env and binds the static comet arrays on first use.
+(\cd{criticality()} --- a cheap ``how close is the game'' measure in $[0,1]$ --- is available for a
+criticality-weighted budget, but the shipped \cd{MctsAgent} budget is purely step-scheduled; the
+\cd{crit_*} constructor args are deprecated and ignored.)
+
+%==================================================================================================
+\section{Evaluation harness}
+\cd{play_2p_vs_script} plays seat~0 (driven by any \cd{act_fn(env,t)->action}) against a scripted
+seat-1 bot on one world and returns the seat-0 score (1 win / 0.5 draw / 0). \cd{greedy_act_fn} wraps
+the raw policy-greedy move (no search) as such an \cd{act_fn}, so the same harness measures the search
+lift over greedy on identical worlds. The dedicated script \cd{scripts/eval_mcts_192x6.py} runs a
+small searched net with breadth-100 search against the production trunks.
+
+%==================================================================================================
+\section{Status (proof of concept)}\label{sec:status}
+\begin{itemize}
+  \item \textbf{Plumbing verified.} \cd{scripts/_mcts_smoke.py} exercises snapshot/restore, candidate
+        dedup, PUCT, and the budget schedule (PASS).
+  \item \textbf{Over the deploy budget.} On CPU the search runs $\sim$1.9\,s/turn --- above the
+        per-turn budget the schedule can afford --- so at deploy it falls back to greedy for much of
+        the game. Batched / GPU-resident search is the obvious next optimization.
+  \item \textbf{A small searched net still loses 2p H2H.} The 192$\times$6 MCTS net \emph{with}
+        breadth-100 search loses seat-0 2p head-to-head to the three production trunks
+        (256$\times$32 / 512$\times$32 / 512$\times$86); mean $\approx0.167$. The search lift over
+        greedy is only $\approx+0.056$ on average ($+0.167$ vs the weakest opponent, $\approx0$ vs the
+        strong ones). This is a seat-0/2p-only PoC; the greedy opponent-model mismatch makes single
+        games high-variance, and 4p is not runnable as a single-agent MDP. See memory
+        \cd{mcts-192x6-eval}.
+  \item \textbf{The intended payoff is the loop, not this file.} The plan is BC warm-start
+        \emph{then} self-play distillation (search visit distributions as policy targets); only then
+        does the simultaneous-move treatment (decoupled-UCT / regret matching, 2p zero-sum first)
+        become necessary. DUCT is deferred until there is a warm-started net to self-play. See memory
+        \cd{mcts-poc-v12}.
+\end{itemize}
+
+\paragraph{Config.} MCTS is not driven by \cd{Config} fields --- its knobs are \cd{MctsAgent} /
+\cd{mcts_search} arguments: \cd{K} (candidates/node, default 6), \cd{c_puct} (1.5), \cd{value}
+(\texttt{"heuristic"}\,/\,\texttt{"net"}), \cd{n_sims}\,/\,\cd{max_sims} (sim cap), and the
+\cd{schedule}\,/\,\cd{bank_s}\,/\,\cd{reserve_s} time budget. It consumes a document~1 checkpoint as
+its prior$+$value net.
+
+\end{document}

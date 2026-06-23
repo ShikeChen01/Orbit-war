@@ -1,7 +1,7 @@
 # Setup & onboarding
 
 Current state of the project and how to get going. For the design, see
-[`ARCHITECTURE.md`](ARCHITECTURE.md); for the native trainer, [`NATIVE_CPP.md`](NATIVE_CPP.md);
+[`archive/ARCHITECTURE.md`](archive/ARCHITECTURE.md); for the native trainer, [`NATIVE_CPP.md`](NATIVE_CPP.md);
 for the game rules, [`GAME_REFERENCE.md`](GAME_REFERENCE.md).
 
 ## What this is

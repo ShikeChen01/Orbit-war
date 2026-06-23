@@ -1,0 +1,1199 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+\usepackage{xcolor}
+
+% --- macros ---
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\Adv}{\widehat{A}}
+\newcommand{\pol}{\pi_\theta}
+\newcommand{\polold}{\pi_{\theta_{\mathrm{old}}}}
+\newcommand{\polref}{\pi_{\mathrm{ref}}}
+\newcommand{\relu}{\operatorname{relu}}
+\newcommand{\softplus}{\operatorname{softplus}}
+\newcommand{\softmax}{\operatorname{softmax}}
+\newcommand{\clip}{\operatorname{clip}}
+\newcommand{\sign}{\operatorname{sign}}
+\newcommand{\cd}[1]{\texttt{#1}}
+
+% --- per-section variable reference sheet ---
+\newenvironment{varsheet}{%
+  \par\smallskip
+  \begin{center}\small
+  \begin{tabular}{@{}l p{0.70\linewidth}@{}}
+  \toprule
+  \multicolumn{2}{@{}l@{}}{\textit{Variable reference --- this section}}\\
+  \midrule
+}{%
+  \bottomrule
+  \end{tabular}
+  \end{center}
+}
+
+\title{\textbf{Orbit Wars --- RL Math, v9\\[2pt]
+\large A complete, self-contained reference:\\
+the mixed 2p/4p league with per-seat categorical ownership}}
+\author{}
+\date{2026-06-14}
+
+\begin{document}
+\maketitle
+
+\begin{center}\small
+This document is the \emph{standalone} specification of the v9 training program ---
+the policy, the reward, the PPO\,+\,GAE update, the BC warm-start, and the mixed
+two-player / four-player Elo league. It supersedes the earlier delta-on-delta chain
+(\texttt{rl\_math.tex} $\to$ \texttt{rl\_math\_v6.tex} $\to$ \texttt{rl\_design\_v7.tex} $\to$
+the old \texttt{rl\_math\_v9.tex}) by inlining everything those documents established;
+\textbf{no back-references are required to read it}. Section~\ref{sec:history} records the
+design history that produced each choice (small intermediate patches are omitted). Two
+mechanisms that the prior write-ups treated only in passing are given full treatment here:
+the \textbf{bilinear pointer head} (Section~\ref{sec:bilinear}) and \textbf{why the WHERE
+distribution is a categorical and not a Dirichlet} --- including how the KL trust region
+silently collapses, and how reward and loss blew up, in the earlier attempts
+(Section~\ref{sec:catdir}).
+\end{center}
+\tableofcontents
+\bigskip
+
+%================================================================
+\section{Design history (what was tried, what broke, what stuck)}\label{sec:history}
+\begin{varsheet}
+$N$ & number of players, $N\in\{2,4\}$ (symmetric Markov game) \\
+GRPO & Group Relative Policy Optimization --- the retired critic-free trainer (Section~\ref{sec:grpo}) \\
+PPO\,+\,GAE & clipped actor--critic with Generalized Advantage Estimation (Section~\ref{sec:ppo}) \\
+BC & behaviour-cloning warm-start (Section~\ref{sec:bc}) \\
+WHETHER / WHERE & the two action factors: per-source Bernoulli launch gate / categorical destination (Section~\ref{sec:dist}) \\
+PFSP & prioritized fictitious self-play matchmaking (Section~\ref{sec:league}) \\
+FFA & four-player free-for-all scoring \\
+KL & Kullback--Leibler divergence --- the PPO trust-region measure \\
+PopArt & output-preserving value normalisation (Section~\ref{sec:popart}) \\
+\end{varsheet}
+The v9 design is the fixed point of a long sequence of measured failures. Each item below
+records a decision and the failure that forced it; the math each one settled on is given in
+full in the body sections. Minor parameter patches are omitted.
+
+\paragraph{(0) The game and the two-player special case.} Orbit Wars is an $N$-player
+($N\in\{2,4\}$) symmetric Markov game (Section~\ref{sec:problem}). Training began on the
+two-player zero-sum case and only generalised to mixed 2p/4p at v8/v9.
+
+\paragraph{(1) GRPO from scratch --- the passivity wall.} The first trainer used \textbf{Group
+Relative Policy Optimization}: no critic, a group of trajectories from the same start/opponent,
+each return centred against its group mean (Section~\ref{sec:grpo}). With a \emph{continuous}
+action actor (a squashed Gaussian over per-fleet direction/fraction controls) every from-scratch
+run collapsed into a \textbf{passive basin}: the policy stopped launching, beat only
+\cd{random}, and the aiming gradient vanished. Re-shaping the reward only moved \emph{which}
+basin it landed in.
+
+\paragraph{(2) PPO\,+\,GAE --- escapes the GRPO wall, but the continuous actor blows up.}
+Adding a value head and Generalized Advantage Estimation (Section~\ref{sec:ppo}) broke the
+aiming freeze by giving per-step credit. But the continuous squashed-Gaussian actor was
+numerically fragile: summing its log-prob over $E\!\cdot\!3K$ components, an extreme mean with a
+saturated sample over a tiny variance produced a huge log-density, an exploding gradient, and
+$\exp(\log\pi-\log\pi_{\mathrm{old}})\to\infty$ (Section~\ref{sec:catdir}, ``earlier blow-ups'').
+A second failure mode was a \emph{frozen} policy: the entropy bonus pinned $\sigma$ at its cap,
+the sampled action stayed noise-dominated, the advantage decorrelated from the mean, and the
+policy-gradient terms cancelled ($\operatorname{adv\_std}=1$ yet $\mathrm{KL}\to0$). Both needed
+log-std clamps, $\mu$ clamps inside the density, log-ratio clamps, advantage clamps, and a
+two-phase exploration schedule just to stay finite.
+
+\paragraph{(3) The target / allocation actor --- aiming becomes a heuristic, over-launch becomes
+impossible.} The continuous direction-vector actor was retired in favour of a \textbf{per-source
+allocation actor}: each owned planet emits one row over destinations, aiming is a deterministic
+orbital-intercept heuristic (Section~\ref{sec:env}), and the action is structurally legal (a
+simplex row cannot over-dispatch the garrison). This removed the entire ``learn legality / learn
+aiming from a penalty'' problem.
+
+\paragraph{(4) v6 --- gated allocation, potential shaping, PopArt, and the bilinear head.}
+The v6 notebook kept the trunk and simulator but changed four things that all carried forward to
+v9: (i) an explicit \textbf{Bernoulli launch gate} (WHETHER) on top of the allocation (WHERE),
+so ``hold'' is a first-class decision (Section~\ref{sec:dist}); (ii) the four-channel
+\emph{event} reward --- which was farmable (capture-churn, dispatch-spam, hoarding milestones,
+all maximisable while losing) --- replaced by \textbf{potential-based shaping}
+(Section~\ref{sec:reward}); (iii) \textbf{PopArt} value normalisation, because the MSE critic
+target spanned a $\pm1000$ terminal spike against $O(10^{-2})$ per-step shaping
+(Section~\ref{sec:popart}); and (iv) the destination head replaced by a \textbf{bilinear
+pointer} (Section~\ref{sec:bilinear}). The data path was also moved fully on-GPU / bf16 to make
+the rollout simulator-bound.
+
+\paragraph{(5) v7 --- the bootstrap was the wall, not the algorithm.} Every from-scratch run in
+the project's history hit the same two walls, reproduced one last time as a controlled smoke: a
+\textbf{catastrophic first update} (iteration-1 KL $2.06$, clip-fraction $0.98$ --- every sample
+clipped, launch rate annihilated $13.5\!\to\!1.0$ per step) and then a \textbf{passivity
+plateau} (gauntlet $0.000$ for 30 iterations). The best from-scratch result ever obtained was a
+$0.47$ win rate vs.\ \cd{starter} after $\sim$1400 iterations ($\sim$20\,h). v7's conclusion:
+\emph{the optimisation machinery is fine; the starting point is fatal.} The fix is a
+\textbf{behaviour-cloning (BC) warm-start} (Section~\ref{sec:bc}) that expresses the strongest
+scripted bot directly in the gated-allocation heads, plus three \textbf{PPO guardrails}
+(Section~\ref{sec:guard}) that make the first updates structurally incapable of destroying it.
+
+\paragraph{(6) v7 --- categorical WHERE (the decisive architecture change).} Warm-started PPO on
+the v6 \emph{Dirichlet} WHERE head \emph{destroyed} the BC policy (gauntlet
+$0.755\!\to\!0.104$) while the KL spiked to $2$--$9$ \emph{despite} a per-minibatch KL stop. The
+Dirichlet's density near a simplex vertex is so steep that one optimiser step moves stored-action
+log-probs by whole nats --- nothing bounds damage \emph{per step}. Replacing the WHERE
+distribution with a \textbf{per-source categorical} (one-hot sampled destination) fixed it
+(gauntlet $0.76\!\to\!0.81$, Elo $938\!\to\!1099$, KL pinned in band). The full mechanism, the
+sensitivity probe, and the entropy/reward/loss blow-ups are Section~\ref{sec:catdir}.
+
+\paragraph{(7) v8 --- the mixed 2p/4p league.} A checkpoint can dominate heads-up (1.000
+gauntlet, $0.82$ vs.\ the previous best) and still \emph{lose} four-player free-for-alls (29\%
+top-rate vs.\ 58\%), and the Kaggle leaderboard mixes both formats. v8 added $N$-player play
+(official seating and top-vs-second combat), a \textbf{dual correlated Elo}, a gap-driven match
+mix, invited anchored members, weak-point matchmaking, and a mixed 2p$+$4p best-checkpoint
+gauntlet --- all legacy-compatible (observation unchanged, $F{=}101$; v7 weights drop in by
+collapsing every opponent to one enemy code).
+
+\paragraph{(8) v9 --- per-seat categorical ownership.} v8's collapsed ownership scalar cannot
+tell \emph{which} opponent owns a body. v9 replaces it with a \textbf{4-channel ego-relative
+seat one-hot} ($F{=}104$) so the policy can learn per-enemy behaviour in FFAs
+(Section~\ref{sec:obs}). Legacy ($F{=}101$) members are admitted through an observation adapter.
+This is the design documented here.
+
+%================================================================
+\section{Problem setup}\label{sec:problem}
+\begin{varsheet}
+$N$ & number of players, $\in\{2,4\}$ \\
+$S^{(i)}$ & player $i$'s total ship count (planets $+$ in-flight fleets); the terminal score \\
+$b$ & base index of the world's 4-fold-symmetric quadrant group (seating) \\
+$\text{owner}(\cdot)$ & seat-slot $\to$ player-id map; $S_{\text{home}}{=}10$ is the starting home garrison \\
+ego & the learner --- always player $0$; opponents occupy seats $1..N{-}1$ \\
+$E$ & number of planet slots; a turn's action factors over these \\
+WHETHER / WHERE & per-source Bernoulli launch gate / categorical destination \\
+\end{varsheet}
+Orbit Wars is an $N$-player symmetric Markov game, $N\in\{2,4\}$. The deterministic engine seats
+$N$ homes on one random group of a 4-fold-symmetric quadrant arrangement, and every turn all
+players \emph{simultaneously} issue fleet \emph{launches}; the engine then moves fleets, resolves
+collisions/combat, rotates planets, produces ships, and (on a fixed schedule) spawns comets.
+Scoring is a \textbf{free-for-all}: at termination player $i$'s score is its total ship count
+$S^{(i)}$ (planets $+$ in-flight fleets). In 2p this is the zero-sum margin
+$S^{(0)}-S^{(1)}$; in 4p the objective is \emph{ordinal} (be the maximum of four), which is not
+zero-sum and motivates the placement-linear outcome of Section~\ref{sec:reward}.
+
+\paragraph{Seating.} The official engine records the world's symmetric quadrant group's base
+index $b$; \cd{reset(worlds, n\_players)} seats owners exactly like the engine:
+\[
+N{=}2:\ \text{owner}(b)=0,\ \text{owner}(b{+}3)=1;\qquad
+N{=}4:\ \text{owner}(b{+}j)=j,\ j=0..3;\qquad S_{\text{home}}=10 .
+\]
+Under the board's 4-fold rotational symmetry every seat is fair in both formats. The learner is
+always player $0$ (the ego); opponents occupy seats $1..N{-}1$.
+
+\paragraph{The turn as a factored action.} A turn's action factors over the $E$ planet slots: per
+\emph{owned} source planet $s$ the policy decides (i) \textbf{WHETHER} to launch (a Bernoulli
+gate) and (ii) \textbf{WHERE} to send (a categorical over destination planets). On a launch the
+\emph{full} garrison is dispatched to the chosen destination, aimed by a deterministic heuristic.
+Unowned/empty sources contribute nothing. There is no continuous fraction, no per-slot launch
+budget, and no separate aiming output --- the design history above retired all three.
+
+%================================================================
+\section{$N$-player environment and the GPU simulator}\label{sec:env}
+\begin{varsheet}
+$r_\odot$ & sun-disk radius, \cd{SUN\_RADIUS}$=10$; board is $100{\times}100$ \\
+$\nu$ (also $n$) & ship count of a fleet \\
+$v(\nu),\,v_{\max}$ & fleet speed law and cap ($v_{\max}{=}6$), Eq.~\eqref{eq:speed} \\
+$r_d,\phi_0,w,C$ & destination orbit: radius, phase, angular velocity, board centre \\
+$P(t)$ & destination position at flight time $t$ \\
+$c_{\mathrm{src}},r_{\mathrm{src}}$ & source planet centre and radius \\
+$t^\star,\,g(t)$ & intercept time (earliest root) and the intercept residual \\
+$\theta$ & launch heading, $\operatorname{atan2}$ of the lead point \\
+$A_e^{(p)}$ & ships of player $p$ arriving at planet $e$ \\
+$\text{surv}_e$ & survivors at $e$ $=$ top-minus-second arrival (official resolve) \\
+$E_c$ & \cd{planet\_cap} --- fixed Structure-of-Arrays slot count \\
+$B$ & batch size: number of parallel worlds rolled out on-GPU \\
+\end{varsheet}
+The board is $100{\times}100$ with a fixed central sun disk of radius $r_\odot=\cd{SUN\_RADIUS}=10$.
+Planets orbit the centre at a fixed angular velocity; fleets fly straight at a ship-count-dependent
+speed; production adds ships each tick; comets spawn on a fixed schedule. All quantities are
+deterministic.
+
+\paragraph{Fleet speed law.} A fleet of $\nu$ ships moves at
+\begin{equation}
+v(\nu)=\min\!\Big(v_{\max},\ 1+(v_{\max}-1)\big(\tfrac{\ln\max(1,\nu)}{\ln 1000}\big)^{1.5}\Big),
+\qquad v_{\max}=6 .
+\label{eq:speed}
+\end{equation}
+
+\paragraph{Lead-target aiming (deterministic orbital intercept).} A launch $s\!\to\!d$ aims not at
+$d$'s current position but at where the orbiting destination will be on arrival. With $d$ at orbital
+radius $r_d$, phase $\phi_0$, angular velocity $w$ about centre $C$, its position at flight time $t$
+(ticks) is $P(t)=C+r_d(\cos(\phi_0{+}wt),\sin(\phi_0{+}wt))$. A fleet leaves the source surface (a
+point at $r_{\mathrm{src}}{+}0.1$ from the source centre along the heading) and flies at $v=v(n)$, so
+the intercept time $t^\star$ is the earliest root of
+\begin{equation}
+g(t)=\lVert P(t)-c_{\mathrm{src}}\rVert-(r_{\mathrm{src}}{+}0.1)-v\,t=0,
+\end{equation}
+solved by bracketed bisection (the earlier fixed-point iterate was not a contraction for fast-orbiting
+targets and missed $\sim$20\% of reachable orbiting planets). The heading is
+$\theta=\operatorname{atan2}(P(t^\star)-c_{\mathrm{src}})$. The static-target case ($w{=}0$) recovers
+the straight-line aim.
+
+\paragraph{Combat: official top-vs-second, $N$ players.} Arrivals at planet $e$ are summed per player,
+$A_e^{(p)}=\sum_{\text{fleets}\to e,\ \text{owner}=p}n$, and the official resolve is the top-two
+statistic
+\begin{equation}
+\text{surv}_e=A_e^{(1\text{st})}-A_e^{(2\text{nd})},\qquad
+\text{owner}^{\text{surv}}_e=\begin{cases}\arg\max_p A_e^{(p)} & \text{surv}_e>0\\
+\varnothing & \text{tie,}\end{cases}
+\end{equation}
+implemented as a $(B,E,N)$ scatter-add $+$ \cd{topk(2)}; survivors reinforce or attack the garrison.
+For $N{=}2$ this is \emph{algebraically identical} to the pairwise max/min resolve.
+
+\paragraph{Batched GPU simulator.} The whole game runs as batched LibTorch tensor ops on the GPU
+(\cd{GpuEnv}): encode, sample, decode, step, and scripted opponents all stay on-device, so the loop
+is GPU-compute-bound (no host round-trips). Planets live in $E_c=\cd{planet\_cap}$ fixed
+Structure-of-Arrays slots (last few reserved for the single live comet group); fleets in a fixed
+pool with an alive mask. Because the per-planet actor is permutation-equivariant, no entity sort is
+needed. Integer quantities are held in \cd{float32} (exact below $2^{24}$).
+
+\paragraph{Parity.} \cd{GpuEnv} is bit-exact to the official Kaggle engine including official comets:
+world-generation is exact, full games are tick-exact, and scripted-launch decisions match to
+99.8\% (the residual being exact-tie collision flips, a benign \cd{float32} boundary choice). The
+threat encoder and reachability mask use the \emph{same} ray/disk projection in rollout and update,
+so the natively trained policy behaves identically when served from pure Python.
+
+\paragraph{Seat interface and rollout boundary.} \cd{env\_step(env, a, seats=[\dots])} takes, per
+opponent pid $1..N{-}1$, either a scripted code (vectorised on-GPU, zero forwards) or a frozen
+neural member acting per-step under \cd{no\_grad} via its own \cd{env\_encode(env, pid)} (the same
+encode, ego $=$ that seat; the observation of Section~\ref{sec:obs} is seat-symmetric by
+construction). Termination is the step cap, $\le 1$ player alive, or ego death.
+
+%================================================================
+\section{Observation encoding}\label{sec:obs}
+\begin{varsheet}
+$X\in\R^{E\times F}$ & per-planet entity matrix; $E$ planet slots, $F{=}104$ body features \\
+$g$ & (i) ego seat index; (ii) board-globals vector $\in\R^{G}$, $G{=}10$ (disambiguated by context) \\
+$m,\,u$ & entity mask ($m_e{=}1$ real body) / action mask ($u_e{=}1$ ego-owned with $>0$ ships) \\
+$S,\varrho,d_c,\omega$ & garrison, planet radius, distance-to-centre, board angular velocity \\
+$\ell(n)$ & shared ship-log $\ln(1{+}n)/\ln1000$ \\
+$\mathbf b[e]$ & ego-relative seat one-hot, Eq.~\eqref{eq:onehot} \\
+$o_e,\,\rho_e$ & owner of body $e$; ego-relative seat index $\rho_e{=}(o_e{-}g)\bmod N$ \\
+$N$ & \cd{n\_players} \\
+$t_{\mathrm{ca}},p^2,t_{\mathrm{hit}},\tau$ & threat ray/disk projection: closest-approach time, perp-distance$^2$, hit time, ETA \\
+$\mathrm{sgn},\widetilde\nu$ & threat-slot friend/foe sign and log-size $\ell(\nu)$ \\
+\cd{N\_SOON},\cd{N\_BIG} & ranked threat-list sizes (soonest / largest), $15$ each \\
+$b^{\text{legacy}}$ & collapsed scalar owner code $\in\{0,1,2\}$ for the legacy obs adapter \\
+\end{varsheet}
+For ego player $g$ and state $s$ the encoder emits four arrays: the per-planet entity matrix
+$X\in\R^{E\times F}$ ($E$ planet slots, $F=104$ features); the board globals $g\in\R^{G}$ ($G=10$, a
+\emph{separate} input, not replicated into rows); the entity mask $m\in\{0,1\}^{E}$ ($m_e=1$ iff slot
+$e$ holds a real body); and the action mask $u\in\{0,1\}^{E}$ ($u_e=1$ iff $e$ is ego-owned with
+$>0$ ships). $m$ hides padding inside attention; $u$ selects the owned sources that act and is also a
+body feature. Each row is $14$ body features (v9: $11\!\to\!14$ from the ownership change) followed by
+a $90$-feature incoming-threat block.
+
+\paragraph{Body features (per planet).} Each value is normalised into roughly $[-1,1]$. With $S$ the
+garrison, $\varrho$ the radius, $d_c$ the distance to centre, $\omega$ the board angular velocity, and
+$\ell(n)=\ln(1{+}n)/\ln 1000$ the shared ship-log:
+\begin{center}\small
+\begin{tabular}{@{}clll@{}}
+\toprule
+\# & feature & encoded value & meaning \\
+\midrule
+0  & position $x$        & $p_x/100$                          & horizontal position, $[0,1]$ \\
+1  & position $y$        & $p_y/100$                          & vertical position, $[0,1]$ \\
+2  & orbital speed       & $|\omega|\,d_c/6$ ($0$ if static)  & tangential orbit speed vs.\ $v_{\max}{=}6$ \\
+3  & spin sign           & $+1$ ccw / $-1$ cw / $0$           & rotation direction \\
+4  & radius              & $\varrho/3$                        & capture / collision disk size \\
+5  & production          & $\mathrm{prod}/5$                  & ships made per tick \\
+6  & ships               & $\ell(S)$                          & garrison, log-compressed \\
+7--10 & \textbf{seat one-hot} & Eq.~\eqref{eq:onehot}          & \textbf{ego-relative owner (v9 change)} \\
+11 & dist.\ to centre    & $d_c/70.71$                        & radial distance from the sun \\
+12 & comet flag          & $\mathbb 1[\text{comet}]$          & $1$ for a comet, else $0$ \\
+13 & action mask $u_e$   & $\mathbb 1[\text{ego}\wedge S{>}0]$ & ego-owned with ships (the decode key) \\
+\bottomrule
+\end{tabular}
+\end{center}
+Radius and production are both fed (redundant for a normal planet, $\varrho=1{+}\ln\mathrm{prod}$) so
+the net need not invert the log; the comet flag is the only observable comet signal (the engine hides
+comet lifetime), and it marks where the radius law breaks (a comet carries fixed
+\cd{COMET\_PRODUCTION}$=1$ at an unrelated radius).
+
+\paragraph{Per-seat categorical ownership (the v9 change).} A single scalar code
+$\{0,1,2\}$ (neutral/ego/enemy) cannot say \emph{which} enemy owns a body, and the ego-relative
+formula does not extend: in 4p, $(o-g)\bmod 2$ \emph{aliases} seat $g{+}2$ onto the ego code. v8
+collapsed every non-ego owner to one code $2$ (the deployed everyone-vs-me view, $F{=}101$). v9
+replaces the scalar with a 4-channel ego-relative seat one-hot. With $N=\cd{n\_players}$, ego seat
+$g$, and per-body owner $o_e$, the ego-relative seat index $\rho_e=(o_e-g)\bmod N$ and
+\begin{equation}
+\mathbf b[e]=\Big(\mathbf 1[o_e{\ge}0\wedge\rho_e{=}0],\;
+\mathbf 1[o_e{\ge}0\wedge\rho_e{=}1],\;
+\mathbf 1[o_e{\ge}0\wedge\rho_e{=}2],\;
+\mathbf 1[o_e{\ge}0\wedge\rho_e{=}3]\Big),
+\label{eq:onehot}
+\end{equation}
+i.e.\ $[\,\text{self}\mid\text{enemy seat}{+}1\mid{+}2\mid{+}3\,]$ with neutral $=$ all-zero, so
+$F=101\to104$. Properties:
+\begin{itemize}[nosep,leftmargin=1.6em]
+\item \textbf{categorical, not ordinal}: a scalar $2..n$ code imposes a fake magnitude/ordering across
+  seats; one-hot channels are permutation-symmetric inputs the network can attach independent behaviour
+  to (per-enemy threat assessment, target selection);
+\item \textbf{rotation-equivariant}: the same \emph{relative} seat always lands in the same channel from
+  any ego seat;
+\item \textbf{format-generalising}: in 2p only the first two channels ever fire, so 4p input space is a
+  strict superset; when a seat is eliminated mid-FFA its channel stops firing, so 3-player intermediate
+  states stay well-formed without being trained explicitly;
+\item \textbf{no aliasing}: $\rho$ is mod $N$, so no opponent collides with the ego channel.
+\end{itemize}
+Everything else is owner-pooled: the threat block keeps the \emph{signed} friend/foe convention ($+1$
+ego, $-1$ any opponent), and the globals pool \emph{all} opponents. Seat identity enters only through
+Eq.~\eqref{eq:onehot}.
+
+\paragraph{Board-summary globals $g\in\R^{10}$.} One vector summarising the board, embedded once and
+broadcast to the heads (not copied into rows): game phase $\mathrm{step}/T$; board angular velocity;
+ego total garrison $\ell(\cdot)$; enemy total garrison $\ell(\cdot)$ (pooled over all opponents); ego /
+enemy / neutral planet shares; ego / enemy in-flight ship totals $\ell(\cdot)$; and planet-slot
+occupancy $\min(n_p,E)/E$.
+
+\paragraph{Incoming-fleet threat block ($90$ features/row).} A purely reactive policy cannot defend
+what it cannot see, so each planet's row carries a compact list of \emph{its own} inbound fleets. Every
+in-flight fleet is projected to the planet it will hit and when, via the ray/disk test: for a fleet at
+$o$ with unit heading $\hat d$ and a planet at $c$ with radius $\varrho$,
+$t_{\mathrm{ca}}=-\langle o-c,\hat d\rangle$, $p^2=\lVert o-c\rVert^2-t_{\mathrm{ca}}^2$,
+$t_{\mathrm{hit}}=t_{\mathrm{ca}}-\sqrt{\varrho^2-p^2}$ (if $t_{\mathrm{ca}}\!\ge\!0$,
+$p^2\!\le\!\varrho^2$), ETA $\tau=t_{\mathrm{hit}}/v(\nu)$, dropped if the ray first crosses the sun.
+Among the fleets assigned to a planet we keep two ranked lists --- the \cd{N\_SOON}$=15$ soonest and the
+\cd{N\_BIG}$=15$ largest --- and each of the $30$ slots contributes
+$[\,\mathrm{sgn},\ \tau/100,\ \widetilde\nu\,]$ with $\mathrm{sgn}\in\{+1\text{ mine},-1\text{ enemy},
+0\text{ empty}\}$ and $\widetilde\nu=\ell(\nu)$, for $30\times3=90$ features. Empty slots are all-zero
+($\mathrm{sgn}{=}0$ already marks ``no fleet''). The encoder itself has no attention; cross-planet
+reasoning is added by the policy trunk.
+
+\paragraph{Legacy members: the obs adapter.} v9's league still admits v7/v8-format checkpoints
+($F{=}101$). They are wrapped in \cd{LegacyObsAdapter}, which collapses the one-hot back to the scalar
+they were trained on before their forward:
+\begin{equation}
+b^{\text{legacy}}=\mathbf b[0]+2\,\min\!\big(1,\ \textstyle\sum_{k=1}^{3}\mathbf b[k]\big)\in\{0,1,2\},
+\end{equation}
+exact on every reachable state (the channels are disjoint indicators). The wrapper is unwrapped on
+league-state save and re-wrapped on load. The \emph{learner} cannot warm-start from $F{=}101$ weights
+($F$ changed), so v9 runs its own BC warm-start (the BC expert is scripted, so nothing else changes).
+
+%================================================================
+\section{Policy network}\label{sec:policy}
+\begin{varsheet}
+$d$ & trunk hidden width, \cd{HIDDEN}$=512$ \\
+$h^{(0)}_e$ & projected token, $W_{\mathrm{proj}}x_e+b_{\mathrm{proj}}$ \\
+$\tilde h$ & pre-LayerNormed tokens fed to attention \\
+$W_Q,W_K,W_V,W_O$ & self-attention query/key/value/output projections ($d{\to}d$) \\
+$A,\,\mathcal M_{\mathrm{ent}}$ & attention output; additive key-mask ($-\infty$ on padding planets) \\
+$\mathcal B(z)$ & residual GLU block (trunk variant A) \\
+$\mathcal M(z)$ & pre-LN residual MLP block; $n_{\mathrm{res}}$ such blocks \\
+$g'\in\R^{d_g}$ & embedded globals, $d_g{=}32$; head input $h'_e{=}[h_e;g']$ \\
+$\ell_{s,d}$ & bilinear WHERE logit, Eq.~\eqref{eq:bilinear} (head $W_Q,W_K\in\R^{d\times(d+d_g)}$) \\
+$\eta_s$ & per-source gate (WHETHER) logit, bias \cd{INIT\_GATE\_BIAS}$=-1$ \\
+$\tilde V_\theta(s),\,V(s)$ & normalised value-head output; usable value $V{=}\sigma\tilde V_\theta+\mu$ (Section~\ref{sec:popart}) \\
+$n_v$ & \cd{VALUE\_RES\_BLOCKS} in the critic \\
+\end{varsheet}
+The network maps the per-planet entity matrix $X\in\R^{E\times F}$ to per-planet action parameters; the
+$G$ globals enter through a small separate path. The \textbf{trunk is shared} by the actor heads and the
+value head; only the heads differ.
+
+\paragraph{Trunk.} In order: input projection $h^{(0)}_e=W_{\mathrm{proj}}x_e+b_{\mathrm{proj}}$; one
+\textbf{masked cross-planet self-attention} block; an optional residual GLU block (trunk variant A); a
+stack of $n_{\mathrm{res}}$ pre-LayerNorm residual MLP blocks; a final LayerNorm. The projection and the
+MLP/GLU blocks are per-row (weights shared across planets); attention is the only cross-row mixing.
+
+\smallskip\noindent\textbf{(1) Masked self-attention.} On pre-LayerNormed tokens
+$\tilde h=\mathrm{LN}(h^{(0)})$,
+\begin{equation}
+A=\softmax\!\Big(\tfrac{(\tilde h W_Q)(\tilde h W_K)^{\!\top}}{\sqrt d}+\mathcal M_{\mathrm{ent}}\Big)
+  (\tilde h W_V),\qquad h^{(1)}=h^{(0)}+A\,W_O,
+\end{equation}
+with the key-mask $\mathcal M_{\mathrm{ent}}[\cdot,j]=-\infty$ for padding planets ($m_j{=}0$). This lets
+a planet read the others' positions/ownership/garrisons/threats --- cross-planet board reasoning. It is
+computed with a fused flash kernel under bf16 autocast (the dead-planet mask supplied as a $-10^9$
+additive bias). An \cd{ARCH} switch selects either this single-attention ``trunk'' or a true multi-head
+``transformer'' stack of pre-LN attention $+$ MLP layers; both feed identical heads.
+
+\smallskip\noindent\textbf{(2) Optional residual GLU} (variant A): for $z\in\R^d$,
+$\mathcal B(z)=z+W_o\big((W_v z+b_v)\odot\sigma(W_g z+b_g)\big)+b_o$. The sigmoid gate passes,
+attenuates, or suppresses each feature channel conditionally (e.g.\ amplify the threat channels when a
+planet is under attack); the residual keeps optimisation easy. Variant B replaces it with a plain
+residual MLP block.
+
+\smallskip\noindent\textbf{(3) Pre-LayerNorm residual MLP blocks.}
+$\mathcal M(z)=z+W_b\,\relu(W_a\,\mathrm{LN}(z))+b_b$, then a final LayerNorm. The pre-norm is
+load-bearing: without it the deep trunk drove the head pre-activations large, the gate sigmoid saturated,
+and gradients vanished --- pre-LN keeps activations bounded so the heads stay responsive.
+
+\paragraph{Globals path.} $g'=\relu(W_g\,g+b_g)\in\R^{d_g}$, $d_g=32$, broadcast to every planet and
+concatenated at the heads as $h'_e=[\,h_e;g'\,]\in\R^{d+d_g}$, so the trunk stays purely per-planet.
+
+\subsection{The bilinear (pointer) WHERE head}\label{sec:bilinear}
+The WHERE head produces, for each owned source $s$, a logit $\ell_{s,d}$ for sending to each candidate
+destination $d$. The naive design (the original target actor) was a single \cd{Linear}$(d{+}d_g\to E)$:
+$\ell_{s,d}=w_d^{\!\top}h'_s+b_d$, i.e.\ a \emph{fixed weight vector $w_d$ per destination slot index}.
+That is the wrong inductive bias here. Planet slots are a permutation-equivariant Structure-of-Arrays
+(Section~\ref{sec:env}) --- the slot \emph{index} carries no meaning, so a per-slot weight $w_d$ has
+nothing stable to attach to; the head would have to memorise geometry it is not even shown, and is not
+equivariant under relabelling destinations.
+
+v6 replaced it (flag \cd{DEST\_HEAD="bilinear"}) with a \textbf{pairwise pointer score} computed from
+\emph{both} planets' tokens. With a query projection $W_Q$ and a key projection $W_K$, both
+$\R^{d\times(d+d_g)}$,
+\begin{equation}
+\boxed{\ \ell_{s,d}\;=\;\frac{\big(W_Q\,h'_s\big)^{\!\top}\big(W_K\,h'_d\big)}{\sqrt{d}}\ \ }
+\qquad h'_e=[\,h_e;g'\,].
+\label{eq:bilinear}
+\end{equation}
+This is exactly a single attention score, but \emph{used as the WHERE logits} over destinations rather
+than to mix features (the source is the query, every planet is a key). Why this is the right head:
+\begin{itemize}[nosep,leftmargin=1.6em]
+\item \textbf{Relational, content-based.} The score for $s\!\to\!d$ depends on \emph{both} planets'
+  features --- relative geometry (from positions/distance-to-centre), ownership (the seat one-hot of
+  Eq.~\eqref{eq:onehot}), garrison, and inbound threat --- which is precisely the information that
+  decides ``is $d$ a good target for $s$''. A fixed per-slot vector cannot express ``send to the
+  nearest weakly-held enemy planet''; a bilinear source$\times$destination score can.
+\item \textbf{Permutation-equivariant in destinations.} Relabelling planets permutes the keys
+  $\{W_K h'_d\}$ and therefore permutes the logits $\{\ell_{s,d}\}$ consistently --- the head respects
+  the SoA symmetry the linear head broke.
+\item \textbf{Shares the aiming mechanism.} It is the same query/key bilinear form as the trunk's
+  cross-planet attention, so ``which planet to point at'' is computed by content match, the operation the
+  trunk attention was added to enable.
+\item \textbf{Calm init.} $W_Q,W_K$ are scaled by \cd{INIT\_DEST\_SCALE}$=0.02$ so $\ell\approx0$
+  (near-uniform WHERE) at start; ``hold by default'' is enforced by the gate bias below
+  (Section~\ref{sec:dist}), not by a diagonal logit, so the WHERE head starts unopinionated and learns
+  to commit.
+\end{itemize}
+These logits are masked (alive $\wedge$ sun-reachable $\wedge$ no-self) and fed to the per-source
+\emph{categorical} of Section~\ref{sec:dist}. The bilinear head is identical for the (retired) Dirichlet
+WHERE and the (current) categorical WHERE --- only the distribution placed on $\ell_{s,\cdot}$ changed
+(Section~\ref{sec:catdir}).
+
+\subsection{Gate head and value head}
+\paragraph{Gate head (WHETHER).} \cd{gate\_head}, a \cd{Linear}$(d{+}d_g\to1)$, emits a per-source fire
+logit $\eta_s$, with bias initialised to \cd{INIT\_GATE\_BIAS}$=-1$ so few planets fire at start
+(Section~\ref{sec:dist}).
+
+\paragraph{Value head (the PPO critic).} A masked-mean pool of the post-trunk tokens over live planets,
+concatenated with $g'$, then an input projection $d{+}d_g\to d$, \cd{VALUE\_RES\_BLOCKS} pre-LN residual
+MLP blocks (the same block as the trunk), and a $d\to1$ readout. Its scalar output is the
+\emph{normalised} value $\tilde V_\theta(s)$; the usable value is $V(s)=\sigma\tilde V_\theta(s)+\mu$
+with the PopArt statistics of Section~\ref{sec:popart}.
+
+\paragraph{Layer inventory (variant A).}
+\begin{center}\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+module & layers (name: shape) & count \\
+\midrule
+input projection & \cd{proj}: $F{\to}d$ & $1$ \\
+self-attention & \cd{attn\_\{q,k,v,o\}}: $d{\to}d$ & $4$ \\
+LayerNorm (pre-attn, per-res, final) & \cd{ln\_attn}, \cd{ln\_res$i$}, \cd{ln\_out}: $d$ & $n_{\mathrm{res}}{+}2$ \\
+residual GLU (variant A) & \cd{glu\_\{gate,val,out\}}: $d{\to}d$ & $3$ \\
+residual MLP $\times n_{\mathrm{res}}$ & \cd{res$i$\{a,b\}}: $d{\to}d$ & $2n_{\mathrm{res}}$ \\
+globals embed & \cd{g\_embed}: $G{\to}d_g$ & $1$ \\
+\textbf{bilinear WHERE} & \cd{dest\_q}, \cd{dest\_k}: $(d{+}d_g){\to}d$, Eq.~\eqref{eq:bilinear} & $2$ \\
+gate head & \cd{gate\_head}: $(d{+}d_g){\to}1$ & $1$ \\
+value in-proj / res / readout & \cd{val\_in}, \cd{val\_res\{a,b\}}, \cd{val\_out} & $3n_v{+}2$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+The deployed scale is $d{=}512$, $n_{\mathrm{res}}{=}6$ (or the transformer $d{=}512$, $L{=}4$/$5$). The
+served twin must mirror trunk, globals path, and heads bit-for-bit; it serves the actor only (no critic
+at inference). Inference is compute-bound and far under the Kaggle 1\,s/move budget at every scale up to
+$\sim$100M params (Section~\ref{sec:deploy}).
+
+%================================================================
+\section{Action distribution: gated categorical allocation}\label{sec:dist}
+\begin{varsheet}
+$R_{s,d}$ & \textbf{reachability mask}: $\mathbb 1[$straight shot $s{\to}d$ clears the sun$]$ (sun-occlusion test below) \\
+$c_\odot,r_\odot$ & sun-disk centre and radius ($r_\odot{=}10$) \\
+$\hat u,t,p^2$ & ray parameters of the $s{\to}d$ occlusion test \\
+$\ell_{s,d},\,\tilde\ell_{s,d}$ & bilinear WHERE logit / its masked form ($-\infty$ off-support) \\
+$d_s$ & sampled destination (categorical); the action row is its one-hot \\
+$m_d$ & alive mask of destination $d$ \\
+$\eta_s,\,p_s,\,f_s$ & gate logit / fire probability $\sigma(\eta_s)$ / Bernoulli fire draw \\
+$\varepsilon$ & \cd{GATE\_EPS}$=0.02$ (train-time gate clamp) \\
+$\mathcal H_{\mathrm{Bern}},\mathcal H_{\mathrm{cat}}$ & gate Bernoulli / WHERE categorical entropies \\
+$n_{s,d_s},\,S_s$ & ships dispatched / source garrison; floor \cd{MIN\_LAUNCH\_SHIPS} \\
+\end{varsheet}
+Per owned source $s$ the policy is a product of two factors --- a categorical \textbf{WHERE} over
+destinations and a Bernoulli \textbf{WHETHER} (fire) gate --- and the policy factorises over owned
+sources. One structural mask encodes the sun-occlusion heuristic the model would otherwise relearn.
+
+\paragraph{Reachability mask $R_{s,d}$ (sun occlusion).} A straight shot $s\!\to\!d$ is absorbed by the
+sun (disk centre $c_\odot$, fixed radius $r_\odot{=}10$) iff the segment crosses that disk before
+reaching $d$. With $\hat u=(p_d-p_s)/\lVert p_d-p_s\rVert$, $t=\langle c_\odot-p_s,\hat u\rangle$,
+$p^2=\lVert c_\odot-p_s\rVert^2-t^2$, the shot is blocked iff $t\ge0$, $p^2\le r_\odot^2$, and
+$0\le t-\sqrt{r_\odot^2-p^2}<\lVert p_d-p_s\rVert$. Then $R_{s,d}=\mathbb 1[\text{not blocked}]$. $R$ is
+recomputed from the encoded positions, so it is identical in rollout and update with no extra buffers.
+
+\paragraph{WHERE: per-source categorical.} The bilinear logits $\ell_{s,d}$ of
+Eq.~\eqref{eq:bilinear} are masked to alive, sun-reachable, non-self destinations and a categorical is
+placed on them:
+\begin{equation}
+\tilde\ell_{s,d}=\begin{cases}\ell_{s,d} & d\neq s\ \wedge\ m_d\ \wedge\ R_{s,d}\\ -\infty & \text{else,}\end{cases}
+\qquad d_s\sim\mathrm{Categorical}\big(\softmax(\tilde\ell_{s,\cdot})\big),
+\label{eq:where}
+\end{equation}
+and the sampled action row is the \emph{one-hot} of $d_s$. (The masking forces zero probability on
+unreachable/padding/self destinations.)
+
+\paragraph{WHETHER: Bernoulli gate.} With the gate logit $\eta_s$,
+\begin{equation}
+\text{train: } p_s=\clip(\sigma(\eta_s),\,\varepsilon,\,1{-}\varepsilon);\qquad
+\text{deploy: } p_s=\clip\!\Big(\tfrac{\sigma(\eta_s)-0.2}{0.6},\,0,\,1\Big);\qquad
+f_s\sim\mathrm{Bernoulli}(p_s),
+\end{equation}
+with $\varepsilon=\cd{GATE\_EPS}=0.02$. Deploy uses a dead-zone / saturation trim so the gate can express
+``essentially never/always fire''; \textbf{training must not} --- applying the hard trim at train time
+gives $\clip$ zero gradient outside the band, which starves both the gate head and (through the
+$f_s\cdot\log\pi_{\text{where}}$ coupling below) the WHERE head as gate logits sharpen. The smooth
+training form is the verified fix (gradient norm stayed in $[0.7,5.4]$ over a 30-iteration smoke where the
+pre-fix run decayed monotonically toward zero). The greedy boundary $p_s\ge0.5\Leftrightarrow\eta_s\ge0$
+is identical in both.
+
+\paragraph{Log-prob and entropy (WHERE counts only on a fire).}
+\begin{align}
+\log\pol(a\mid s) &=\!\!\sum_{s:\,\text{owned}}\!\!\Big[\underbrace{f_s\log p_s+(1{-}f_s)\log(1{-}p_s)}_{\text{gate}}
+   +f_s\,\log\softmax(\tilde\ell_{s,\cdot})_{d_s}\Big],\label{eq:logp}\\
+\mathcal H[\pol(\cdot\mid s)] &=\!\!\sum_{s:\,\text{owned}}\!\!\Big[\mathcal H_{\mathrm{Bern}}(p_s)
+   +p_s\,\mathcal H_{\mathrm{cat}}(\softmax(\tilde\ell_{s,\cdot}))\Big].
+\end{align}
+On a hold ($f_s{=}0$) the destination is unobserved, so it must not be scored --- otherwise a holding
+planet would be credited/penalised for a launch it never made. The WHERE entropy is symmetrically
+weighted by $p_s$.
+
+\paragraph{Decode.} A firing source dispatches its \textbf{full garrison} to the single drawn
+destination (the categorical row is one-hot), aimed by the orbital intercept of Section~\ref{sec:env}:
+$n_{s,d_s}=S_s$ ships if $f_s{=}1$ and $n_{s,d_s}\ge\cd{MIN\_LAUNCH\_SHIPS}$, else held. A holding source
+keeps everything. Because the destination is a real, sun-reachable planet, over-dispatch and phantom
+launches cannot arise --- the action is structurally legal. Multi-target pressure comes over \emph{time}:
+the gate is a per-turn fire \emph{rate}, the garrison refills by production, and the source can fire
+again next turn at a possibly different target.
+
+\paragraph{Greedy / deploy.} The destination is $\arg\max_d\tilde\ell_{s,d}$ and the fire decision is
+$f_s^{\mathrm{greedy}}=\mathbb 1[p_s\ge0.5]$ --- a single concentrated strike per firing source. (Under
+the retired Dirichlet WHERE the deploy rule was a temperature-sharpened masked softmax, because the
+Dirichlet \emph{mean} was concentration-blind and floored every $\lfloor\cdot\rfloor$ below
+\cd{MIN\_LAUNCH\_SHIPS}, firing zero launches --- a residual passivity bug; see
+Section~\ref{sec:catdir}.)
+
+%================================================================
+\section{Why categorical and not Dirichlet (and how the earlier attempts blew up)}\label{sec:catdir}
+\begin{varsheet}
+$A[s,\cdot]\in\Delta^{E-1}$ & retired Dirichlet allocation row over the simplex (ship fractions) \\
+$\alpha_{s,d}$ & Dirichlet concentration, Eq.~\eqref{eq:dir} \\
+$\kappa,\epsilon$ & \cd{ALLOC\_KAPPA} concentration gain / Dirichlet floor; \cd{LOGIT\_CLAMP}$=8$ \\
+$\ell_{s,d}$ & bilinear logits --- shared by both WHERE distributions \\
+$r$ & importance ratio $\exp(\log\pol-\log\polold)$ \\
+$\KL,\,k_3$ & trust-region divergence and its low-variance estimator \\
+$x_d,\,\Delta\log\pol(a)$ & simplex coordinate; per-step log-prob movement of a stored action \\
+$\nabla_\ell\log\softmax(\ell)_d$ & categorical policy gradient $=\mathrm{onehot}(d)-\softmax(\ell)$ ($\to0$ when confident) \\
+\end{varsheet}
+This section is the full account of the architecture decision that distinguishes v7$+$ from v6, including
+the trust-region collapse and the reward/loss blow-ups the user asked to have on record.
+
+\subsection{The Dirichlet WHERE (what v6 did)}
+v5/v6 made each owned source row a continuous \textbf{allocation simplex} $A[s,\cdot]\in\Delta^{E-1}$ ---
+ship \emph{fractions} over destinations including the self-diagonal (the \cd{HOLD} share) --- and placed a
+Dirichlet on it:
+\begin{equation}
+\alpha_{s,d}=\softplus\!\big(\clip(\ell_{s,d},\pm\cd{LOGIT\_CLAMP})\big)\cdot\cd{ALLOC\_KAPPA}+\epsilon,
+\qquad A[s,\cdot]\sim\mathrm{Dirichlet}(\alpha_s),
+\label{eq:dir}
+\end{equation}
+with log-prob/entropy the per-source Dirichlet terms summed over owned planets. The intent was
+expressivity: one source could split its garrison across several destinations in a single turn.
+
+\subsection{The measured failure: warm-started PPO destroys the Dirichlet policy}
+Starting PPO from a BC clone (Section~\ref{sec:bc}) with the Dirichlet head, under \emph{all} guardrails
+of Section~\ref{sec:guard} (run \cd{runs/v6/ppoS2}), the fixed-opponent gauntlet decayed
+$0.755\to0.625\to0.276\to0.104$ over 40 iterations while the per-update $k_3$ KL spiked to $2$--$9$
+\emph{despite} a per-minibatch KL hard stop. This is not a tuning artifact; it is intrinsic to the
+distribution.
+
+\subsection{How the KL trust region silently collapses}
+PPO is an off-policy update made valid by an importance ratio
+$r=\exp(\log\pol(a)-\log\polold(a))$ and kept honest by a \textbf{trust region}: keep $\pol$ close in KL
+to the data-collecting $\polold$. Two mechanisms enforce it --- the ratio \emph{clip}
+($\pm\epsilon$ around $1$) and a KL \emph{early-stop} --- but \textbf{both act between optimiser steps},
+the clip bounding each sample's loss contribution and the stop bounding damage per epoch/minibatch.
+Neither bounds how far a \emph{single gradient step} moves $\log\pol(a)$.
+
+For a categorical, that per-step movement is small and bounded. For a Dirichlet sharpened by BC it is
+catastrophic. BC drives $\alpha=\softplus(\ell)\,\kappa$ into near-one-hot rows, so the policy sits at a
+\emph{vertex} of the simplex. The Dirichlet log-density there is steep --- the $(\alpha_d-1)\log x_d$
+terms with suppressed $\alpha_d=\softplus(-6)\approx0.003<1$ are \emph{singular} at exactly the corner
+every sample occupies, injecting $|\log x_d|\approx14$-scale contributions. A single clipped,
+LR-warmed step then moves a stored action's log-prob by whole \emph{nats}:
+\[
+\Delta\log\pol(a)\sim\text{several nats}\ \Rightarrow\ r=e^{\Delta}\gg1\ \Rightarrow\
+\KL\approx\tfrac12(\log r)^2\ \text{blows up to }2\text{--}9\ \text{in one update.}
+\]
+Once $r$ leaves $1\pm\epsilon$ the surrogate gradient on that sample is gated off, but the damage is
+already done: the ratio is no longer a valid importance weight, the advantage is being applied through a
+distribution that no longer matches the data, and the BC behaviour erodes. The KL stop fires
+\emph{after} the epoch that already ran away --- exactly the ``trust region collapses when the policy
+outcome moves too far'' failure: the controllers all sit downstream of a per-step move they cannot see.
+
+\subsection{The replacement and why it is self-stabilising}
+The WHERE head keeps its bilinear logits $\ell_{s,d}$ but the distribution becomes a per-source
+\textbf{categorical} (Eq.~\eqref{eq:where}); the sampled row is the one-hot of the drawn destination, so
+the action bundle, decode, rollout buffers, league fingerprint, and checkpoints are all untouched. The
+categorical's score $\log\softmax(\ell)_d$ has \emph{bounded} sensitivity in $\ell$, and the policy
+gradient $\partial\log\softmax(\ell)_d/\partial\ell=\mathrm{onehot}(d)-\softmax(\ell)$ \textbf{collapses
+to $\approx0$ on a confident sample} (when $\softmax$ is already near one-hot at the chosen $d$). A sharp
+categorical is therefore self-stabilising; a sharp Dirichlet cannot settle, because its gradient stays
+$\approx5$ \emph{forever} (the singular corner terms above).
+
+\paragraph{Quantified (CPU probe, \cd{scripts/probe\_dist\_sensitivity.py}).} Over $E{=}48$ logit rows,
+identical logits, sampled actions: the Dirichlet's $\lVert\partial\log\pi(a)/\partial\ell\rVert_2$ is
+$5$--$6\times$ the categorical's at every sharpness regime, and the log-prob movement per unit-direction
+logit perturbation is $5$--$10\times$ --- which compounds \emph{quadratically} in KL, matching the
+$\sim$$100\times$ KL gap measured between the real runs. The decisive asymmetry is at BC sharpness: the
+categorical's gradient on confident samples $\to0$ while the Dirichlet's stays $\approx5$. Measured
+end-to-end: the first-update KL drops from $0.53$--$2.06$ (Dirichlet) to $0.008$--$0.010$ (categorical),
+same setup.
+
+\subsection{Two more independent reasons}
+\begin{enumerate}[nosep,leftmargin=1.8em]
+\item \textbf{Deploy equivalence.} The \emph{deployed} Dirichlet already collapsed to a
+  temperature-sharpened softmax over the same $\ell$ --- effectively one-hot. The continuous
+  ``split allocation'' expressivity was paid for in training fragility and \emph{never used} at deploy;
+  the gate-as-rate already delivers multi-target pressure over time (Section~\ref{sec:dist}).
+\item \textbf{Search-readiness.} A fully discrete factored action (categorical WHERE $\times$ Bernoulli
+  FIRE) is the prerequisite for the planned Gumbel-AlphaZero extension (Appendix~\ref{sec:search}); the
+  Dirichlet was the blocker.
+\end{enumerate}
+
+\subsection{Attribution: what the Dirichlet did and did not cause}
+A $2{\times}2$ (from-scratch $\times$ \{categorical, Dirichlet\}, full guardrails) plus a low-LR BC leg
+separates three phenomena previously conflated:
+\begin{center}\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+phenomenon & cause & evidence \\
+\midrule
+\textbf{bootstrap wall} (can't beat starter & \emph{not} the distribution: & scratch-cat gauntlet 0.083, Elo 170; \\
+\quad from scratch in reasonable time) & credit assignment $+$ opponent gap & scratch-dir 0.016, Elo 125 (both walled) \\
+\textbf{first-update slam} (launch rate & Dirichlet $\times$ \emph{unguarded} update; & old code: it1 KL 2.06, lnch 13.5$\to$1.0; \\
+\quad annihilated at it1) & guardrails alone remove it & guardrailed dir: KL $\le$0.024, no slam \\
+\textbf{post-BC erosion} & Dirichlet density sharpness; & LR $10^{-4}$: gauntlet 0.755$\to$0.104; \\
+ & LR-dependent (trust-region misfit) & LR $10^{-5}$: 0.719$\to$0.771 (survives) \\
+\bottomrule
+\end{tabular}
+\end{center}
+The bootstrap wall is \emph{distribution-independent} (BC removes it under either; the v5 actor's
+destination head was already categorical and still needed 1400 iterations for a 0.47 starter win rate).
+The Dirichlet's real crime is the update fragility, and even that is survivable at $10\times$ reduced LR
+--- but strictly dominated: BC$+$Dirichlet at LR $10^{-5}$ reaches gauntlet 0.771 with median KL 0.102
+(still $2$--$3\times$ over target), vs.\ BC$+$categorical at LR $10^{-4}$ reaching 0.812 with KL 0.035 and
+Elo $+161$ over the same 40 iterations. You can pay for the Dirichlet with a $10\times$ smaller trust
+region; there is no reason to.
+
+\subsection{The earlier reward/loss blow-ups (full list)}
+The categorical fix removed the \emph{sharpness} blow-up; for the record, these are the other
+divergences that earlier designs hit and the guards that contained them:
+\begin{enumerate}[nosep,leftmargin=1.8em]
+\item \textbf{Continuous squashed-Gaussian actor.} Summing the squashed-Gaussian log-prob over
+  $E\!\cdot\!3K$ components, an extreme mean $\mu$ with a saturated sample (latent far from $\mu$) over a
+  tiny $\sigma^2$ produces a huge $\log\mathcal N$, hence an exploding step and
+  $\exp(\log p-\log p_{\mathrm{old}})\to\infty$. Guards: tight log-std range $[-2,1]$, a $\mu$ clamp
+  inside the density, a log-ratio clamp before $\exp$, a $[-10,10]$ clamp on the whitened advantage (a
+  near-degenerate group otherwise explodes it), and skipping any optimiser step with non-finite gradient.
+\item \textbf{Frozen policy / never exploits.} The entropy bonus pushed $\sigma$ to its cap, the sampled
+  action stayed noise-dominated, the per-trajectory advantage decorrelated from the mean, and the
+  policy-gradient terms cancelled ($\operatorname{adv\_std}=1$ yet $\mathrm{KL}\to0$). Fixed by a
+  two-phase $\sigma$-cap schedule (force the cap down, then release to a state-dependent head).
+\item \textbf{Catastrophic first update (from scratch).} Iteration-1 KL $2.06$, clip-fraction $0.98$ ---
+  every sample clipped, launch rate $13.5\!\to\!1.0$ per step in one iteration. The v6 end-of-epoch KL
+  check fires only \emph{after} a full epoch ran away. Fixed by the per-minibatch hard stop $+$ LR warmup
+  $+$ critic-only warmup (Section~\ref{sec:guard}).
+\item \textbf{Dirichlet entropy bonus.} Differential entropy of a peaked Dirichlet is unboundedly
+  \emph{negative} ($\approx-4000$ per source after BC), so with coefficient $0.005$ the ``bonus'' became
+  a $+20$ \emph{loss} term whose gradient actively blurred the BC-learned WHERE head (measured at
+  warmup-end: grad-norm $1380$, KL $4.8$, Elo $1032\!\to\!955$). Fixed: gate-only entropy
+  (Section~\ref{sec:guard}), keeping only bounded terms.
+\item \textbf{Value-target dynamic range.} The MSE critic target spans the $\pm1000/\sigma_R$ terminal
+  spike against $O(10^{-2})$ per-step shaping, so an un-normalised value loss dominates and destabilises
+  the shared trunk. Fixed by PopArt (Section~\ref{sec:popart}).
+\end{enumerate}
+
+%================================================================
+\section{Reward: $N$-player potential shaping and outcome}\label{sec:reward}
+\begin{varsheet}
+$S^{(p)}$ & player $p$ total ships (planets $+$ fleets) \\
+$\Pi^{(p)},\Pi_{\mathrm{tot}}$ & owned production / total alive production \\
+$\ell(n)$ & ship-log $\ln(1{+}n)/\ln1000$ \\
+$\Phi_{\mathrm{ship}},\Phi_{\mathrm{prod}}$ & ship- and production-potentials vs.\ the strongest opponent, $\in[-1,1]$ \\
+$r_t$ & per-step potential-shaping reward, Eq.~\eqref{eq:shape} \\
+$c_{\mathrm{ship}},c_{\mathrm{prod}}$ & shaping coefficients, \cd{SHAPE\_SHIP}$=$\cd{SHAPE\_PROD}$=50$ \\
+$\gamma$ & discount (the \emph{same} $\gamma$ as GAE) \\
+$F(s,s')$ & shaping term $\gamma\Phi(s'){-}\Phi(s)$; $\Phi$ a potential (telescopes $\Rightarrow$ policy-invariant) \\
+$\mathrm{sc}_k$ & pairwise terminal score vs.\ seat $k$, $\in\{0,\tfrac12,1\}$ \\
+$\Omega$ & placement-linear outcome $\in\{-1,-\tfrac13,+\tfrac13,+1\}$, Eq.~\eqref{eq:outcome} \\
+$O,\,W,L$ & terminal payment $\Omega\cdot(\cdot)$; win/loss magnitude $W{=}L{=}1000$ \\
+$\sigma_R$ & \cd{PPO\_REWARD\_SCALE}$=100$ (reward scale before GAE) \\
+\end{varsheet}
+The reward is potential-based shaping $+$ a terminal outcome, generalised so that $N{=}2$ reproduces the
+two-player form exactly. The earlier four-channel \emph{event} reward (outcome $+$ capture $+$ dispatch
+$+$ production-milestone) was \textbf{retired} because its dense channels were farmable --- capture
+rewarded border-flip churn, dispatch rewarded ship expenditure, milestones rewarded hoarding, all
+maximisable while \emph{losing}.
+
+\paragraph{Potentials vs.\ the strongest opponent.} With per-player totals $S^{(p)}$ (planets $+$
+fleets), owned production $\Pi^{(p)}$, total alive production $\Pi_{\mathrm{tot}}$, and ship-log
+$\ell(n)=\ln(1{+}n)/\ln1000$,
+\begin{equation}
+\Phi_{\mathrm{ship}}(s)=\ell\big(S^{(0)}\big)-\ell\big(\max_{p\ge1}S^{(p)}\big),\qquad
+\Phi_{\mathrm{prod}}(s)=\frac{\Pi^{(0)}-\max_{p\ge1}\Pi^{(p)}}{\max(\Pi_{\mathrm{tot}},1)} .
+\end{equation}
+The $\max$ is the right opponent aggregate for a win-the-game potential: in an FFA you are measured
+against whoever currently leads, not the average. Both are bounded in $[-1,1]$ and reduce to the
+two-player pair at $N{=}2$.
+
+\paragraph{Shaping reward.} The per-step reward is the potential difference
+\begin{equation}
+r_t=c_{\mathrm{ship}}\big(\gamma\Phi_{\mathrm{ship}}(s_{t+1})-\Phi_{\mathrm{ship}}(s_t)\big)
+   +c_{\mathrm{prod}}\big(\gamma\Phi_{\mathrm{prod}}(s_{t+1})-\Phi_{\mathrm{prod}}(s_t)\big),
+\label{eq:shape}
+\end{equation}
+with $c_{\mathrm{ship}}=c_{\mathrm{prod}}=\cd{SHAPE\_SHIP}=\cd{SHAPE\_PROD}=50$ and the \emph{same}
+$\gamma$ as GAE.
+
+\paragraph{Policy invariance (why this is un-hackable).} For $F(s,s')=\gamma\Phi(s')-\Phi(s)$ the added
+discounted return telescopes, $\sum_{t\ge0}\gamma^tF(s_t,s_{t+1})=\gamma^T\Phi(s_T)-\Phi(s_0)$, which
+depends only on the fixed start and terminal, not the policy (Ng, Harada \& Russell, 1999). So the
+optimal policy and the ordering of policies are unchanged versus training on the sparse outcome alone,
+while the gradient is now dense and win-aligned at every step. A quantity that returns to its prior value
+contributes net zero --- no reward-farming basin exists.
+
+\paragraph{Pairwise scores and the 4p outcome.} At termination, against each seat $k$ with total
+$S^{(k)}$:
+\begin{equation}
+\mathrm{sc}_k=\begin{cases}1 & S^{(0)}>S^{(k)}\\\tfrac12 & S^{(0)}=S^{(k)}\\0 & S^{(0)}<S^{(k)},\end{cases}
+\qquad
+\Omega=\begin{cases}
+\sign\!\big(S^{(0)}-\max_{p\ge1}S^{(p)}\big) & N{=}2\ \text{or}\ \cd{OUTCOME\_4P}{=}\text{winner},\\[4pt]
+2\cdot\tfrac1{N-1}\sum_k\mathrm{sc}_k-1 & \cd{OUTCOME\_4P}{=}\text{placement (default)}.
+\end{cases}
+\label{eq:outcome}
+\end{equation}
+The placement-linear $\Omega\in\{-1,-\tfrac13,+\tfrac13,+1\}$ maps finishing place affinely (beat-all
+$=+1$, lose-to-all $=-1$): a dense, correctly-ordered signal where the official top-score-only rule pays a
+4p game like a lottery (2nd of 4 $=$ dead loss). The terminal payment is the win/loss magnitude scaled
+linearly by $\Omega$, $O=\Omega\cdot(\Omega>0\,?\,W:L)$ with $W{=}L{=}1000$, so 2p (where
+$\Omega\in\{\pm1,0\}$) pays as a $\pm1000$ win/loss. The per-seat $\mathrm{sc}_k$ are also the dual-Elo
+update signal (Section~\ref{sec:league}); the logged 4p \cd{win\_rate} is the strict ``beat
+\emph{every} opponent'' indicator $\mathbb 1[\min_k\mathrm{sc}_k\ge1]$.
+
+\paragraph{Scaling into GAE.} Both $r_t$ and the scattered $O$ are divided by
+$\sigma_R=\cd{PPO\_REWARD\_SCALE}=100$ before GAE (the outcome is placed on the episode's last active
+step so GAE propagates it backward); advantages are re-normalised afterward. Empirically the outcome
+dominates the per-game return (e.g.\ $O\!\sim\!450$ vs.\ shaping $\sim\!8$ each), the intended regime.
+
+%================================================================
+\section{PPO\,+\,GAE update}\label{sec:ppo}
+\begin{varsheet}
+$V(s),\,\delta_t$ & value $\sigma\tilde V_\theta{+}\mu$; TD residual $r_t{+}\gamma V(s_{t+1}){-}V(s_t)$ \\
+$\Adv^{\mathrm{GAE}}_t,\,\hat R_t$ & GAE advantage and its return target $\Adv^{\mathrm{GAE}}_t{+}V(s_t)$ \\
+$\mathcal L^V$ & (normalised) value loss \\
+$\gamma,\lambda$ & discount $0.997$, GAE decay $0.98$ \\
+$r_t,\,\epsilon$ & importance ratio; clip radius \cd{CLIP}$=0.2$ \\
+$\mathcal L^{\mathrm{CLIP}},\mathcal L$ & clipped surrogate; total loss $\mathcal L^{\mathrm{CLIP}}{+}c_V\mathcal L^V{-}c_{\mathcal H}\overline{\mathcal H}$ \\
+$c_V,\,c_{\mathcal H},\,\overline{\mathcal H}$ & \cd{vf\_coef}$=0.5$; entropy coefficient; per-source mean entropy \\
+$k_1,k_2,k_3$ & Schulman KL estimators of $\KL(\polold\|\pol)$ \\
+\cd{approx\_kl},\cd{clipfrac} & logged $k_1$-form KL and clip fraction $\E[\mathbb 1(|r_t{-}1|{>}\epsilon)]$ \\
+$\mu,\nu,\sigma,\beta$ & PopArt running mean, second moment, std, EMA rate $\beta{=}3{\times}10^{-4}$ \\
+$\Adv_i,\mu_j,\varsigma_j$ & (GRPO, retired) group-centred advantage, group mean/std; $\polref$ frozen reference \\
+\end{varsheet}
+The algorithm is actor--critic PPO with Generalized Advantage Estimation. With the value head
+$V(s)=\sigma\tilde V_\theta(s)+\mu$, the TD residual $\delta_t=r_t+\gamma V(s_{t+1})-V(s_t)$, and the
+alive/done masks,
+\begin{equation}
+\Adv^{\mathrm{GAE}}_t=\sum_{l\ge0}(\gamma\lambda)^l\delta_{t+l},\qquad
+\hat R_t=\Adv^{\mathrm{GAE}}_t+V(s_t),\qquad
+\mathcal L^V=\tfrac12\big(\tilde V_\theta(s_t)-(\hat R_t-\mu)/\sigma\big)^2,
+\end{equation}
+with $\gamma=\cd{GAMMA}=0.997$ and $\lambda=\cd{GAE\_LAMBDA}=0.98$ (a $\sim$500-step game with
+$\gamma{=}0.99$ discounts the terminal to $\approx7\!\times\!10^{-3}$ and confines GAE credit to the last
+$\sim1/(1{-}\gamma\lambda)$ steps; the higher values let the win-aligned signal reach mid-game actions).
+The \cd{done} flag is set at \emph{any} terminal (death \emph{or} time cap), so a time-capped env does not
+add a spurious $\gamma V(s_T)$ bootstrap on top of the scattered outcome; a true death contributes no
+bootstrap.
+
+\paragraph{Clipped surrogate and total loss.} With the per-sample ratio $r_t=\exp(\log\pol-\log\polold)$,
+\begin{equation}
+\mathcal L^{\mathrm{CLIP}}=-\E_t\Big[\min\!\big(r_t\Adv^{\mathrm{GAE}}_t,\ \clip(r_t,1{-}\epsilon,1{+}\epsilon)\Adv^{\mathrm{GAE}}_t\big)\Big],
+\qquad \epsilon=\cd{CLIP}=0.2,
+\end{equation}
+\begin{equation}
+\mathcal L=\mathcal L^{\mathrm{CLIP}}+c_V\,\mathcal L^V-c_{\mathcal H}\,\overline{\mathcal H},
+\qquad c_V=\cd{vf\_coef}=0.5,
+\end{equation}
+where $\log\pol$ is the per-source sum of Eq.~\eqref{eq:logp}. Optimisation: collect on-GPU under
+$\polold=\pol$, compute GAE, then \cd{UPDATE\_EPOCHS}$=3$ passes over shuffled minibatches with Adam
+(global grad-norm clip \cd{MAX\_GRAD\_NORM}), recomputing $r_t$ each minibatch.
+
+\paragraph{KL: the trust region and its estimators.} For discrete distributions
+$\KL(p\|q)=\sum_x p(x)\log\frac{p(x)}{q(x)}\ge0$ (equality iff $p{=}q$; not symmetric), and the factored
+policy's joint KL is the \emph{sum} of the per-source factor KLs over owned planets. PPO controls the
+old-vs-new KL implicitly through clipping; the loop monitors it with Schulman's estimators of
+$\KL(\polold\|\pol)$ (writing $\log r=\log\pol-\log\polold$):
+\begin{align}
+k_1&=\E_{\polold}[-\log r] && \text{(unbiased; high variance; can be negative),}\\
+k_2&=\tfrac12\E_{\polold}[(\log r)^2] && \text{(low variance; biased; }\ge0\text{),}\\
+k_3&=\E_{\polold}[(r-1)-\log r] && \text{(unbiased; low variance; }\ge0\text{).}
+\end{align}
+$k_3$ is the control-variate fix: $(r-1)$ has zero expectation under $\polold$ and $r-1\ge\log r$ makes
+every term $\ge0$. The loop logs $\cd{approx\_kl}=\operatorname{mean}(\log\polold-\log\pol)$ (the $k_1$
+form) and the clip fraction $\cd{clipfrac}=\E[\mathbb 1(|r_t-1|>\epsilon)]$. \cd{approx\_kl} and
+\cd{clipfrac} rise together: KL growth is what activates the clip, and a spiking clipfrac with a large
+approx-KL is the signal the trust region is binding.
+
+\subsection{PopArt value normalisation}\label{sec:popart}
+The MSE critic target spans a huge dynamic range (Section~\ref{sec:catdir}), so the value head is trained
+in a \emph{normalised} space with output-preserving rescaling (Hessel et al., 2018). With running
+statistics over GAE returns $\hat R$, EMA rate $\beta=\cd{POPART\_BETA}=3\!\times\!10^{-4}$,
+\begin{equation}
+\mu\leftarrow(1{-}\beta)\mu+\beta\,\E[\hat R],\quad
+\nu\leftarrow(1{-}\beta)\nu+\beta\,\E[\hat R^2],\quad
+\sigma=\sqrt{\nu-\mu^2}.
+\end{equation}
+The value loss regresses the normalised target $\mathcal L^V$ above, while GAE/bootstrapping use the
+de-normalised $V=\sigma\tilde V_\theta+\mu$. On each statistics update $(\mu,\sigma)\to(\mu',\sigma')$ the
+final value layer is rescaled to \emph{preserve} raw outputs,
+$W\leftarrow W\,\sigma/\sigma'$, $b\leftarrow(\sigma b+\mu-\mu')/\sigma'$, so $V(s)$ is invariant to the
+update (verified to $4\!\times\!10^{-7}$). PopArt state is persisted in the resumable train-state.
+
+\subsection{The three PPO guardrails}\label{sec:guard}
+These make the post-BC updates structurally incapable of destroying the warm start:
+\begin{enumerate}[nosep,leftmargin=1.8em]
+\item \textbf{Per-minibatch KL hard stop} (\cd{KL\_STOP\_MINIBATCH}). The update breaks \emph{mid-epoch}
+  the moment a minibatch's $k_3$ KL exceeds $\cd{KL\_HARD\_MULT}\,(1.5)\times\cd{KL\_TARGET}\,(0.05)$. The
+  end-of-epoch check provably cannot prevent the iteration-1 slam (KL $2.06$ happened \emph{within} one
+  epoch).
+\item \textbf{Linear LR warmup} (\cd{LR\_WARMUP\_ITERS}): $\eta_t=\eta\cdot\min(1,(t{+}1)/W)$ over the
+  first $W$ iterations \emph{of a \cd{train()} call}, so every fresh-Adam phase (from-scratch, post-BC,
+  resumed-with-fresh-moments) ramps in.
+\item \textbf{Critic-only warmup} (\cd{VALUE\_WARMUP\_ITERS}): for the first $K$ iterations the policy
+  surrogate and entropy are multiplied by $0$ \emph{and only \cd{val\_*} parameters are stepped}. The
+  second clause is load-bearing --- with a shared trunk, the value loss alone (backpropagating into the
+  trunk) dragged the BC policy by KL $0.15$--$0.84$ per iteration with the surrogate fully off. Rationale:
+  after BC the actor is strong but the critic is random, so advantages against a random baseline are
+  structured noise. With the val-only restriction the warmup measures KL $\equiv0.000$, then the actor
+  unfreezes against a usable baseline.
+\end{enumerate}
+
+\subsection{Entropy bonus: gate-only}
+The bonus keeps only \emph{bounded} terms: the gate Bernoulli entropy ($\le\ln2$) plus the categorical
+WHERE entropy ($\le\ln E$) weighted by \cd{ENT\_DIR\_COEF} (default $0$). The coefficient on the gate
+term is annealed $\cd{ENT\_COEF\_START}=0.02\to\cd{ENT\_COEF\_END}=0.002$ (explore $\to$ exploit), and is
+normalised \emph{per owned source}, $\overline{\mathcal H}=\frac1{|\mathcal B|}\sum_b\mathcal H_b/\max(n^b_{\mathrm{owned}},1)$.
+Exploration is supplied by the stochastic gate, categorical sampling, and PFSP opponent diversity --- not
+by fighting the BC sharpness (the unbounded-negative Dirichlet entropy was a blow-up source,
+Section~\ref{sec:catdir}).
+
+\subsection{GRPO (the retired alternative)}\label{sec:grpo}
+The original algorithm had no critic: it drew $N$ groups, each fixing a start world and opponent and
+rolling out $G$ trajectories under $\polold$, and centred each return against its group,
+$\Adv_i=(R_i-\mu_{j})/(\varsigma_{j}+\varepsilon)$ (or $R_i-\mu_j$ unwhitened), broadcast to all of the
+trajectory's timesteps. It used the same clipped surrogate and a KL anchor $\beta\,\E[k_3(\pol\|\polref)]$
+to a frozen reference. PPO\,+\,GAE superseded it because the group baseline collapses each trajectory to a
+single episode return (no temporal credit), which is what produced the passivity wall
+(Section~\ref{sec:history}).
+
+%================================================================
+\section{BC warm-start in the gated-categorical action space}\label{sec:bc}
+\begin{varsheet}
+$\text{fire}^\ast_s,\,\text{where}^\ast_s$ & \cd{medium}-expert fire label / destination one-hot; $d^\ast_s$ the target index \\
+$S_s$ & source garrison (the expert fires when $\lfloor S_s/2\rfloor\ge20$) \\
+$p_s,\,\tilde\ell_{s,\cdot}$ & smooth gate probability / masked WHERE logits \\
+$O,\,F$ & set of owned sources / set of firing sources (this $F$ is a \emph{set}, not the feature count) \\
+$\mathcal L_{\mathrm{BC}}$ & BC loss $=$ gate BCE (all owned) $+$ WHERE cross-entropy (firing only) \\
+\end{varsheet}
+The bootstrap --- not the algorithm --- was the wall (Section~\ref{sec:history}). BC removes it by
+starting PPO from a policy that already commits, aims, and wins against the scripted ladder. This is the
+payoff of the gated-allocation action space: the strongest scripted bot maps \emph{exactly} onto the two
+heads.
+
+\paragraph{The expert, native to the heads.} The clone target is \cd{medium} (nearest non-owned planet,
+lead-aimed, fire when $\lfloor S_s/2\rfloor\ge20$):
+\[
+\text{fire}^\ast_s=\mathbb 1\big[\text{owned}_s\wedge\text{alive}_s\wedge\lfloor S_s/2\rfloor\ge20\wedge\exists\,\text{target}\big],
+\qquad
+\text{where}^\ast_s=\operatorname{onehot}\big(\arg\min_{d:\,\text{non-owned}}\lVert x_d-x_s\rVert\big).
+\]
+Two deliberate deviations: the gated decode dispatches the \emph{full} garrison on fire (the action space
+cannot ``send half''), so the clone is ``full-send medium'' --- measured \emph{stronger} than its teacher;
+and sun-occluded targets are dropped from the WHERE loss (``medium minus sun-suicide'').
+
+\paragraph{Loss (native to the distribution).} With $p_s$ the smooth gate probability and
+$\tilde\ell_{s,\cdot}$ the masked WHERE logits,
+\[
+\mathcal L_{\mathrm{BC}}
+=\underbrace{-\tfrac1{|O|}\sum_{s\in O}\big[\text{fire}^\ast_s\log p_s+(1{-}\text{fire}^\ast_s)\log(1{-}p_s)\big]}_{\text{gate BCE, all owned sources}}
+\underbrace{-\tfrac1{|F|}\sum_{s\in F}\log\softmax(\tilde\ell_{s,\cdot})_{d^\ast_s}}_{\text{WHERE CE, firing sources only}} .
+\]
+The CE \emph{is} the categorical log-likelihood (Eq.~\eqref{eq:where}), so supervised and RL phases
+optimise the same parameters with consistent semantics --- no new heads, no adapter. (It is also the exact
+log-likelihood the Dirichlet's $\softmax$-deploy approximated, so a single BC checkpoint warm-starts
+either WHERE variant.)
+
+\paragraph{Data: states the clone itself visits.} Rollouts are generated by the \emph{expert acting in the
+clone's own action space} against a starter-heavy scripted mix, so the state distribution BC fits is the
+one the warm-started policy will visit --- a free DAgger-like property (no compounding-error gap on the
+states that matter).
+
+\paragraph{Result and quality gate.} A 256/L2 clone in $\sim$144\,s reaches greedy-deploy GpuEnv scores
+$1.000$/$0.938$/$0.625$/$0.875$ vs.\ \cd{random}/\cd{starter}/\cd{greedy}/\cd{medium} --- league Elo
+$\approx900$--$940$, versus the best-ever from-scratch RL of $0.47$ vs.\ starter at $\sim$20\,h. A
+deliberately undertrained clone (64-dim, 2 rounds) reached only dest-acc $0.40$ and scored $0.03$ vs.\
+starter: \textbf{BC inits are trustworthy only above dest-acc $\approx0.85$}. The decisive A/B (same BC
+init, same guardrails, same seeds, only the WHERE distribution changed): categorical climbs
+$0.76\to0.81$ gauntlet, Elo $938\to1099$, KL pinned in $[0.025,0.045]$ for all 40 iters; Dirichlet erodes
+$0.755\to0.104$ with KL spiking $0.2$--$8.9$. The recipe transfers untouched across a $7\times$ parameter
+jump (256/L2 $\to$ 512/L4), and the rollout is simulator-bound so model capacity is nearly free.
+
+%================================================================
+\section{The mixed 2p/4p league}\label{sec:league}
+\begin{varsheet}
+$e^2,e^4$ & dual correlated Elo (2p / 4p) carried by every member \\
+$\E,\,\E^{(4)}_k$ & logistic win expectation (2p / vs.\ seat $k$ in 4p) \\
+$K,K_4,\kappa$ & \cd{ELO\_K}$=$\cd{ELO\_K4}$=32$; cross-format coupling $\kappa{=}0.25$ \\
+$\Delta,\,\bar s,\,\mathrm{sc}_k$ & rating update; mean learner score; pairwise score vs.\ seat $k$ \\
+$s_4,\,a$ & scheduled 4p match share (\cd{S4\_BASE/MIN/MAX/GAIN}); error-diffusion accumulator \\
+$w_m,\,p_m,\,f$ & PFSP draw weight; logistic expectation vs.\ member $m$; PFSP curve \\
+JS & Jensen--Shannon behavioural-footprint (anti-clone) distance \\
+$\beta,\,w$ & weak-point boost factor; learner's actual score EMA \\
+$\hat r,\,R,\,\bar a$ & recalibration back-solved rating; anchor rating; mean anchored 4p rating \\
+$g,g_2,g_4,w_4$ & mixed best-ckpt gauntlet $=(1{-}w_4)g_2{+}w_4g_4$, $w_4{=}0.5$ \\
+\end{varsheet}
+A single training program schedules both formats, because heads-up strength and FFA strength are
+correlated but not identical (the \cd{it1041} post-mortem: 1.000 heads-up gauntlet, yet 29\% 4p top-rate
+vs.\ 58\%).
+
+\paragraph{Unified rollout.} One \cd{collect\_ppo(env, net, pool, \dots, seats, n\_players)} runs both
+formats. The learner is always player $0$ with on-GPU buffers and GPU GAE; each opponent seat is either a
+scripted anchor (on-GPU, zero forwards) or a frozen neural member acting per-step under \cd{no\_grad}. A
+4p iteration costs the learner's rollout $+$ up to three no-grad forwards per step; \cd{B\_4P}$=B$ keeps
+the learner's transition count format-independent.
+
+\paragraph{Dual correlated Elo.} Every member --- and the learner --- carries two ratings $(e^2,e^4)$;
+scripted anchors and invited members are anchored in both (never move); snapshots float. A 2p iteration
+vs.\ member $m$ with mean learner score $\bar s$ and expectation
+$\E=(1+10^{(e^2_m-e^2_\ell)/400})^{-1}$ updates
+\begin{equation}
+\Delta=K(\bar s-\E),\qquad e^2_\ell\mathrel{+}=\Delta,\quad e^4_\ell\mathrel{+}=\kappa\Delta,
+\end{equation}
+($K=\cd{ELO\_K}=32$, coupling $\kappa=\cd{ELO\_COUPLING}=0.25$, non-anchor $m$ mirrored). A 4p FFA becomes
+$N{-}1$ pairwise updates at $K_4/(N{-}1)$ each (the standard multiplayer decomposition; total motion per
+game matches a 2p game at $K_4$):
+\begin{equation}
+\Delta_k=\frac{K_4}{N-1}\big(\mathrm{sc}_k-\E^{(4)}_k\big),\qquad
+e^4_\ell\mathrel{+}=\Delta_k,\quad e^2_\ell\mathrel{+}=\kappa\Delta_k\ \ \text{for each }k,
+\end{equation}
+$K_4=\cd{ELO\_K4}=32$. The coupling encodes that the two skills share most of their variance (a 2p result
+moves the 4p belief a quarter as much, and vice versa) without forcing them equal --- it is exactly their
+\emph{gap} that drives the scheduler.
+
+\paragraph{Gap-driven match mix.} The 4p share is a bounded affine function of the dual-rating gap,
+\begin{equation}
+s_4=\clip\!\Big(\cd{S4\_BASE}+\cd{S4\_GAIN}\cdot\tfrac{e^2_\ell-e^4_\ell}{400},\ \cd{S4\_MIN},\ \cd{S4\_MAX}\Big),
+\end{equation}
+so when the 4p rating lags, more 4p is scheduled (within a $1{:}1\,..\,1{:}6$ envelope). The scheduler is
+\textbf{error-diffused}: an accumulator $a\mathrel{+}=s_4$ each iteration plays 4p iff $a\ge1$ (then
+$a\mathrel{-}=1$), so the realized ratio equals the target exactly over any window (a Bernoulli draw would
+only match in expectation, with format droughts at small counts).
+
+\paragraph{Membership and matchmaking.} Opponents are PFSP draws over all pool members $m$ with weight
+$w_m=\cd{MATCH\_ELO\_W}\,f(p_m)+\cd{MATCH\_FP\_W}\,\mathrm{JS}(\hat\pi_m,\hat\pi_\ell)+\cd{PFSP\_FLOOR}$,
+where $p_m$ is the logistic expectation, $f$ the PFSP curve ($p(1{-}p)$ ``even'' or $(1{-}p)^P$ ``hard''),
+and the JS term is an \emph{anti-clone} behavioral-footprint distance (down-weights near-identical
+snapshots, keeps the maximally-distinct scripted anchors in the mix). The footprint is computed on
+cached \emph{real} encoded states. 4p seats are $k{=}3$ weighted draws without replacement. Two additions:
+\begin{itemize}[nosep,leftmargin=1.6em]
+\item \textbf{Invited members.} The top \cd{INVITE\_MAX}$=4$ \cd{*.pt} by anchored rating from
+  \cd{INVITE\_DIRS} join as fixed high-level bots; the anchor resolves as filename suffix
+  \cd{\_elo<NNNN>} $\succ$ ckpt-meta \cd{elo} $\succ$ \cd{INVITE\_DEFAULT\_ELO}$=750$ (the submitted
+  \cd{it1041} level). While unmastered they sample at $\times\cd{INVITE\_MATCH\_BOOST}{=}2$; once the
+  learner's per-format EMA passes \cd{INVITE\_MASTER\_WR}$=0.75$ their rate drops to
+  $\times\cd{INVITE\_MASTERED\_W}{=}0.2$ (a small anti-forgetting floor). Legacy ($F{=}101$) members get
+  the obs adapter of Section~\ref{sec:obs}.
+\item \textbf{Weak-point matchmaking.} Per member and format, compare the learner's actual score EMA $w$
+  against the Elo-expected $\E$; when reality runs below theory, boost the weight
+  $\beta=\min(\cd{WEAK\_BOOST\_MAX},\,1+\cd{WEAK\_BOOST\_GAIN}(\E-w))$, gated by a minimum game count and a
+  deadband (so EMA noise does not trigger it). It fires only on underperformance.
+\end{itemize}
+
+\paragraph{Curriculum gate.} Strong anchors are withheld from a weak learner. When the learner's online
+Elo first reaches \cd{ADVANCE\_TRIGGER\_ELO}$=525$, a full recalibration with all anchors on fresh seeds
+runs; if it grades $\ge\cd{ADVANCE\_CONFIRM\_ELO}=425$, the advanced anchors unlock permanently
+(the gate refuses to be fooled by self-play inflation).
+
+\paragraph{Recalibration (removes self-play inflation).} Online Elo inflates as the learner farms
+under-rated snapshots. Every \cd{ELO\_RECAL\_EVERY} iters on fresh worlds, the learner's rating is
+re-grounded against the fixed anchors via the logistic back-solve: for measured score $s$ (clamped to
+$[0.02,0.98]$) vs.\ an anchor of rating $R$, $\hat r=R+400\log_{10}\frac{s}{1-s}$, averaged over the
+active anchors. The 4p analog re-grounds $e^4$ from the fixed FFA trio
+$\{\cd{starter},\cd{greedy},\cd{intermediate}\}$ with mean anchored rating $\bar a$:
+$e^4=\bar a+400\log_{10}(s/(1{-}s))$.
+
+\paragraph{Mixed best-checkpoint gauntlet.} ``Best'' is selected on the mix it will be graded on, not 2p
+alone (the 2p-only rule is what crowned \cd{it1041} while it lost FFAs):
+\begin{equation}
+g=(1-w_4)\,g_2+w_4\,g_4,\qquad w_4=\cd{GAUNTLET\_4P\_W}=0.5,
+\end{equation}
+$g_2$ the 2p gauntlet (greedy play vs.\ \cd{starter}/\cd{intermediate}/\cd{greedy} on held-out worlds),
+$g_4$ the mean pairwise score (Eq.~\eqref{eq:outcome} left) of a 4p FFA vs.\ the same trio on the same
+worlds.
+
+\paragraph{Scripted anchors and the leaderboard-calibrated scale.} The pool is pinned by hand-coded bots,
+all vectorised in the GPU env. The anchor Elos were re-pinned from the in-house round-robin to the
+\emph{submitted} Kaggle levels so the learner's rating reads against the competition:
+\begin{center}\small
+\begin{tabular}{@{}lcl@{}}
+\toprule
+anchor & Elo & behaviour \\
+\midrule
+\cd{random}       & $0$   & random heading, half-garrison ($\ge20$) from any planet \\
+\cd{starter}      & $450$ & half-garrison ($\ge20$) at the nearest \emph{static} non-owned planet, straight aim \\
+\cd{intermediate} & $475$ & in-flight-aware capture from the nearest capable source, lead-aimed; local rebalancing; comet-escape \\
+\cd{greedy}       & $500$ & every owned planet captures the nearest beatable non-owned planet within radius, lead-aimed (strongest) \\
+\cd{medium}       & $500$ & ``starter$++$'': nearest non-owned \emph{including} rotating, lead-aimed, half-garrison \\
+\bottomrule
+\end{tabular}
+\end{center}
+Empirical strength order is
+$\cd{greedy}>\cd{medium}>\cd{intermediate}>\cd{starter}>\cd{random}$. The compressed scale understates
+in-house win probabilities (starter$\to$medium is a $\sim$90\%-win gap but is now 50 Elo $\approx57\%$),
+so PFSP/weak-boost expected scores flatten toward $\tfrac12$; the weak-point detector compensates since it
+compares against the same $\E$. League state stores member ratings, so resuming a pre-rescale train-state
+keeps the old anchors --- fresh runs use the new ones.
+
+%================================================================
+\section{Deployment}\label{sec:deploy}
+\begin{varsheet}
+$F$ & body-feature count; v9 checkpoints are $F{=}104$ (do not load in v7-era tools) \\
+\cd{n\_players} & set to $4$ in FFA episodes, $2$ heads-up; the adapter maps each opponent to its own owner $1..3$ \\
+$B,\,E$ & inference batch ($B{=}1$) and planet-token count per move \\
+$d,\,L$ & served model width and depth; cost $\approx12d^2L\cdot E$ MACs/move \\
+\end{varsheet}
+\paragraph{Seat-preserving adapter (the v9 constraint).} The v7-era Kaggle adapters map \emph{every}
+opponent to the single enemy owner before encoding --- correct for v7/v8 (that \emph{is} their training
+view) and \textbf{wrong for v9}: it would zero the seat channels and discard the trained per-enemy
+behaviour. The v9 submission adapter must \emph{preserve seats}: map each opponent id to its own owner
+$1..3$ (any fixed assignment --- Eq.~\eqref{eq:onehot} is ego-relative, so only consistency within a game
+matters), set \cd{n\_players}$=4$ in 4p episodes and $=2$ heads-up. v9 checkpoints ($F{=}104$) do not load
+in the v7-era eval tools. The adapter is parity bit-exact across all egos.
+
+\paragraph{Inference budget.} The served agent runs one forward per turn on a single state ($B{=}1$,
+$E$ planet tokens) on a 2-vCPU Kaggle box ($\sim$0.032\,TFLOP/s fp32). The transformer cost is
+$\approx12d^2L\cdot E$ MACs; even a 768/6 (43.8M-param) model is $\sim$127\,ms/move and a 1024/8 (103M)
+$\sim$302\,ms/move --- both under the 1\,s \cd{actTimeout}. \textbf{The deploy budget never binds the
+architecture choice up to $\sim$100M params}; model scale is bounded by training compute, not inference.
+The fp32 submission size ceiling ($\le$100\,MB) is the real cap ($\le$26M params fp32; a 512-wide
+$B{=}64$ trunk at 37.5M needs fp16).
+
+%================================================================
+\section{Verification battery}\label{sec:verify}
+\begin{itemize}[nosep,leftmargin=1.6em]
+\item \cd{scripts/test\_v8\_parity.py}: v7 vs.\ v8, 70 ticks (comet spawn included), identical random
+  gated-alloc actions vs.\ scripted \cd{medium} --- planet/fleet state \textbf{and} encodings bit-exact
+  (v8 is a strict superset of v7 on the 2p path).
+\item \cd{scripts/test\_v9\_parity.py}: v8 vs.\ v9 --- 2p \emph{state} bit-exact; encodings bit-equal on
+  all shared features; the one-hot exactly consistent with the scalar
+  (self$\leftrightarrow$1, enemy$\leftrightarrow$2); channels $2/3$ provably silent in 2p.
+\item \cd{scripts/verify\_enemy\_id.py}: on a 4-seat state, v8 reads all enemies as code 2 (by design);
+  v9 reads $0100/0010/0001$ and is rotation-equivariant from every ego seat.
+\item \cd{scripts/probe\_dist\_sensitivity.py}: the categorical-vs-Dirichlet gradient/log-prob
+  sensitivity probe of Section~\ref{sec:catdir}.
+\item \cd{scripts/smoke\_v8\_nb.py} / \cd{scripts/smoke\_v9\_nb.py}: the full notebooks at SMOKE scale
+  (BC $\to$ mixed 2p/4p league $\to$ resume): both formats scheduled within the envelope, KL inside the
+  guardrail band, dual ratings and the mixed gauntlet logged; v9 additionally asserts $F{=}104$, the
+  legacy wrapper on $F{=}101$ invites, and wrapper survival across the resume round-trip.
+\end{itemize}
+
+%================================================================
+\section{Config $\leftrightarrow$ symbols}\label{sec:cfg}
+Each section above opens with a local \emph{variable reference} sheet defining the symbols it uses; this
+table is the master config-name $\leftrightarrow$ symbol/role map with deployed values.
+\begin{center}\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+config & symbol / role & value \\
+\midrule
+\multicolumn{3}{@{}l@{}}{\emph{observation / network}}\\
+\cd{N\_BODY\_FEATURES}, $F$  & ownership one-hot (v9)                 & $14$, $F{=}104$ (v8: $11$, $101$)\\
+\cd{HIDDEN}, $d$             & trunk width                           & $512$\\
+\cd{N\_RES\_BLOCKS} / \cd{N\_TX\_LAYERS} & trunk depth               & $6$ / $4$--$5$\\
+\cd{USE\_ATTENTION}, \cd{USE\_GLU}, \cd{D\_G} & trunk A/B, globals dim & on, on, $32$\\
+\cd{DEST\_HEAD}              & WHERE head, Eq.~\eqref{eq:bilinear}    & \cd{bilinear}\\
+\cd{INIT\_DEST\_SCALE}, \cd{INIT\_GATE\_BIAS} & calm init            & $0.02$, $-1$\\
+\cd{WHERE\_DIST}             & WHERE distribution                    & \cd{categorical} (\cd{dirichlet} A/B)\\
+\cd{GATE\_TRIM\_LO/HI}, \cd{GATE\_EPS} & deploy trim / train clamp   & $0.2,0.8$ / $0.02$\\
+\cd{ALLOC\_KAPPA}, \cd{LOGIT\_CLAMP} & Dirichlet-only (A/B)          & --- / $8$\\
+\multicolumn{3}{@{}l@{}}{\emph{reward}}\\
+\cd{SHAPE\_SHIP}, \cd{SHAPE\_PROD} & $c_{\mathrm{ship}},c_{\mathrm{prod}}$, Eq.~\eqref{eq:shape} & $50$, $50$\\
+\cd{OUTCOME\_4P}            & $\Omega$ rule, Eq.~\eqref{eq:outcome}   & \cd{placement} (\cd{winner} $=$ official)\\
+\cd{PPO\_REWARD\_SCALE}, $\sigma_R$ & GAE reward scale              & $100$\\
+\multicolumn{3}{@{}l@{}}{\emph{PPO\,+\,GAE}}\\
+\cd{GAMMA}, \cd{GAE\_LAMBDA} & $\gamma$, $\lambda$                   & $0.997$, $0.98$\\
+\cd{CLIP}, \cd{vf\_coef}     & $\epsilon$, $c_V$                     & $0.2$, $0.5$\\
+\cd{UPDATE\_EPOCHS}          & PPO epochs/iter                       & $3$\\
+\cd{KL\_TARGET}, \cd{KL\_HARD\_MULT} & per-minibatch hard stop       & $0.05$, $1.5$\\
+\cd{LR\_WARMUP\_ITERS}, \cd{VALUE\_WARMUP\_ITERS} & guardrails       & $8$, $5$\\
+\cd{ENT\_COEF\_START/END}, \cd{ENT\_DIR\_COEF} & gate / WHERE entropy & $0.02\!\to\!0.002$, $0$\\
+\cd{USE\_POPART}, \cd{POPART\_BETA} & value normalisation $\beta$    & on, $3\!\times\!10^{-4}$\\
+\multicolumn{3}{@{}l@{}}{\emph{league}}\\
+\cd{FOURP\_ENABLED}, \cd{B\_4P} & 4p training, envs per 4p iter      & on, $B$\\
+\cd{S4\_BASE/MIN/MAX/GAIN}   & match mix                             & $0.60$ / $0.50$ / $6/7$ / $1.0$\\
+\cd{ELO\_K}, \cd{ELO\_K4}, \cd{ELO\_COUPLING} & $K$, $K_4$, $\kappa$ & $32$, $32$, $0.25$\\
+\cd{INVITE\_MAX/DEFAULT\_ELO} & invited members                     & $4$ / $750$\\
+\cd{INVITE\_MATCH\_BOOST/MASTER\_WR/MASTERED\_W} & sparring focus    & $2.0$ / $0.75$ / $0.2$\\
+\cd{WEAK\_BOOST\_MIN\_GAMES/MIN\_GAP/GAIN/MAX} & weak-point boost    & $5$ / $0.05$ / $10$ / $3$\\
+\cd{MATCH\_ELO\_W/FP\_W}, \cd{PFSP\_FLOOR} & matchmaking blend       & $0.7$ / $0.3$ / $0.05$\\
+\cd{GAUNTLET\_4P\_W}, $w_4$  & mixed best-ckpt weight                & $0.5$\\
+\cd{ELO\_STARTER/INTERMEDIATE/GREEDY/MEDIUM} & anchor ratings        & $450$ / $475$ / $500$ / $500$\\
+\cd{ADVANCE\_TRIGGER\_ELO/CONFIRM\_ELO} & curriculum gates           & $525$ / $425$\\
+\cd{MIN\_LAUNCH\_SHIPS}, $r_\odot$ & decode floor; sun radius        & $1$; $10$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\appendix
+%================================================================
+\section{Appendix: search-based improvement (the planned successor)}\label{sec:search}
+\begin{varsheet}
+$m$ & number of joint actions sampled and searched (degrades to PPO at $m{=}1$) \\
+$g$ & per-factor Gumbel noise (Gumbel-Top-$k$ sampling) \\
+$\hat q$ & completed action-value (a depth-1 real env step bootstrapped by $V_\phi$) \\
+$A^\star$ & selected action $\arg\max(g+\mathrm{logits}+\sigma(\hat q))$ \\
+$\pi'$ & search-improved policy target $\softmax(\mathrm{logits}+\sigma(\mathrm{completedQ}))$ \\
+$V_\phi,\,z$ & leaf-value network; its regression target \\
+\end{varsheet}
+PPO improves the policy with a first-order gradient on sampled returns; the AlphaZero family improves it
+by \emph{planning}. Discretising the action (the categorical WHERE of Section~\ref{sec:catdir}) was the
+prerequisite. Because \cd{GpuEnv} is a perfect, batched, cheaply-cloneable simulator, the \textbf{learned
+model is unnecessary} --- AlphaZero (search with the real model), not MuZero, is the template: the encoder
+$+$ trunk is the representation, the real env step is the dynamics, the real reward is the reward head, the
+factored actor is the policy prior, and the PPO critic is the leaf value. Three obstacles and their
+resolutions:
+\begin{itemize}[nosep,leftmargin=1.6em]
+\item \textbf{Combinatorial factored action} (one categorical per owned planet): sample $m$ joint actions
+  via per-factor \textbf{Gumbel-Top-$k$} (Multiagent Gumbel MuZero) and search only those; cost scales
+  with samples, not the product space. The reachability mask shrinks each row's support first.
+\item \textbf{Very few simulations}: \textbf{Gumbel MuZero} gives a \emph{guaranteed} policy improvement at
+  any budget --- Sequential Halving over the sampled top-$m$, action
+  $A^\star=\arg\max(g+\mathrm{logits}+\sigma(\hat q))$, training target
+  $\pi'=\softmax(\mathrm{logits}+\sigma(\mathrm{completedQ}))$. Each $q$ is a depth-1 real env step
+  bootstrapped by $V_\phi$.
+\item \textbf{Simultaneous moves / hidden opponent}: treat the frozen league opponent as a \emph{chance
+  node} (opponent-as-chance / Stochastic MuZero afterstates) --- we need no learned chance model because
+  $\mu$ is a network we can query; averaging over a PFSP mixture makes $\pi'$ a best response to the
+  population.
+\end{itemize}
+The loss replaces the clipped surrogate with $\KL(\pi'\|\pol)+c_V(V_\phi-z)^2$; everything else (factored
+actor, masks, GPU rollout, league) transfers as-is, and the design degrades gracefully to current PPO at
+$m{=}1$. Reanalyze (re-search stored trajectories with the latest network) is a large sample-efficiency
+win the perfect simulator makes free.
+
+\end{document}

@@ -1,0 +1,270 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+\usepackage{xcolor}
+
+\newcommand{\cd}[1]{\texttt{\detokenize{#1}}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\setlist{itemsep=2pt,topsep=3pt}
+
+\title{\textbf{Orbit Wars --- v12 PPO\,+\,GAE}\\[3pt]
+\large The shipped on-policy learner: GPU-side GAE on the shaped reward, the clipped surrogate with
+PPO/DAPO/GSPO knobs, PopArt value targets, the BC-stability guardrails, and the optional UNREAL
+auxiliary reward-prediction head}
+\author{Source of truth: \texttt{orbit\_wars\_v12/rollout.py}, \texttt{ppo.py}, \texttt{policy.py}}
+\date{2026-06-19}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent This is document~2 of four and describes the \textbf{default} learner: PPO with
+Generalized Advantage Estimation (\cd{cfg.ALGO="ppo"}). It assumes document~1
+(\cd{v12_setup.tex}) for the game, the \cd{GpuEnv} rollout, the observation encoding, the
+gated-allocation action, and especially the reward --- PPO learns from exactly the reward defined
+there. Here we document only the PPO-specific machinery: how the advantage and value targets are
+built in \cd{collect_ppo}, the clipped-surrogate update in \cd{ppo_update} (including the DAPO and
+GSPO knobs), the value-warmup / LR-warmup / KL guardrails that make PPO-after-BC stable, and the
+optional auxiliary reward-prediction head. The last section addresses head-on whether that head
+``replaces GAE'' (it does not, and we explain precisely why a reward head cannot).
+\end{abstract}
+
+\tableofcontents
+\bigskip
+
+%==================================================================================================
+\section{What PPO adds to the shared loop}
+The actor--critic network of document~1 has a \textbf{value head} (the PopArt critic) that PPO trains
+and uses as a learned baseline; GRPO (document~3) leaves it untrained. The per-iteration loop in
+\cd{train.py} is shared: PFSP-sample league opponents, roll out $B$ envs with \cd{collect_ppo},
+call \cd{ppo_update}, update Elo. PPO's contribution is (i) the \textbf{GAE} advantage and value
+targets computed at the end of the rollout, and (ii) the \textbf{clipped surrogate $+$ value loss}
+update. Key hyperparameters (\cd{config.py}):
+\begin{center}
+\begin{tabular}{@{}llll@{}}
+\toprule
+$\gamma$ \cd{GAMMA} & 0.997 & $\lambda$ \cd{GAE_LAMBDA} & 0.98 \\
+clip \cd{CLIP} & 0.2 & \cd{VF_COEF} & 0.5 \\
+\cd{ENT_COEF} (anneal) & $0.005\!\to\!0.002$/300it & \cd{MINIBATCHES} & 64 \\
+\cd{UPDATE_EPOCHS} & 3 & \cd{MAX_GRAD_NORM} & 0.5 \\
+\cd{KL_TARGET} & 0.05 & \cd{LOGRATIO_CLAMP} & 4.0 \\
+\cd{LR} & $10^{-4}$ & \cd{ADAM_EPS} & $10^{-5}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%==================================================================================================
+\section{Advantage and value targets (\texttt{collect\_ppo})}
+During the rollout, each step stores the critic value $V(s_t)=\cd{val_buf}[t]$ (PopArt-denormalized
+in \cd{act}), the shaped per-step reward $r_t=\cd{rew_buf}[t]$ (document~1, divided by
+\cd{PPO_REWARD_SCALE}), a \cd{done} flag (terminal on capture-out or death), and an \cd{alive} mask.
+After the loop the terminal outcome payment $O/\cd{PPO_REWARD_SCALE}$ is scattered onto each env's
+last active step, so $r_t$ carries both the dense shaping and the sparse game result.
+
+\paragraph{Bootstrap.} A final forward gives $V(s_T)$ for envs still active at the horizon:
+$\cd{bootstrap}=V(s_T)\cdot\cd{active}$ (zero for envs that already terminated --- no spurious
+bootstrap past a decided game).
+
+\paragraph{GAE recursion (on-GPU, no host sync).} With $\delta_t=r_t+\gamma V(s_{t+1})(1-\cd{done}_t)-V(s_t)$,
+the truncated GAE is accumulated backwards:
+\[
+  A_t = \delta_t + \gamma\lambda\,(1-\cd{done}_t)\,A_{t+1},
+  \qquad
+  \hat R_t = A_t + V(s_t),
+\]
+masked by \cd{alive} at every step (finished envs contribute nothing). $\hat R_t$ is the value
+\emph{target}; $A_t$ is the policy advantage. The whole recursion runs as tensor ops on the device
+--- no \cd{.cpu()}, no \cd{synchronize}.
+
+\paragraph{Advantage normalization.} On the PPO path the flattened advantage is standardized over the
+live transitions, $A\leftarrow(A-\bar A)/(\sigma_A+10^{-8})$, before it enters the surrogate. (The
+\cd{unit_scaled} and \cd{ADV_TARGET_RMS} branches in the same code block are GRPO-only and never fire
+for \cd{ALGO="ppo"}.) Value targets $\hat R_t$ are stored raw in \cd{tb["returns"]} and normalized by
+PopArt inside the update.
+
+%==================================================================================================
+\section{The clipped-surrogate update (\texttt{ppo\_update})}
+\cd{ppo_update} runs \cd{UPDATE_EPOCHS} passes over \cd{MINIBATCHES} random minibatches, each
+re-evaluating the policy on the stored transitions and taking one Adam step. All logging stats are
+accumulated on-GPU and flushed with a \emph{single} host sync at the end.
+
+\paragraph{Importance ratio.} For a minibatch, \cd{evaluate} returns the current log-prob
+$\log\pi(a\mid s)$ (summed over owned sources, document~1). The log-ratio against the stored
+behaviour log-prob is
+\[
+  \rho = \exp\!\big(\mathrm{clip}(\log\pi-\log\pi_{\text{old}},\ \pm\cd{LOGRATIO_CLAMP})\big).
+\]
+\textbf{[GSPO / \cd{RATIO_LENGTHNORM}]} optionally divides the log-ratio by the number of owned
+planets before exponentiating, so the ratio measures policy change \emph{per decision} rather than a
+product over a variable planet count (whose variance otherwise trips the clip/KL unevenly). Default
+off.
+
+\paragraph{Clipped surrogate.}
+\[
+  L^{\text{pol}} = -\,\E\big[\min(\rho\,A,\ \mathrm{clip}(\rho,\,1-\cd{CLIP},\,1+\cd{CLIP_{hi}})\,A)\big].
+\]
+\textbf{[DAPO / \cd{CLIP_HI}]} sets an asymmetric \emph{upper} clip $1+\cd{CLIP_HI}$ (anti-passivity:
+lets good actions ratchet up faster than bad ones are cut); \cd{CLIP_HI}$=0$ recovers the symmetric
+PPO clip $1\pm\cd{CLIP}$ (the default).
+
+\paragraph{Value loss and PopArt.} The critic regresses the PopArt-normalized return,
+$L^{\text{vf}}=\mathrm{MSE}(V,\ \cd{popart.normalize}(\hat R))$. After each step,
+\cd{popart.update} rescales \cd{val_out}'s weight/bias so the head's \emph{raw} predictions are
+preserved while the running mean/variance track the target distribution
+($\beta=\cd{POPART_BETA}=3\!\times\!10^{-4}$). This keeps value targets $O(1)$ across the huge
+$\pm1000$ outcome scale.
+
+\paragraph{Entropy.} A per-owned-source mean entropy bonus $\bar H=\E[H/n_{\text{owned}}]$ (gate-only
+by default, document~1) is subtracted with the annealed \cd{ent_coef}.
+
+\paragraph{Total loss.}
+\[
+  L = \underbrace{p_c}_{\text{warmup}}\,L^{\text{pol}}
+    + \cd{VF_COEF}\cdot L^{\text{vf}}
+    - p_c\cdot\cd{ent_coef}\cdot\bar H
+    \ (+\ \cd{AUX_REWARD_COEF}\cdot L^{\text{aux}}),
+\]
+followed by global-norm grad clipping at \cd{MAX_GRAD_NORM} and a fused-Adam step (skipped if the
+grad norm is non-finite).
+
+\subsection{BC-stability guardrails}
+PPO is initialized from a sharp BC clone (document~1), so the early updates must not wreck it:
+\begin{itemize}
+  \item \textbf{Critic-only warmup} (\cd{VALUE_WARMUP_ITERS}$=5$): for the first few iters
+        $p_c=0$, and \emph{after} \cd{backward} every gradient on a parameter \emph{not} prefixed
+        \cd{val_} is zeroed --- so only the critic learns to track the BC policy's value, and the
+        shared trunk is not dragged by value gradients while the policy is frozen. (Because the aux
+        reward head's parameters are also non-\cd{val_}, it likewise trains only after warmup.)
+  \item \textbf{Linear LR warmup} (\cd{LR_WARMUP_ITERS}$=16$): $\text{lr}=\cd{LR}\cdot\min(1,(step{+}1)/16)$.
+  \item \textbf{KL early-stop} (k3 estimator $\widehat{\mathrm{KL}}=\E[(\rho-1)-\log\rho]\ge0$):
+        a minibatch exceeding \cd{KL_HARD_MULT}$\times$\cd{KL_TARGET} stops the epoch immediately
+        (\cd{KL_STOP_MINIBATCH}); an epoch whose \emph{mean} KL exceeds \cd{KL_TARGET} ends the update
+        (\cd{KL_EARLYSTOP}).
+  \item \textbf{Gate-collapse tripwire} (in \cd{train.py}): if the launch rate's recent EMA falls
+        below \cd{TRIPWIRE_FRAC} of the early baseline under healthy-looking KL, it warns of a
+        passivity ratchet --- the project's oldest failure mode.
+\end{itemize}
+
+%==================================================================================================
+\section{The auxiliary reward-prediction head (\texttt{AUX\_REWARD\_PRED})}
+This is the ``aux head'' variant. An optional shallow head off the \emph{shared} trunk regresses the
+immediate per-step reward $r_t$ as a supervised auxiliary (UNREAL-style), adding
+$L^{\text{aux}}=\mathrm{MSE}(\hat r,\,r_t)$ weighted by \cd{AUX_REWARD_COEF}$=0.25$. The target
+$r_t$ is exactly the reward signal GAE already consumes (document~1, including the terminal payment).
+The head is built only when the flag is on, so the network --- and every existing checkpoint --- is
+byte-identical when off; when on, the flag is persisted in the checkpoint \cd{config} blob and the
+head is rebuilt per-member, so pre-aux league snapshots and invited members still load (document~1's
+\cd{LegacyObsAdapter} / \cd{build_from_cfg} plumbing).
+
+\subsection{Does the aux head ``replace GAE''? No --- and here is why a reward head cannot}
+It is tempting to read the aux head as a GAE substitute. It is not: \textbf{GAE runs unchanged}, the
+critic still produces the baseline, and the aux head is a pure \emph{representation} auxiliary --- it
+adds gradient to the trunk and changes neither the reward, the advantage, nor the critic.
+
+The deeper reason a reward-prediction head cannot stand in for GAE is that \textbf{folding a value
+estimate into the reward is a GAE no-op}. GAE telescopes: with the shaped reward
+$r'_t=r_t+\gamma\,\Phi(s_{t+1})-\Phi(s_t)$ for any state potential $\Phi$, the advantage
+\[
+  A^{\lambda}_t(r') = A^{\lambda}_t(r) + \big[\Phi(s_t)-\Phi(s_t)\big]\ \text{(the $\Phi$ terms cancel along the $\lambda$-sum)}
+\]
+is \emph{unchanged} --- this is exactly the policy-invariance of potential-based shaping (the same
+identity document~1 uses for the shaping reward). So you cannot manufacture a useful baseline by
+predicting reward and adding it back in: whatever potential-shaped quantity a reward head learns,
+GAE's discounted-difference structure cancels it. A learned \emph{baseline} (the critic) is needed
+precisely because it enters the advantage \emph{outside} that telescoping cancellation
+($A_t=\sum(\gamma\lambda)^k\delta_{t+k}$ with $\delta$ built from $V$). The aux head is therefore
+positioned as what it can actually help: pressuring the shared trunk to encode reward-predictive
+features, which helps when the RL signal is terminal-dominated --- not as a critic replacement.
+
+\subsection{Caveat}
+The aux target $r_t$ \emph{includes} the sparse terminal payment, which overlaps what the critic
+already predicts at the last step (a large terminal spike on top of the small dense shaping). A
+\emph{dense-only} variant (regress the shaping channels, exclude the terminal payment) avoids that
+overlap and is the cleaner representation signal; it is offered but not the current default. See
+memory \cd{v12-aux-reward-head}.
+
+%==================================================================================================
+\section{The win-bet head (\texttt{AUX\_WIN\_BET}) --- a stronger aux target}
+A more decision-relevant alternative to predicting $r_t$: have the shared trunk \emph{bet} on the
+eventual game outcome. The same shallow scalar head emits a bet $b_t=\tanh(\hat r)\in[-1,1]$, scored
+against the episode outcome $z\in[-1,1]$ (2p $\pm1$ win/loss; 4p placement) by the linear payoff
+$b_t\cdot z$; the update minimizes $-\,\cd{AUX_WIN_BET_COEF}\cdot\E[b_t z]$ (bet $+1$ \& win $\to+1$;
+bet $+1$ \& lose $\to-1$; bet $-1$ \& lose $\to+1$). Like the reward head it is a \emph{pure
+representation} aux --- not in the reward, advantage, or critic --- reuses the same shallow head and
+checkpoint plumbing (mutually exclusive with \cd{AUX_REWARD_PRED}; win-bet takes precedence), and
+trains only after the value warmup. It pressures the trunk to discriminate winning vs.\ losing states,
+a far stronger signal than the immediate reward. The per-step target is the terminal outcome broadcast
+to every step (\cd{tb["outcome"]}, set in \cd{collect_ppo}); it is consumed by both \cd{ppo_update} and
+the critic-free \cd{grpo_update}, so it trains under PPO, GRPO, and \cd{ALGO="mc"} (the blockseq MC
+notebooks enable it).
+
+\emph{Caveat:} the linear payoff is not a proper scoring rule --- its optimum is the hard bet
+$b=\operatorname{sign}(2p-1)$, so it elicits the \emph{sign} of the win-probability, not a calibrated
+$p$. That is fine for a representation aux (it forces confident win/loss discrimination); use a
+log/Brier rule if calibrated probabilities are wanted. See memory \cd{v12-aux-win-bet-head}.
+
+\subsection{One-sided win-bet \emph{reward} (\texttt{AUX\_WIN\_BET\_REWARD})}
+Optionally the bet is promoted from a pure representation aux to an actual per-step \emph{reward} fed
+into the advantage, to \emph{shape behaviour} (not just the representation). It must be \emph{one-sided}.
+Folding the symmetric payoff $b_t z$ into the return is a passivity trap: in a game it is going to lose
+($z=-1$) the policy collects $(-1)(-1)=+1$ per step for confidently betting on its own loss, so the
+cheapest way to maximize the channel is to \emph{throw the game early and bet against itself} --- the
+documented passivity ratchet (memories \cd{orbit-wars-policy-failure-diagnosis},
+\cd{grpo-anticollapse-v12}). Rectifying to the winning side removes that gradient entirely. The added
+per-step reward is
+\[
+  r^{\text{bet}}_t \;=\; \cd{AUX_WIN_BET_REWARD_COEF}\cdot \operatorname{relu}\!\big(\tanh \hat r_t\big)\cdot \max(z,0),
+\]
+i.e.\ it pays for \emph{confident wins} and \emph{exactly zero} on a draw/loss. The bet is
+\emph{detached} when used as a reward (it is a reward, not a loss --- the head is still trained as a
+calibrated bet by \cd{AUX_WIN_BET}); $z$ is known only at termination, so the rectified reward is added
+to every live step's reward once the rollout's outcome is resolved (\cd{collect_ppo}), in raw units
+divided by \cd{PPO_REWARD_SCALE} like the other dense channels. Because it lives in the reward stream it
+flows through PPO+GAE and the per-step GRPO / \cd{ALGO="mc"} returns alike (bypassed only under
+\cd{GRPO_OUTCOME_ONLY}, which scores the terminal payoff only). It \textbf{requires}
+\cd{AUX_WIN_BET=True} (\cd{Config.create} raises otherwise) and is reported as the \cd{wb} channel in the
+\cd{R[o c p ln wb]} heartbeat. Default off. Keep the coefficient modest (the default $0.5$ raw integrates
+to $\sim$75 over a won game, $\ll$ \cd{WIN_BONUS} $=1000$) so the terminal W/L still dominates.
+
+%==================================================================================================
+\section{Config-knob map}
+\begin{center}
+\begin{tabular}{@{}llL{0.50\linewidth}@{}}
+\toprule
+field & default & controls \\
+\midrule
+\cd{ALGO}              & \texttt{"ppo"} & selects this learner (vs \texttt{"grpo"}) \\
+\cd{GAMMA}             & 0.997 & discount \\
+\cd{GAE_LAMBDA}        & 0.98  & GAE bias/variance trade-off \\
+\cd{CLIP}              & 0.2   & symmetric PPO clip half-width \\
+\cd{CLIP_HI}           & 0.0   & [DAPO] asymmetric upper clip $1+\cd{CLIP_HI}$ (0 $=$ symmetric) \\
+\cd{RATIO_LENGTHNORM}  & False & [GSPO] divide the log-ratio by \#owned planets \\
+\cd{VF_COEF}           & 0.5   & value-loss weight \\
+\cd{ENT_COEF_START/END}& 0.005/0.002 & entropy anneal (over \cd{ENT_DECAY_ITERS}$=300$) \\
+\cd{MINIBATCHES}       & 64    & minibatches per epoch \\
+\cd{UPDATE_EPOCHS}     & 3     & epochs per update \\
+\cd{KL_TARGET}         & 0.05  & KL early-stop target (k3) \\
+\cd{KL_HARD_MULT}      & 1.5   & per-minibatch hard-stop multiplier \\
+\cd{VALUE_WARMUP_ITERS}& 5     & critic-only (val-grad-masked) warmup iters \\
+\cd{LR_WARMUP_ITERS}   & 16    & linear LR warmup \\
+\cd{USE_POPART}        & True  & output-preserving value-target normalization \\
+\cd{AUX_REWARD_PRED}   & False & build/train the UNREAL reward-prediction head \\
+\cd{AUX_REWARD_COEF}   & 0.25  & aux reward-MSE weight \\
+\cd{AUX_WIN_BET}       & False & build/train the win-bet head (maximize $b\cdot z$; precedence over reward-pred) \\
+\cd{AUX_WIN_BET_COEF}  & 0.25  & win-bet aux weight \\
+\cd{AUX_WIN_BET_REWARD}& False & one-sided confident-win bet reward into the advantage (needs \cd{AUX_WIN_BET}) \\
+\cd{AUX_WIN_BET_REWARD_COEF}& 0.5 & raw per-step weight of $\operatorname{relu}(b_t)\max(z,0)$ (pre \cd{PPO_REWARD_SCALE}) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\end{document}

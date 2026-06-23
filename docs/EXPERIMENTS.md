@@ -1,5 +1,21 @@
 # Orbit Wars — experiment log
 
+> **UPDATE 2026-06-19 — GRPO "anti-collapse" estimators FAIL the GPU ablation; legacy std-norm is the keeper.**
+> A v12 GRPO run collapsed (passivity: launch-rate → 0.1, losing to its own snapshots *and* to `greedy`). A set
+> of Tier 0–2 critic-free "fixes" was added (rank / Dr.GRPO / sibling / phi-value advantages, clip-higher, etc.;
+> `docs/v12_grpo.tex`) and one — the bounded **rank** advantage — was shipped as the notebook default on the
+> strength of a deterministic √3-bound proof. **A controlled RTX 3070 Ti ablation reversed that** (`scripts/_gpu_ab*.py`;
+> shared BC init, h256 trunk, 2p, 100 iters/arm): *every* anti-collapse estimator drove the agent into the
+> **passivity basin** (launch → ~0, Elo down), while **legacy per-group std-norm stayed stable and improving**
+> (Elo 1497→1576). Two confirmed root causes: (1) the it426→it526 collapse was a **reward TRIGGER** (an asymmetric
+> "lose-slower" outcome decay), *not* the estimator — identical legacy std-norm is stable under symmetric decay and
+> collapses only when `LOSS_DECAY<1`; keep `WIN_DECAY=LOSS_DECAY=1.0`. (2) The "all flags on" A100 collapse was a
+> **precedence footgun** — the mutually-exclusive estimator flags silently select `sibling`/`phi-value`, never rank
+> (`train.py` now prints the active estimator and warns). ***Bounded ≠ good***: the √3 bound held, but rank discards
+> win-magnitude → stops rewarding aggression. **Keeper: legacy std-norm + symmetric decay** (`setup1_v12_grpo_a100.ipynb`
+> reverted to it). Next lever if the spiral recurs: trust-region/entropy (`GRPO_KL_COEF>0`, entropy floor), not an
+> estimator swap. Full write-up: `docs/v12_grpo.tex` §"Empirical verdict"; curves in `runs/v12_gpu_ab*/`.
+
 > **UPDATE 2026-06-04 — RL now beats starter without search.** Three changes broke the old
 > "RL plateaus at 0–2% vs starter" wall: (1) **threat-aware obs** (5 incoming-fleet features so a
 > reactive policy can defend), (2) a **GLU/ResNet trunk**, (3) a **properly-trained BC** (800
