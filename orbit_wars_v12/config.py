@@ -114,17 +114,23 @@ class Config:
     # precedence). Default OFF; flag persisted in the ckpt blob so league members rebuild correctly.
     AUX_WIN_BET: bool = False        # build + train the win-bet head (maximize bet*outcome; ppo_update only)
     AUX_WIN_BET_COEF: float = 0.25   # weight of the win-bet aux loss (shared-trunk regularizer)
-    # ---- ONE-SIDED win-bet REWARD (behaviour shaping; PPO + GRPO + mc) --------------------------
+    # ---- SELF-CONFIDENCE win-bet REWARD (behaviour shaping; PPO + GRPO + mc) --------------------
     # Optionally promote the bet from a pure representation aux to an actual per-step REWARD fed into
-    # the advantage -- but ONE-SIDED: pay coef * relu(tanh(bet)) * max(z,0). It rewards CONFIDENT WINS
-    # and pays EXACTLY ZERO on a draw/loss. The two-sided bet*z reward is a passivity trap (it pays
-    # coef/step for confidently LOSING -> the policy learns to bet against itself and throw games, the
-    # documented passivity ratchet); rectifying to the winning side removes that gradient entirely. The
+    # the advantage. PROPER SCORING RULE, one-sided in the BET but two-sided in the OUTCOME: only a
+    # POSITIVE self-bet (b>0, "I will win") is ever scored, and it pays relu(tanh(bet)) * z -- so a
+    # confident WIN is rewarded (true positive) and a confident LOSS is PENALISED the same (false
+    # positive). The old relu(b)*max(z,0) form zeroed the loss branch, so betting max on yourself was
+    # free on a loss and the model just bet 1.0 every step regardless -- meaningless. Signing by z
+    # forces calibration: bet high ONLY when genuinely confident. It stays one-sided in the bet (b<=0
+    # scores nothing either way) so the "predict your own loss for free reward" passivity trap never
+    # opens. BUDGETED: at most TURN_CAP raw per step and TURN..GAME_CAP raw per game (earliest-first),
+    # both in raw units pre PPO_REWARD_SCALE -> sits below the +-WIN_POOL outcome / alive channels. The
     # bet is DETACHED into the reward (no grad through it); the head is still trained as a calibrated bet
     # by the AUX_WIN_BET loss above. REQUIRES AUX_WIN_BET=True. Default OFF; flows through PPO+GAE and the
     # per-step GRPO/mc returns (bypassed only under GRPO_OUTCOME_ONLY, which keeps the terminal payoff).
-    AUX_WIN_BET_REWARD: bool = False     # add the one-sided confident-win bet reward into the advantage
-    AUX_WIN_BET_REWARD_COEF: float = 0.5 # raw per-step weight (pre PPO_REWARD_SCALE); ~0.5 -> ~75 raw over a won game (<<WIN_BONUS 1000)
+    AUX_WIN_BET_REWARD: bool = False      # add the self-confidence bet reward (signed by outcome) into the advantage
+    AUX_WIN_BET_TURN_CAP: float = 10.0    # max |bet reward| per step  = payout at a full bet (relu(tanh)=1)
+    AUX_WIN_BET_GAME_CAP: float = 250.0   # max |bet reward| per game (cumulative budget, paid earliest-first)
 
     # ---- GRPO (group-relative PO; critic-free alternative to PPO+GAE) -----------------------
     # ALGO selects the optimizer at rollout+update time. "grpo" rolls each world out GRPO_GROUP
@@ -326,6 +332,10 @@ class Config:
     ELO_RECAL_EVERY: int = 500
     RESUME_FROM: Optional[str] = None
     ELO_RECAL_ENVS: int = 64
+    SKIP_WARMSTART_RECAL: bool = False  # warm-start (bare ckpt, no league state) normally grounds the
+    #   learner Elo vs anchors + runs the measured eviction before training -- a long one-time pass at
+    #   ELO_RECAL_ENVS. True -> SKIP it and stamp a placeholder Elo (ELO_STARTER); the rating re-grounds
+    #   at the first ELO_RECAL_EVERY. Use to jump straight into training when resuming a bare snapshot.
 
     # ---- v8: mixed 2p/4p + dual Elo + invited league ---------------------------------------
     FOURP_ENABLED: bool = True

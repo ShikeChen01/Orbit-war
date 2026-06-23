@@ -87,10 +87,10 @@ OVERRIDES   = dict(
     # earning b*z -- pressures it to discriminate winning vs losing states. Representation aux only (not in
     # the advantage); mutually exclusive with AUX_REWARD_PRED (win-bet wins).
     AUX_WIN_BET=False, AUX_WIN_BET_COEF=0.25,      # True -> turn the win-bet aux head on
-    # ONE-SIDED win-bet REWARD (needs AUX_WIN_BET=True): also feed the (detached) bet into the advantage as
-    # coef*relu(tanh(bet))*max(z,0) -- rewards CONFIDENT WINS, pays ZERO on a loss (the two-sided bet*z reward
-    # is a passivity trap). Behaviour shaping, not just representation. Heartbeat: R[... wb].
-    AUX_WIN_BET_REWARD=False, AUX_WIN_BET_REWARD_COEF=0.5,   # True -> one-sided confident-win bet reward
+    # SELF-CONFIDENCE win-bet REWARD (needs AUX_WIN_BET=True): also feed the (detached) bet into the advantage
+    # as relu(tanh(bet))*z, capped at TURN_CAP/step & GAME_CAP/game -- REWARDS confident wins, PENALISES
+    # confident losses (false positives), one-sided in the bet. Behaviour shaping. Heartbeat: R[... wb].
+    AUX_WIN_BET_REWARD=False, AUX_WIN_BET_TURN_CAP=10.0, AUX_WIN_BET_GAME_CAP=250.0,   # signed self-confidence bet reward
 )
 """ + _SETTINGS_PRINT
 
@@ -399,6 +399,7 @@ OVERRIDES   = dict(
     ALGO="ppo", VALUE_RES_BLOCKS=2, VALUE_WARMUP_ITERS=5, VF_COEF=0.5,
     GRAD_CHECKPOINT=True, USE_COMPILE=True, AMP_DTYPE=torch.bfloat16,
     NUM_GROUPS=16, GROUP_SIZE=16, TOTAL_ITERS=2000, BC_ENABLED=True,
+    # SKIP_WARMSTART_RECAL=True,  # resuming a BARE snapshot? skip the long start-of-run Elo grounding (re-grounds at first recal)
     # --- WIN POOL terminal + clawback (1200 win / -1000 decayed loss) ---
     USE_WIN_POOL=True, WIN_POOL=1200.0, ALIVE_REWARD=2.0,
     LOSS_PENALTY=1000.0, LOSS_DECAY=0.9995, WIN_DECAY=1.0, DECAY_START_STEP=100.0,
@@ -406,8 +407,8 @@ OVERRIDES   = dict(
     USE_POTENTIAL_SHAPING=True, DENSE_WITH_SHAPING=True, SHAPE_SHIP=25.0, SHAPE_PROD=25.0,
     # --- capture + prod-milestone + launch SHARE one 250 hard game cap ---
     USE_DENSE_GAME_CAP=True, DENSE_GAME_CAP=250.0,
-    # --- one-sided confident-WIN bet reward: up to +1/step on won games, zero on a loss ---
-    AUX_WIN_BET=True, AUX_WIN_BET_COEF=0.25, AUX_WIN_BET_REWARD=True, AUX_WIN_BET_REWARD_COEF=1.0,
+    # --- self-confidence bet reward: +/-10/step (signed by outcome), <=250/game; rewards confident wins, penalises confident losses ---
+    AUX_WIN_BET=True, AUX_WIN_BET_COEF=0.25, AUX_WIN_BET_REWARD=True, AUX_WIN_BET_TURN_CAP=10.0, AUX_WIN_BET_GAME_CAP=250.0,
 )''' % SUBMISSION_SPEC + "\n" + _SETTINGS_PRINT
 
 # Critical-step MCTS deploy demo for the submission nb -- the EXACT deploy schedule (scaled bank for a quick demo).

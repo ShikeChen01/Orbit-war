@@ -216,6 +216,10 @@ def load_train_state(cfg, net, opt, league, path):
                     league.add_invited(p, aelo)
                 except Exception as e:
                     print("  !! invite failed %s -> %r" % (p, e))
+    elif getattr(cfg, "SKIP_WARMSTART_RECAL", False):  # jump straight into training; re-grounds at first recal
+        league.learner_elo = league.learner_elo4 = cfg.ELO_STARTER
+        print("  [resume] no league state -> SKIP_WARMSTART_RECAL: stamped placeholder Elo %.0f "
+              "(re-grounds at first ELO_RECAL_EVERY)" % cfg.ELO_STARTER)
     else:  # warm-start: calibrate learner Elo vs anchors so the first snapshot is not stamped Elo 0
         rnd = (start_it // cfg.WORLD_RESAMPLE_EVERY) if cfg.WORLD_RESAMPLE_EVERY > 0 else 0
         print("  [resume] no league state -> calibrating learner Elo vs anchors")

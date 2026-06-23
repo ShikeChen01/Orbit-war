@@ -27,13 +27,19 @@ def _potentials(env):
     return phi_ship, (pe - pen) / tot
 
 
-def one_sided_bet_reward(coef, bet_buf, outcome, alive):
-    """ONE-SIDED confident-win bet reward (raw units, pre PPO_REWARD_SCALE). ``bet_buf`` (Tu,Bn) already holds
-    relu(tanh(bet_t)) >= 0 (the confident-POSITIVE part of the bet). Pays ``coef * bet * max(z,0)`` so it
-    rewards confident WINS and is EXACTLY ZERO on a draw/loss (z<=0) -- the symmetric ``bet*z`` reward is a
-    passivity trap (it would pay coef/step for confidently LOSING). ``outcome`` (Bn,) z in [-1,1]; ``alive``
-    (Tu,Bn) the live-step mask. Returns (Tu,Bn). Factored out so the one-sidedness is unit-testable."""
-    return coef * bet_buf * outcome.clamp_min(0.0).unsqueeze(0) * alive
+def one_sided_bet_reward(turn_cap, game_cap, bet_buf, outcome, alive):
+    """SELF-CONFIDENCE bet reward (raw units, pre PPO_REWARD_SCALE). ``bet_buf`` (Tu,Bn) holds
+    relu(tanh(bet_t)) >= 0 -- the per-step POSITIVE self-bet ("I will win"). Proper scoring rule:
+    pays ``turn_cap * bet * z`` so a confident WIN is rewarded (true positive) and a confident LOSS is
+    PENALISED the same (false positive); a non-positive bet (relu=0) scores nothing either way, so the
+    'bet against yourself for free reward' passivity trap stays shut. Budgeted: each step's |payout| is
+    capped at ``turn_cap`` and the per-game cumulative magnitude at ``game_cap`` (paid earliest-first;
+    z is constant per game so all steps share one sign). ``outcome`` (Bn,) z in [-1,1]; ``alive`` (Tu,Bn)
+    the live-step mask. Returns the SIGNED (Tu,Bn) reward. Factored out so the rule is unit-testable."""
+    mag = (turn_cap * bet_buf * alive).clamp(max=turn_cap)          # per-step >=0 payout, turn-capped
+    cum = torch.cumsum(mag, 0).clamp(max=game_cap)                  # running total, game-capped
+    paid = cum.clone(); paid[1:] = cum[1:] - cum[:-1]              # per-step paid amount (earliest-first budget)
+    return paid * outcome.unsqueeze(0)                             # sign by z: +win / -loss / 0 draw
 
 
 def _opp_baseline(cfg, Re, opp_exp):
@@ -362,12 +368,13 @@ def collect_ppo(cfg, env, net, world_pool, cursor, rng, seats, n_players=2, n_en
     Tu = last_t + 1
     rew = rew_buf[:Tu].clone(); val = val_buf[:Tu]; done = done_buf[:Tu]; alive = valid_buf[:Tu]
     length = alive.sum(0)
-    # ONE-SIDED confident-win bet reward: pay coef * relu(tanh(bet_t)) * max(z,0), rectified to the WINNING
-    # side so it can never pay for confidently losing (the two-sided bet*z reward is a passivity trap). The
-    # bet is DETACHED (a reward, not a loss); it flows through GAE / the per-step GRPO return like any reward.
+    # SELF-CONFIDENCE bet reward: pay turn_cap * relu(tanh(bet_t)) * z -- a proper scoring rule that REWARDS
+    # confident wins and PENALISES confident losses (false positives), one-sided in the bet (b<=0 scores
+    # nothing) and budgeted (<=10/step, <=250/game). The bet is DETACHED (a reward, not a loss); it flows
+    # through GAE / the per-step GRPO return like any reward.
     r_win_bet_log = 0.0
     if want_bet:
-        bet_r = one_sided_bet_reward(cfg.AUX_WIN_BET_REWARD_COEF, bet_buf[:Tu], outcome, alive)
+        bet_r = one_sided_bet_reward(cfg.AUX_WIN_BET_TURN_CAP, cfg.AUX_WIN_BET_GAME_CAP, bet_buf[:Tu], outcome, alive)
         rew = rew + bet_r / cfg.PPO_REWARD_SCALE                                   # raw units / scale, like the other channels
         r_win_bet_log = bet_r.sum(0).mean().item()                                # heartbeat 'wb' (raw units, like R[o c p ln])
     len_eff = (length - cfg.DECAY_START_STEP).clamp_min(0.0)
